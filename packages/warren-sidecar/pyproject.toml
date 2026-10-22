@@ -6,7 +6,7 @@ license = "MIT"
 authors = [{ name = "Scott Cowan" }]
 requires-python = ">=3.11"
 dependencies = [
-  "fastapi>=0.115,<0.116",
+  "fastapi>=0.150.0,<0.151",
   "uvicorn[standard]>=0.32,<0.33",
   "pathspec>=1.1,<2",
   "pydantic-settings>=2.16.0,<3",
