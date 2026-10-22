@@ -68,6 +68,9 @@ jobs:
       - name: Script tests
         run: python3 -m unittest discover -s scripts/tests -p 'test_check_public_hygiene.py' -v
 
+      - name: Release script tests
+        run: python3 -m unittest discover -s scripts/tests -p 'test_release.py' -v
+
       - name: Tracked files
         run: python3 scripts/check_public_hygiene.py
 

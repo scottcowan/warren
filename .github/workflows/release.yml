@@ -1,0 +1,145 @@
+name: release
+# Keeps one release PR (branch release/next) open with the next version of
+# every image whose build inputs changed since its last release; see
+# scripts/release.py and .github/releases.json. Merging it tags those images,
+# creates their GitHub releases and publishes them.
+#
+# Tags created with GITHUB_TOKEN don't trigger the images' tag-push workflows,
+# so this calls them directly. The "release tags" ruleset needs GitHub Actions
+# as a bypass actor for the tag step to succeed.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      released: ${{ steps.released.outputs.tags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - id: released
+        env:
+          BEFORE: ${{ github.event.before || 'HEAD^' }}
+        run: echo "tags=$(python3 scripts/release.py released --before "$BEFORE")" >> "$GITHUB_OUTPUT"
+
+      - name: Tag and create GitHub releases
+        if: steps.released.outputs.tags != '{}'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAGS: ${{ steps.released.outputs.tags }}
+        run: |
+          echo "$TAGS" | jq -r 'to_entries[] | "\(.key) \(.value)"' | while read -r name tag; do
+            if gh release view "$tag" >/dev/null 2>&1; then
+              echo "$tag already released"
+              continue
+            fi
+            python3 scripts/release.py notes "$name" > "$RUNNER_TEMP/notes.md"
+            gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes-file "$RUNNER_TEMP/notes.md"
+          done
+
+  warren-server:
+    needs: tag
+    if: fromJSON(needs.tag.outputs.released)['warren-server']
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/warren-server-image.yml
+    with:
+      tag: ${{ fromJSON(needs.tag.outputs.released)['warren-server'] }}
+
+  warren-docker-base:
+    needs: tag
+    if: fromJSON(needs.tag.outputs.released)['warren-docker-base']
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/warren-docker-base-image.yml
+    with:
+      tag: ${{ fromJSON(needs.tag.outputs.released)['warren-docker-base'] }}
+
+  warren-docker-dev-base:
+    needs: tag
+    if: fromJSON(needs.tag.outputs.released)['warren-docker-dev-base']
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/warren-docker-dev-base-image.yml
+    with:
+      tag: ${{ fromJSON(needs.tag.outputs.released)['warren-docker-dev-base'] }}
+
+  warren-ecs-base:
+    needs: tag
+    if: fromJSON(needs.tag.outputs.released)['warren-ecs-base']
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/warren-ecs-base-image.yml
+    with:
+      tag: ${{ fromJSON(needs.tag.outputs.released)['warren-ecs-base'] }}
+
+  warren-ecs-dev-base:
+    needs: tag
+    if: fromJSON(needs.tag.outputs.released)['warren-ecs-dev-base']
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/warren-ecs-dev-base-image.yml
+    with:
+      tag: ${{ fromJSON(needs.tag.outputs.released)['warren-ecs-dev-base'] }}
+
+  release-pr:
+    needs: tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - id: prepare
+        run: |
+          python3 scripts/release.py prepare --title "$RUNNER_TEMP/title" --body "$RUNNER_TEMP/body"
+          if [ -n "$(git status --porcelain)" ]; then echo "pending=true"; else echo "pending=false"; fi >> "$GITHUB_OUTPUT"
+
+      - name: Open or update the release PR
+        if: steps.prepare.outputs.pending == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C release/next
+          git add -A
+          git commit -q -F "$RUNNER_TEMP/title"
+          git push -q --force origin release/next
+          if [ "$(gh pr view release/next --json state --jq .state 2>/dev/null)" = "OPEN" ]; then
+            gh pr edit release/next --title "$(cat "$RUNNER_TEMP/title")" --body-file "$RUNNER_TEMP/body"
+          else
+            gh pr create --base main --head release/next --title "$(cat "$RUNNER_TEMP/title")" --body-file "$RUNNER_TEMP/body"
+          fi
+
+      - name: Close a stale release PR
+        if: steps.prepare.outputs.pending == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(gh pr view release/next --json state --jq .state 2>/dev/null)" = "OPEN" ]; then
+            gh pr close release/next --delete-branch --comment "Nothing left to release."
+          fi

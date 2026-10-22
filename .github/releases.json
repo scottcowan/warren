@@ -1,0 +1,53 @@
+{
+  "baseline": "ddf75e3ddb2b87719c8f4fc45d8191324b85c85b",
+  "components": {
+    "warren-server": {
+      "version": "1.1.0",
+      "paths": [
+        "packages/warren-server/",
+        "packages/warren-common/",
+        "pyproject.toml",
+        "uv.lock"
+      ],
+      "exclude": [
+        "packages/warren-server/images/",
+        "packages/warren-server/tests/",
+        "packages/warren-common/tests/",
+        "packages/warren-server/README.md",
+        "packages/warren-server/CHANGELOG.md",
+        "packages/warren-common/CHANGELOG.md"
+      ]
+    },
+    "warren-docker-base": {
+      "version": "1.0.1",
+      "paths": [
+        "images/warren-docker-base/",
+        "packages/warren-common/src/warren_common/assets/",
+        "packages/warren-common/src/warren_common/agent_supervisor.py"
+      ],
+      "exclude": [
+        "images/warren-docker-base/tests/"
+      ]
+    },
+    "warren-docker-dev-base": {
+      "version": "1.0.0",
+      "paths": [
+        "images/warren-docker-dev-base/"
+      ]
+    },
+    "warren-ecs-base": {
+      "version": "1.1.0",
+      "paths": [
+        "packages/warren-server/images/ecs-base/",
+        "packages/warren-common/src/warren_common/assets/",
+        "packages/warren-common/src/warren_common/agent_supervisor.py"
+      ]
+    },
+    "warren-ecs-dev-base": {
+      "version": "1.0.0",
+      "paths": [
+        "packages/warren-server/images/warren-ecs-dev-base/"
+      ]
+    }
+  }
+}
