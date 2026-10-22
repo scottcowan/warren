@@ -19,7 +19,7 @@ dependencies = [
   "podman>=5.8,<6",
   "docker>=7.2,<8",
   "structlog>=24.4",
-  "typer>=0.15",
+  "typer>=0.27.3",
   "warren-common",
   "PyJWT>=2.14,<3",       # GitHub App JWT signing (LIFE-03, D-08)
   "GitPython>=3.1.62,<4", # server-side git materialization (LIFE-03)
