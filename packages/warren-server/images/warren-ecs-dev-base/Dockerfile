@@ -20,7 +20,7 @@
 # fetch itself remains TOFU-only (no published checksum for that script exists to pin
 # against), a known, deliberately-unresolved broader supply-chain gap this audit
 # already tracks separately.
-FROM ghcr.io/scottcowan/warren-ecs-base:latest@sha256:51ab8127a93b1ffcd50a3c4a60c5138a68fd6bc87d8ed59cfcf45fe3409589fa
+FROM ghcr.io/scottcowan/warren-ecs-base:latest@sha256:c1b5c590fce9b127d94bb5632ddc7aeb0e7b0431a6bdd04fe3c54b89e4597912
 # warren-ecs-base:latest (warren-ecs-base-v1.0.1, with the S1 build fix and
 # UX-1's zsh banner/prompt) as of 2026-10-17
 
