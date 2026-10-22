@@ -12,7 +12,7 @@ dependencies = [
   "docker>=7.2,<8",
   "httpx>=0.28,<0.29",
   "PyJWT>=2.14,<3",  # GitHub App JWT for workspace token issuers (AK1)
-  "cryptography>=43.0,<44",  # RS256 for PyJWT
+  "cryptography>=50.0.2,<51",  # RS256 for PyJWT
 ]
 
 [project.optional-dependencies]
