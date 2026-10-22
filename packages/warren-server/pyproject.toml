@@ -6,12 +6,12 @@ license = "MIT"
 authors = [{ name = "Scott Cowan" }]
 requires-python = ">=3.11"
 dependencies = [
-  "fastapi>=0.115,<0.116",
-  "uvicorn[standard]>=0.32,<0.33",
+  "fastapi>=0.149,<0.150",
+  "uvicorn[standard]>=0.54,<0.55",
   "pydantic>=2.13,<3",
   "pydantic-settings>=2.14,<3",
   "pyyaml>=6.0,<7",
-  "cryptography>=43.0,<44",     # Fernet secret store
+  "cryptography>=50.0,<51",     # Fernet secret store
   "aiofiles>=25.1,<26",
   "httpx>=0.28,<0.29",
   "aiosqlite>=0.22,<0.23",
@@ -23,7 +23,7 @@ dependencies = [
   "warren-common",
   "PyJWT>=2.14,<3",       # GitHub App JWT signing (LIFE-03, D-08)
   "GitPython>=3.1.62,<4", # server-side git materialization (LIFE-03)
-  "mcp>=1.27.2,<1.28",     # control-plane MCP endpoint (AI8)
+  "mcp>=1.30,<1.31",     # control-plane MCP endpoint (AI8)
 ]
 
 [tool.uv.sources]
