@@ -33,8 +33,9 @@ Out = Callable[[str], None]
 # floor, not the image pin: scripts/bump_pins.py moves the Dockerfile pins
 # weekly; raise this by hand when warren starts depending on a newer feature.
 # binary -> minimum "X.Y.Z"
+# claude 2.1.79: StopFailure hook (2.1.78) and SessionEnd firing on /resume.
 _HARNESS_MIN_VERSIONS: dict[str, str] = {
-    "claude": "2.1.0",
+    "claude": "2.1.79",
 }
 _SEMVER_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 
