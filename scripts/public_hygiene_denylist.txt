@@ -1,0 +1,15 @@
+# Denylist for scripts/check_public_hygiene.py.
+# One sha256 hex digest per line, of a lower-cased token that must never appear in
+# tracked files or history (employer/internal names, real account ids, private ids).
+# Tokens are stored hashed so this file does not re-leak them. To add one:
+#   printf '%s' 'the-token' | shasum -a 256
+# Single words are matched as alphanumeric runs; two-word tokens as 'a-b' pairs.
+cf08fccd9d8bfd57d4e6dd765d4cfc1ec6c2e3e9d5219c6229fa0828e9b1004d
+d6af082eea42d228cb466df37676b0f6e3000ac98fb2e327f09afd05c5f1c427
+a4da9883fd09e73345047466910b7f3364e8f2c527debb7e92158f31fb62c284
+8a45e80aa25b717a25244ed19b0afc3ec847d7de7968c4165c8bd352177b5329
+eceae69544912d72d6f7c33995d34b94c867121f5ead3c1041de81ca367fc479
+1c3eb3944ef43e4ea89fb7858e2005ad31958f4d909dc65a3896a05cecc97414
+ab75af22dfd5d11ac8d831a6d1b2b64100864b0e95cf469a2cc8113947eb9334
+35a697e63d4216ee715b70fb57bcedf89e6a74db52929b138aaf9921d24245d0
+8cb346216f7bb06235e77276a3224f19e814cae356c56cbaf11245c4a58be953

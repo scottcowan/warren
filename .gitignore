@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+*.egg-info/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+!.env.example
+
+# Terraform
+resources/ecs/terraform/.terraform/
+
+# Internal GSD planning workspace — not part of the public release
+.planning/
+
+# Local tooling — agent worktrees/settings and editor vaults
+.claude/
+.obsidian/

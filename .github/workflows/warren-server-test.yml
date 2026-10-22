@@ -1,0 +1,101 @@
+name: warren-server tests
+
+on:
+  push:
+    paths:
+      - 'packages/warren-server/**'
+      - 'packages/warren-common/**'
+      - 'uv.lock'
+      - '.github/workflows/warren-server-test.yml'
+  pull_request:
+    paths:
+      - 'packages/warren-server/**'
+      - 'packages/warren-common/**'
+      - 'uv.lock'
+      - '.github/workflows/warren-server-test.yml'
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      # warren-common is a workspace member (packages/warren-common), resolved
+      # locally — no git/network dependency. `--package warren-server` scopes
+      # the sync to just this package's own deps instead of the whole workspace.
+      - name: Install dependencies
+        run: uv sync --package warren-server --extra dev
+
+      - name: Start rootless Podman socket
+        run: |
+          # ubuntu-latest runners execute as a non-logged-in user with no systemd
+          # user session, so /run/user/<uid>/ does not exist by default — the
+          # socket bind fails with ENOENT unless its parent directory is created
+          # first.
+          mkdir -p "/run/user/$(id -u)/podman"
+          podman system service --time=0 "unix:///run/user/$(id -u)/podman/podman.sock" &
+          echo "PODMAN_SOCKET=/run/user/$(id -u)/podman/podman.sock" >> "$GITHUB_ENV"
+
+      - name: Podman smoke check
+        run: |
+          # The service can take several seconds to bind its socket and answer on a cold
+          # runner, so wait for it (up to ~30s) instead of failing on the first check.
+          for i in $(seq 1 30); do
+            if test -S "$PODMAN_SOCKET" && podman --url "unix://$PODMAN_SOCKET" info >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          test -S "$PODMAN_SOCKET" || { echo "::error::Podman socket not found at $PODMAN_SOCKET after 30s — service failed to start"; exit 1; }
+          podman --url "unix://$PODMAN_SOCKET" info
+
+      # Diagnostic + mitigation: pull the test fixture's base image via the CLI, under a HARD
+      # wall-clock timeout (the shell `timeout` command kills the process outright, unlike
+      # podman-py's HTTP `timeout` kwarg, which only bounds gaps between received bytes and can
+      # be reset indefinitely by a slow trickle — e.g. Docker Hub anonymous-pull throttling on
+      # shared CI runner IPs). If this step times out, the bottleneck is the registry pull, not
+      # podman-py's build() streaming; if it succeeds, the base layer is cached locally so the
+      # test fixture's own `images.build()` call no longer needs to pull it.
+      # Both fixture bases are pre-pulled: busybox (long-running fixture) and
+      # debian:bookworm-slim (the SSH fixture image, tests/integration/fixtures/ssh_test_image),
+      # which previously was pulled inside the test session under no wall-clock bound at all.
+      # Each attempt is bounded; on failure it falls back to Google's Docker Hub mirror
+      # (mirror.gcr.io, no anonymous quota) and re-tags under the docker.io name the
+      # Containerfiles use, so the build finds it locally. Retries back off 10s/20s.
+      - name: Pre-pull test base images
+        run: |
+          set -u
+          pull() {
+            ref="$1"
+            for attempt in 1 2 3; do
+              for src in "docker.io/library/$ref" "mirror.gcr.io/library/$ref"; do
+                if timeout 90 podman --url "unix://$PODMAN_SOCKET" pull "$src"; then
+                  [ "$src" = "docker.io/library/$ref" ] || podman --url "unix://$PODMAN_SOCKET" tag "$src" "docker.io/library/$ref"
+                  return 0
+                fi
+                echo "::warning::pull of $src failed (attempt $attempt)"
+              done
+              sleep $((attempt * 10))
+            done
+            echo "::error::could not pull $ref from docker.io or mirror.gcr.io"
+            return 1
+          }
+          pull busybox:latest
+          pull debian:bookworm-slim
+
+      # pytest-timeout (pyproject.toml + tests/integration/conftest.py) fails a hung test
+      # with a traceback well before this outer wall-clock backstop, which only exists to
+      # stop a wedged interpreter; it is kept under the job's 15-minute timeout-minutes.
+      - name: Run test suite
+        run: timeout 720 uv run --package warren-server pytest packages/warren-server/tests -v

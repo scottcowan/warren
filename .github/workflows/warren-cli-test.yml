@@ -1,0 +1,82 @@
+name: warren-cli tests
+
+on:
+  push:
+    paths:
+      - 'packages/warren-cli/**'
+      - 'packages/warren-common/**'
+      - 'uv.lock'
+      - '.github/workflows/warren-cli-test.yml'
+  pull_request:
+    paths:
+      - 'packages/warren-cli/**'
+      - 'packages/warren-common/**'
+      - 'uv.lock'
+      - '.github/workflows/warren-cli-test.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      # warren-common is a workspace member (packages/warren-common), resolved
+      # locally — no git/network dependency. `--package warren` (the warren-cli
+      # package's project name) scopes the sync to just this package's own deps
+      # instead of the whole workspace.
+      - name: Install dependencies
+        run: uv sync --package warren --extra dev
+
+      - name: Run test suite
+        run: uv run --package warren pytest packages/warren-cli/tests -v
+
+  # Windows as a client for podman/ECS workspaces (AC1). POSIX-only tests are
+  # skipped by explicit skipif markers, listed in the -rs summary.
+  # WSL2 (AC2) can't run on GitHub-hosted runners (no nested virtualization),
+  # so WSL detection, AppArmor userns guidance and drvfs refusal are covered by
+  # fake /proc files and mount tables (test_wsl.py, test_wsl2.py). The real
+  # check is manual: the bubblewrap suite inside WSL2 Ubuntu 22.04 and 24.04.
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      PYTHONUTF8: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+
+      - name: Install dependencies
+        run: uv sync --package warren --extra dev
+
+      - name: warren --help smoke
+        run: uv run --package warren warren --help
+
+      - name: Connect smoke against a faked server and stub ssh/aws
+        if: success() || failure()
+        run: uv run --package warren pytest packages/warren-cli/tests/test_connect_smoke.py -v
+
+      - name: warren-cli tests
+        if: success() || failure()
+        run: uv run --package warren pytest packages/warren-cli/tests -v -rs
+
+      - name: warren-common tests
+        if: success() || failure()
+        run: uv run --package warren pytest packages/warren-common/tests -v -rs

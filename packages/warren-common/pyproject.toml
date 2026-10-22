@@ -1,0 +1,40 @@
+[project]
+name = "warren-common"
+version = "0.1.1"
+description = "Shared models, loader, and secrets utilities for warren-server and warren-cli"
+license = "MIT"
+authors = [{ name = "Scott Cowan" }]
+requires-python = ">=3.11"
+dependencies = [
+  "pydantic>=2.13,<3",
+  "pyyaml>=6.0,<7",
+  "structlog>=24.4",
+  "docker>=7.2,<8",
+  "httpx>=0.28,<0.29",
+  "PyJWT>=2.14,<3",  # GitHub App JWT for workspace token issuers (AK1)
+  "cryptography>=43.0,<44",  # RS256 for PyJWT
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/warren_common"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[project.urls]
+Homepage = "https://github.com/scottcowan/warren"
+Source = "https://github.com/scottcowan/warren/tree/main/packages/warren-common"
+Issues = "https://github.com/scottcowan/warren/issues"
+Security = "https://github.com/scottcowan/warren/security/policy"

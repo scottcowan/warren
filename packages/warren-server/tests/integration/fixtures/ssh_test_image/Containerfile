@@ -1,0 +1,29 @@
+# Test-only fixture image for tests/integration/test_ssh_access.py.
+#
+# Mirrors the ACP-over-SSH ForceCommand pattern extracted to github.com/scottcowan/
+# agent-poc, but kept self-contained here (no external repo dependency during test
+# setup) and using the exact usernames warren-server's production code hardcodes
+# (_SSH_LOGIN_USER="warren", _SSH_BREAK_GLASS_USER="warren-shell" in
+# routes/workspaces.py) — agent-poc's generic agent/agent-shell naming wouldn't match
+# what this test is actually proving.
+FROM docker.io/library/debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssh-server ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /run/sshd /etc/warren && chmod 0755 /etc/warren
+
+RUN useradd -m -s /bin/bash -u 1000 warren \
+    && useradd -m -s /bin/bash warren-shell \
+    && usermod -p '*' warren \
+    && usermod -p '*' warren-shell
+
+COPY sshd_config /etc/ssh/sshd_config
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY acp-entry /usr/local/bin/acp-entry
+RUN chmod 0755 /usr/local/bin/entrypoint.sh /usr/local/bin/acp-entry
+
+EXPOSE 22
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

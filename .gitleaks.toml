@@ -1,0 +1,31 @@
+# gitleaks config for .github/workflows/public-hygiene.yml.
+# Default rules, plus narrow allowlists for known test fixtures. Each allowlist
+# requires BOTH a path and a regex match (condition = "AND"), so the same value
+# anywhere else, or a different value in the same file, is still reported.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Dummy EFS access point ids in runtime tests"
+condition = "AND"
+paths = [
+  '''^packages/warren-server/tests/unit/runtime/test_efs_mount\.py$''',
+  '''^packages/warren-server/tests/unit/runtime/test_ecs_runtime\.py$''',
+]
+regexes = ['''^fsap-0123456789abcdef0$''']
+
+[[allowlists]]
+description = "Placeholder OpenSSH key body in the connect route test"
+condition = "AND"
+paths = ['''^packages/warren-server/tests/unit/routes/test_workspace_connect\.py$''']
+regexes = ['''^-----BEGIN OPENSSH PRIVATE KEY-----\\nfakefakefake\\n-----END OPENSSH PRIVATE KEY-----''']
+
+[[allowlists]]
+description = "Fake GitHub installation tokens in credential-redaction tests"
+condition = "AND"
+paths = [
+  '''^packages/warren-server/tests/unit/git/test_manager\.py$''',
+  '''^packages/warren-server/tests/unit/git/test_github_app\.py$''',
+]
+regexes = ['''^ghs_liveTokenValue123$''', '''^ghs_xxx$''']

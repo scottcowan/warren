@@ -1,0 +1,57 @@
+name: warren-server image
+on:
+  push:
+    tags: ['warren-server-v*.*.*']
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ghcr.io/scottcowan/warren-server
+          tags: |
+            type=match,pattern=warren-server-v(\d+\.\d+\.\d+),group=1
+            type=match,pattern=warren-server-v(\d+\.\d+)\.\d+,group=1
+            type=raw,value=latest
+
+      # warren-common is resolved from the workspace root (packages/warren-common)
+      # during `uv lock`/`uv sync` inside the Dockerfile — a local path, no
+      # network dependency, unlike the old separate-repo git+https source.
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: packages/warren-server/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Catches a real gap that shipped silently for a long time: GitManager
+      # (warren/git/manager.py) shells out to `git`/`ssh` for every server-side
+      # worktree clone, but nothing ever verified either binary was actually in
+      # the built image -- unit tests run on a host that already has both, so
+      # they never caught it. This loads the just-pushed image fresh (same tag
+      # metadata-action just resolved) rather than re-asserting against the
+      # local build cache.
+      - name: Sanity-check git/ssh exist in the published image
+        run: |
+          docker run --rm --entrypoint git "${{ fromJSON(steps.meta.outputs.json).tags[0] }}" --version
+          docker run --rm --entrypoint ssh "${{ fromJSON(steps.meta.outputs.json).tags[0] }}" -V

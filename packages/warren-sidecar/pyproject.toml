@@ -1,0 +1,46 @@
+[project]
+name = "warren-sidecar"
+version = "0.1.0"
+description = "In-workspace HTTP sidecar for warren workspaces"
+license = "MIT"
+authors = [{ name = "Scott Cowan" }]
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<0.116",
+  "uvicorn[standard]>=0.32,<0.33",
+  "pathspec>=1.1,<2",
+  "pydantic-settings>=2.3,<3",
+  "structlog>=24.4",
+  "aiofiles>=25.1,<26",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "httpx>=0.28,<0.29",
+]
+
+[project.scripts]
+warren-sidecar = "warren_sidecar.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/warren_sidecar"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+  "requires_podman: integration test that needs a live rootless Podman socket",
+]
+testpaths = ["tests"]
+
+[project.urls]
+Homepage = "https://github.com/scottcowan/warren"
+Source = "https://github.com/scottcowan/warren/tree/main/packages/warren-sidecar"
+Issues = "https://github.com/scottcowan/warren/issues"
+Security = "https://github.com/scottcowan/warren/security/policy"

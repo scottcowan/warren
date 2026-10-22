@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+.env
+.env.*
+!.env.example
+*.pem
+credentials.json
+
+# Internal GSD planning workspace — not part of the public release
+.planning/

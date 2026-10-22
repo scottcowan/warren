@@ -1,0 +1,75 @@
+name: warren-docker-base image
+# Builds and pushes ghcr.io/scottcowan/warren-docker-base (multi-arch amd64+arm64) on version tags.
+# NOTE: warren-base-claude-code depends on this image being published before its own build.
+# That extension image can be built manually or triggered after this workflow completes.
+# Automated chaining is deferred to v1.1.
+on:
+  push:
+    tags: ['warren-docker-base-v*.*.*']
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ghcr.io/scottcowan/warren-docker-base
+          tags: |
+            type=match,pattern=warren-docker-base-v(\d+\.\d+\.\d+),group=1
+            type=match,pattern=warren-docker-base-v(\d+\.\d+)\.\d+,group=1
+            type=raw,value=latest
+
+      # Base image source: the Dockerfile's default (Docker Hub) first, so a normal release
+      # is built exactly as before; falls back to mirror.gcr.io only if Docker Hub fails,
+      # after verifying it serves the IDENTICAL digest-pinned manifest. Build content and
+      # the base digest in the provenance attestation (default, unchanged) are the same.
+      - id: base
+        name: Resolve base-image registry
+        run: .github/scripts/resolve-base-registry.sh images/warren-docker-base/Dockerfile docker.io/library mirror.gcr.io/library
+
+      - id: build
+        continue-on-error: true
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: images/warren-docker-base/Dockerfile
+          build-args: BASE_REGISTRY=${{ steps.base.outputs.primary }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Back off before retrying the build
+        if: steps.build.outcome == 'failure'
+        run: sleep 30
+
+      - name: Retry build from the fallback registry
+        if: steps.build.outcome == 'failure'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: images/warren-docker-base/Dockerfile
+          build-args: BASE_REGISTRY=${{ steps.base.outputs.fallback }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

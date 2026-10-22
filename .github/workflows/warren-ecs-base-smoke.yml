@@ -1,0 +1,132 @@
+name: warren-ecs-base smoke test
+# Build-only validation, path-scoped so it only runs when this image's own files
+# change — same pattern as devcontainers/images' per-image smoke tests. Publishing
+# stays separate, in warren-ecs-base-image.yml, triggered only by a version tag.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - packages/warren-server/images/ecs-base/**
+      - packages/warren-common/src/warren_common/assets/warren_banner.zsh
+      - .github/workflows/warren-ecs-base-smoke.yml
+      - .github/scripts/resolve-base-registry.sh
+      - packages/warren-cli/src/warren_cli/dispatch.py
+  push:
+    branches: [main]
+    paths:
+      - packages/warren-server/images/ecs-base/**
+      - packages/warren-common/src/warren_common/assets/warren_banner.zsh
+      - .github/workflows/warren-ecs-base-smoke.yml
+      - .github/scripts/resolve-base-registry.sh
+      - packages/warren-cli/src/warren_cli/dispatch.py
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      # Anonymous ECR Public pulls from shared runner IPs intermittently fail with
+      # "toomanyrequests: Data limit exceeded". Pull the SAME digest-pinned base from a
+      # registry verified to serve the identical manifest, preferring mirror.gcr.io (no
+      # anonymous quota); retries with backoff, then falls back to the next verified one.
+      - id: base
+        name: Resolve base-image registry
+        run: .github/scripts/resolve-base-registry.sh packages/warren-server/images/ecs-base/Dockerfile mirror.gcr.io/library public.ecr.aws/docker/library docker.io/library
+      - id: build
+        continue-on-error: true
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          # Repo-root context (changed from the image's own dir for UX-1): the
+          # Dockerfile now COPYs the shared banner asset from warren-common,
+          # same pattern warren-docker-base's own Dockerfile already uses.
+          context: .
+          file: packages/warren-server/images/ecs-base/Dockerfile
+          build-args: BASE_REGISTRY=${{ steps.base.outputs.primary }}
+          push: false
+          load: true
+          tags: warren-ecs-base:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Back off before retrying the build
+        if: steps.build.outcome == 'failure'
+        run: sleep 30
+      - name: Retry build from the fallback registry
+        if: steps.build.outcome == 'failure'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: packages/warren-server/images/ecs-base/Dockerfile
+          build-args: BASE_REGISTRY=${{ steps.base.outputs.fallback }}
+          push: false
+          load: true
+          tags: warren-ecs-base:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - name: Render the CLI's ECS Exec command
+        run: |
+          uv sync --package warren
+          uv run --package warren python -c "from warren_cli.dispatch import ecs_session_command; print(ecs_session_command('bash'))" > "$RUNNER_TEMP/ecs-exec-cmd.txt"
+
+      - name: Sanity-check the built image
+        # entrypoint.sh ignores CMD args entirely (only reacts to WARREN_APP_CMD),
+        # so inspection has to bypass it with --entrypoint.
+        env:
+          IMG: warren-ecs-base:smoke
+        run: |
+          set -eu
+          CMD="$(cat "$RUNNER_TEMP/ecs-exec-cmd.txt")"
+          docker run --rm --entrypoint git "$IMG" --version
+          docker run --rm --entrypoint bash "$IMG" --version
+          docker run --rm --entrypoint tmux "$IMG" -V
+          # The entrypoint starts as root and drops to warren before running the app.
+          test "$(docker run --rm -e WARREN_APP_CMD='id -u; echo $HOME' "$IMG" | tr '\n' ' ')" = "1000 /home/warren "
+          # Helpers are root-owned 0755 in root-owned, non-writable dirs.
+          test "$(docker run --rm --entrypoint stat "$IMG" -c '%u:%g:%a' /usr/local/bin/warren-session /usr/local/bin/warren-init-volume /usr/local/bin/entrypoint.sh /usr/local/bin /usr/local /usr | sort -u)" = "0:0:755"
+          # Pre-owned paths for uid 1000.
+          test "$(docker run --rm --entrypoint stat "$IMG" -c '%u:%g' /workspace /var/lib/warren /home/warren | sort -u)" = "1000:1000"
+          # A fresh root-owned task volume is chowned to warren by the entrypoint.
+          test "$(docker run --rm --mount type=tmpfs,destination=/var/lib/warren,tmpfs-mode=0755 -e WARREN_APP_CMD='touch /var/lib/warren/x && stat -c %u:%g /var/lib/warren/x' "$IMG")" = "1000:1000"
+          # warren-session resets PATH: planted su-exec/tmux/id earlier on PATH never run.
+          out="$(docker run --rm --user 0 --entrypoint sh "$IMG" -c 'mkdir /tmp/evil && for b in su-exec tmux id; do printf "#!/bin/sh\necho PWNED\n" > /tmp/evil/$b; chmod +x /tmp/evil/$b; done; PATH=/tmp/evil:$PATH /usr/local/bin/warren-session bash' 2>&1 || true)"
+          echo "$out"
+          case "$out" in *PWNED*) echo "warren-session used the caller's PATH" >&2; exit 1 ;; esac
+          case "$out" in *terminal*) ;; *) echo "warren-session did not reach tmux" >&2; exit 1 ;; esac
+          # The CLI's ECS Exec command fails closed, with no root shell, when the helper is
+          # missing or writable by non-root.
+          for prep in 'rm /usr/local/bin/warren-session' 'chmod 0777 /usr/local/bin/warren-session' 'chown 1000 /usr/local/bin/warren-session' 'chmod 0777 /usr/local/bin'; do
+              if out="$(docker run --rm --user 0 --entrypoint sh "$IMG" -c "$prep && $CMD" 2>&1 </dev/null)"; then
+                  echo "ECS Exec command succeeded after: $prep" >&2; exit 1
+              fi
+              case "$out" in *"refusing to open a root shell"*) ;; *) echo "unexpected output after $prep: $out" >&2; exit 1 ;; esac
+          done
+          # Intact image: the command reaches warren-session as uid 1000 (tmux then needs a tty).
+          out="$(docker run --rm --user 0 --entrypoint sh "$IMG" -c "$CMD" 2>&1 </dev/null || true)"
+          case "$out" in *refusing*) echo "helper rejected on a clean image: $out" >&2; exit 1 ;; esac
+          case "$out" in *terminal*) ;; *) echo "unexpected: $out" >&2; exit 1 ;; esac
+          # AH1: git-init ships root-owned, and the pinned known_hosts is read-only.
+          test "$(docker run --rm --entrypoint stat "$IMG" -c '%u:%g:%a' /usr/local/bin/warren-git-materialize)" = "0:0:755"
+          test "$(docker run --rm --entrypoint stat "$IMG" -c '%u:%g:%a' /etc/warren/ssh_known_hosts)" = "0:0:444"
+          docker run --rm --entrypoint ssh "$IMG" -V
+          # AH1 + AD3 end to end on a fresh root-owned task volume: git-init (started as root)
+          # runs warren-init-volume, drops to 1000, and materializes a worktree owned by 1000;
+          # the workspace entrypoint then links /workspace to the checkout and drops to 1000.
+          out="$(docker run --rm --user 0 --mount type=tmpfs,destination=/var/lib/warren,tmpfs-mode=0755 --entrypoint sh "$IMG" -c '
+            set -e
+            git init -q -b main /tmp/up
+            git -C /tmp/up -c user.email=ci@example.invalid -c user.name=ci commit -q --allow-empty -m init
+            chown -R 1000:1000 /tmp/up
+            WARREN_GIT_ALLOW_PROTOCOL=file WARREN_GIT_FOLDERS="$(printf "worktree\tapp\tcode/app\tfile:///tmp/up\tmain\twarren/dev/abcdef12/code-app\tnone\t-")" \
+              /usr/local/bin/warren-git-materialize >&2
+            stat -c %u:%g /var/lib/warren /var/lib/warren/workspace /var/lib/warren/workspace/code/app /var/lib/warren/git/app.git-store | sort -u
+            WARREN_WORKSPACE_DIR=/var/lib/warren/workspace WARREN_APP_CMD="readlink /workspace; pwd; id -u; git -C code/app branch --show-current" \
+              /usr/local/bin/entrypoint.sh')"
+          echo "$out"
+          test "$out" = "$(printf '1000:1000\n/var/lib/warren/workspace\n/workspace\n1000\nwarren/dev/abcdef12/code-app')"

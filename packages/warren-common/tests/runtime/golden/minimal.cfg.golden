@@ -1,0 +1,33 @@
+# GENERATED-BY: NsjailConfig.to_proto_text; edit fixture inputs, not this file
+mode: ONCE
+hostname: "warren-abc123"
+cwd: "/workspace/main"
+keep_env: false
+clone_newnet: false
+envar: "HOME=/workspace"
+envar: "PATH=/usr/local/bin:/usr/bin:/bin"
+rlimit_nofile: 4096
+rlimit_as_type: SOFT
+uidmap { inside_id: "1000" outside_id: "1000" count: 1 }
+gidmap { inside_id: "1000" outside_id: "1000" count: 1 }
+mount {
+  src: "/bin"
+  dst: "/bin"
+  is_bind: true
+  rw: false
+  mandatory: true
+}
+mount {
+  src: "/usr"
+  dst: "/usr"
+  is_bind: true
+  rw: false
+  mandatory: true
+}
+mount {
+  src: "/workspaces/abc/main"
+  dst: "/workspace/main"
+  is_bind: true
+  rw: true
+  mandatory: true
+}

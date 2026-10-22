@@ -1,0 +1,68 @@
+name: warren-docker-base smoke test
+# Build-only validation that this image still builds, scoped to its own path so it
+# only runs when this image's own files change (not on every repo PR) — same pattern
+# as devcontainers/images' per-image smoke-test workflows. Publishing stays separate,
+# in warren-docker-base-image.yml, triggered only by a version tag.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - images/warren-docker-base/**
+      - .github/workflows/warren-docker-base-smoke.yml
+      - .github/scripts/resolve-base-registry.sh
+  push:
+    branches: [main]
+    paths:
+      - images/warren-docker-base/**
+      - .github/workflows/warren-docker-base-smoke.yml
+      - .github/scripts/resolve-base-registry.sh
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      # Pull the SAME digest-pinned base from a registry verified to serve the identical
+      # manifest, preferring mirror.gcr.io over Docker Hub's anonymous rate limit on shared
+      # runner IPs; retries with backoff, then falls back to the next verified registry.
+      - id: base
+        name: Resolve base-image registry
+        run: .github/scripts/resolve-base-registry.sh images/warren-docker-base/Dockerfile mirror.gcr.io/library docker.io/library
+      - id: build
+        continue-on-error: true
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: images/warren-docker-base/Dockerfile
+          build-args: BASE_REGISTRY=${{ steps.base.outputs.primary }}
+          push: false
+          load: true
+          tags: warren-docker-base:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Back off before retrying the build
+        if: steps.build.outcome == 'failure'
+        run: sleep 30
+      - name: Retry build from the fallback registry
+        if: steps.build.outcome == 'failure'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: images/warren-docker-base/Dockerfile
+          build-args: BASE_REGISTRY=${{ steps.base.outputs.fallback }}
+          push: false
+          load: true
+          tags: warren-docker-base:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Sanity-check the built image
+        # entrypoint.py is a custom supervisor (it ignores CMD args and requires
+        # WARREN_WORKSPACE_ID), so inspection has to bypass it with --entrypoint.
+        run: |
+          docker run --rm --entrypoint git warren-docker-base:smoke --version
+          docker run --rm --entrypoint curl warren-docker-base:smoke --version
+          docker run --rm --entrypoint uv warren-docker-base:smoke --version

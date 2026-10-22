@@ -1,0 +1,52 @@
+[project]
+name = "warren"
+version = "1.0.0"
+description = "warren CLI — client for warren-server"
+license = "MIT"
+authors = [{ name = "Scott Cowan" }]
+requires-python = ">=3.11"
+dependencies = [
+  "httpx>=0.28,<0.29",
+  "typer>=0.15",
+  "click>=8.0",
+  "pydantic>=2.13,<3",
+  "rich>=13.8",  # already transitive via typer; declared directly since we now import it (spinner)
+  "questionary>=2.0",  # arrow-key interactive selectors (remote/workspace pickers)
+  "tomli-w>=1.0",  # writes config.toml without f-string interpolation (pairs with stdlib tomllib for reads)
+  "warren-common",
+]
+
+[tool.uv.sources]
+warren-common = { workspace = true }
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "respx>=0.21",
+  "boto3>=1.43.51",
+]
+# Only needed to talk to an ECS-mode warren-server, which resolves
+# warren.secrets ownership from the caller's real AWS identity rather than
+# warren's own bearer-token user_id (see warren-server's
+# warren/auth/aws_identity.py). Podman/docker deployments never need this --
+# client.py's header-attach helper no-ops without it.
+aws = [
+  "boto3>=1.43.51",
+]
+
+[project.scripts]
+warren = "warren_cli.wslshim:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/warren_cli"]
+
+[project.urls]
+Homepage = "https://github.com/scottcowan/warren"
+Source = "https://github.com/scottcowan/warren/tree/main/packages/warren-cli"
+Issues = "https://github.com/scottcowan/warren/issues"
+Security = "https://github.com/scottcowan/warren/security/policy"

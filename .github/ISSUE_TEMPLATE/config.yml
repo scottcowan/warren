@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/scottcowan/warren/security/advisories/new
+    about: Please report security issues privately, not as a public issue. See SECURITY.md.
+  - name: Questions and design discussion
+    url: https://github.com/scottcowan/warren/blob/main/CONTRIBUTING.md
+    about: Read the contributing guide first; open a feature request to discuss scope before sending a PR.

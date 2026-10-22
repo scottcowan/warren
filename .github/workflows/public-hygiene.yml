@@ -1,0 +1,75 @@
+name: public hygiene
+
+# Secret and internal-name scanning for a public repo. Runs on every PR, on
+# pushes to main, and weekly (new gitleaks rules catch old history too).
+# Read-only: no secrets, no pull_request_target, no write permissions.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+  # sha256 of gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz, from the release's
+  # gitleaks_${GITLEAKS_VERSION}_checksums.txt. Bump both together.
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks (pinned release, checksum-verified)
+        run: |
+          set -euo pipefail
+          tarball="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/gitleaks" gitleaks
+          "$RUNNER_TEMP/gitleaks/gitleaks" version
+
+      - name: Scan full history
+        run: '"$RUNNER_TEMP/gitleaks/gitleaks" detect --no-banner --redact --config .gitleaks.toml --log-opts="--all"'
+
+      - name: Scan working tree
+        run: '"$RUNNER_TEMP/gitleaks/gitleaks" dir --no-banner --redact --config .gitleaks.toml .'
+
+  internal-names:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Script tests
+        run: python3 -m unittest discover -s scripts/tests -p 'test_check_public_hygiene.py' -v
+
+      - name: Tracked files
+        run: python3 scripts/check_public_hygiene.py
+
+      - name: History reachable from HEAD
+        run: python3 scripts/check_public_hygiene.py --history

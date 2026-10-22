@@ -1,0 +1,60 @@
+name: Bug report
+description: Something in warren doesn't work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Security issues (secret leakage, sandbox or scope escape, auth bypass) must not be filed here.**
+        Use [private vulnerability reporting](https://github.com/scottcowan/warren/security/advisories/new) instead.
+        Remove tokens, account ids, hostnames and private paths from anything you paste.
+  - type: dropdown
+    id: package
+    attributes:
+      label: Package
+      multiple: true
+      options:
+        - warren (CLI)
+        - warren-common
+        - warren-server
+        - warren-sidecar
+        - warren-mcp
+        - images / deployment (ECS, terraform, CDK)
+    validations:
+      required: true
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Runtime
+      options:
+        - not runtime-specific
+        - seatbelt (macOS)
+        - bubblewrap (Linux / WSL2)
+        - nsjail
+        - docker / podman
+        - ECS Fargate
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `warren --version`, or the package version / commit.
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: A minimal template or command sequence, if you have one.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output, with secrets redacted.
+      render: text

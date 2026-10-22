@@ -1,0 +1,97 @@
+name: warren pin bumps
+# AI6: weekly check of pinned harness/tool versions in the image Dockerfiles
+# (Claude Code) and the GitHub SSH known_hosts baked into ecs-base (#29) against
+# upstream. On drift it pushes chore/pin-bumps and opens (or updates) one PR.
+#
+# Uses only GITHUB_TOKEN. Two consequences of that:
+#   - Pushes and PRs made with GITHUB_TOKEN don't trigger `pull_request`/`push`
+#     workflows, so the smoke tests are started explicitly with
+#     `gh workflow run <smoke>.yml --ref chore/pin-bumps` (workflow_dispatch is
+#     the documented exception). Their check runs land on the branch's head
+#     commit, so they show on the PR. Other PR workflows (cli/server tests) do
+#     not run; close and reopen the PR to trigger them if needed.
+#   - The repo setting "Allow GitHub Actions to create and approve pull
+#     requests" (Settings > Actions > General) must be on for `gh pr create`.
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - scripts/bump_pins.py
+      - scripts/tests/**
+      - .github/workflows/warren-pin-bumps.yml
+
+concurrency:
+  group: warren-pin-bumps
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m unittest discover -s scripts/tests -v
+
+  bump:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    env:
+      BRANCH: chore/pin-bumps
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Check upstream and rewrite pins
+        run: |
+          python scripts/bump_pins.py --write \
+            --summary "$RUNNER_TEMP/summary.md" \
+            --smoke-workflows "$RUNNER_TEMP/smoke.txt"
+          cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push branch and open or update PR
+        id: pr
+        run: |
+          if git diff --quiet; then
+            echo "No pin drift."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$BRANCH"
+          git commit -am "chore: bump pinned harness/host-key versions (AI6)"
+          git push --force origin "$BRANCH"
+          if [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            gh pr edit "$BRANCH" --body-file "$RUNNER_TEMP/summary.md"
+          else
+            gh pr create --base main --head "$BRANCH" \
+              --title "chore: bump pinned harness/host-key versions" \
+              --body-file "$RUNNER_TEMP/summary.md"
+          fi
+
+      - name: Dispatch smoke tests on the bump branch
+        if: steps.pr.outputs.changed == 'true'
+        run: |
+          if [ ! -s "$RUNNER_TEMP/smoke.txt" ]; then
+            gh pr comment "$BRANCH" --body "No smoke workflow covers the changed files; review manually."
+            exit 0
+          fi
+          while read -r wf; do
+            echo "dispatching $wf on $BRANCH"
+            gh workflow run "$wf" --ref "$BRANCH"
+          done < "$RUNNER_TEMP/smoke.txt"

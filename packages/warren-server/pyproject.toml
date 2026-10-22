@@ -1,0 +1,75 @@
+[project]
+name = "warren-server"
+version = "0.2.0"
+description = "Environment broker for AI agent workspaces"
+license = "MIT"
+authors = [{ name = "Scott Cowan" }]
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<0.116",
+  "uvicorn[standard]>=0.32,<0.33",
+  "pydantic>=2.13,<3",
+  "pydantic-settings>=2.14,<3",
+  "pyyaml>=6.0,<7",
+  "cryptography>=43.0,<44",     # Fernet secret store
+  "aiofiles>=25.1,<26",
+  "httpx>=0.28,<0.29",
+  "aiosqlite>=0.22,<0.23",
+  "boto3>=1.43.51",
+  "podman>=5.8,<6",
+  "docker>=7.2,<8",
+  "structlog>=24.4",
+  "typer>=0.15",
+  "warren-common",
+  "PyJWT>=2.14,<3",       # GitHub App JWT signing (LIFE-03, D-08)
+  "GitPython>=3.1.62,<4", # server-side git materialization (LIFE-03)
+  "mcp>=1.27.2,<1.28",     # control-plane MCP endpoint (AI8)
+]
+
+[tool.uv.sources]
+warren-common = { workspace = true }
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "pytest-timeout>=2.3",
+  "ruff>=0.7",
+  "mypy>=1.11",
+  "respx>=0.21",
+]
+
+[project.scripts]
+warren-server = "warren.__main__:main"
+warren-secrets = "warren.secrets.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/warren"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# pytest-timeout: a hung test fails with a stack dump instead of running into the CI
+# step's wall-clock kill (exit 124, no traceback). Unit tests get 60s; live-podman
+# integration tests get a larger budget in tests/integration/conftest.py. "signal"
+# (SIGALRM) fails only the offending test and lets the session continue.
+timeout = 60
+timeout_method = "signal"
+markers = [
+  "requires_podman: integration test that needs a live rootless Podman socket",
+]
+testpaths = ["tests"]
+filterwarnings = [
+  "error::pytest.PytestUnraisableExceptionWarning",
+  "error::pytest.PytestUnhandledThreadExceptionWarning",
+]
+
+[project.urls]
+Homepage = "https://github.com/scottcowan/warren"
+Source = "https://github.com/scottcowan/warren/tree/main/packages/warren-server"
+Issues = "https://github.com/scottcowan/warren/issues"
+Security = "https://github.com/scottcowan/warren/security/policy"

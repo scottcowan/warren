@@ -1,0 +1,46 @@
+name: warren-ecs-dev-base image
+on:
+  push:
+    tags: ['warren-ecs-dev-base-v*.*.*']
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ghcr.io/scottcowan/warren-ecs-dev-base
+          tags: |
+            type=match,pattern=warren-ecs-dev-base-v(\d+\.\d+\.\d+),group=1
+            type=match,pattern=warren-ecs-dev-base-v(\d+\.\d+)\.\d+,group=1
+            type=raw,value=latest
+
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: packages/warren-server/images/warren-ecs-dev-base
+          file: packages/warren-server/images/warren-ecs-dev-base/Dockerfile
+          # amd64 only -- see ../warren-ecs-base-image.yml's comment (same
+          # reasoning: Fargate defaults to X86_64, nothing requests Graviton).
+          # This image in particular compiles Python from source via pyenv, so
+          # the arm64 leg was especially slow under QEMU for a target nothing
+          # ever uses.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

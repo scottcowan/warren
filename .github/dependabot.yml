@@ -1,0 +1,48 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Single uv workspace lockfile at the repo root covers every package in
+  # packages/* (warren-cli, warren-common, warren-mcp, warren-server,
+  # warren-sidecar) -- one entry is enough, Dependabot resolves the whole
+  # workspace from uv.lock.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "docker"
+    directory: "/images/warren-docker-base"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "docker"
+    directory: "/images/warren-docker-dev-base"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "docker"
+    directory: "/images/warren-agent-base"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "docker"
+    directory: "/images/warren-base-claude-code"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "docker"
+    directory: "/packages/warren-server"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "docker"
+    directory: "/packages/warren-server/images/ecs-base"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "docker"
+    directory: "/packages/warren-server/images/warren-ecs-agent-base"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "docker"
+    directory: "/packages/warren-server/images/warren-ecs-dev-base"
+    schedule:
+      interval: "weekly"

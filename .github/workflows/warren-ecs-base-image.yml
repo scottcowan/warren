@@ -1,0 +1,81 @@
+name: warren-ecs-base image
+on:
+  push:
+    tags: ['warren-ecs-base-v*.*.*']
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ghcr.io/scottcowan/warren-ecs-base
+          tags: |
+            type=match,pattern=warren-ecs-base-v(\d+\.\d+\.\d+),group=1
+            type=match,pattern=warren-ecs-base-v(\d+\.\d+)\.\d+,group=1
+            type=raw,value=latest
+
+      # Base image source: the Dockerfile's default (ECR Public) first, so a normal release
+      # is built exactly as before; only if that registry is unreachable or over its
+      # anonymous quota ("toomanyrequests: Data limit exceeded") does it fall back to a
+      # registry verified to serve the IDENTICAL digest-pinned manifest. The build content,
+      # and the base digest recorded in the provenance attestation (build-push-action's
+      # default, unchanged here), are the same whichever registry is used.
+      - id: base
+        name: Resolve base-image registry
+        run: .github/scripts/resolve-base-registry.sh packages/warren-server/images/ecs-base/Dockerfile public.ecr.aws/docker/library mirror.gcr.io/library docker.io/library
+
+      - id: build
+        continue-on-error: true
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          # Repo-root context (changed from the image's own dir for UX-1): the
+          # Dockerfile now COPYs the shared banner asset from warren-common,
+          # same pattern warren-docker-base's own Dockerfile already uses.
+          context: .
+          file: packages/warren-server/images/ecs-base/Dockerfile
+          build-args: BASE_REGISTRY=${{ steps.base.outputs.primary }}
+          # amd64 only: Fargate defaults to X86_64 when a task definition's
+          # runtimePlatform is unset (confirmed: nothing in runtime/ecs.py or
+          # the Terraform/CDK IaC ever sets runtimePlatform/cpuArchitecture),
+          # and nothing in this codebase requests ARM64/Graviton. arm64 here
+          # bought no real target and made every publish compile under slow
+          # QEMU emulation for nothing.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Back off before retrying the build
+        if: steps.build.outcome == 'failure'
+        run: sleep 30
+
+      - name: Retry build from the fallback registry
+        if: steps.build.outcome == 'failure'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: packages/warren-server/images/ecs-base/Dockerfile
+          build-args: BASE_REGISTRY=${{ steps.base.outputs.fallback }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,54 @@
+name: warren-docker-dev-base smoke test
+# Build-only validation, path-scoped so it only runs when this image's own files
+# change — same pattern as devcontainers/images' per-image smoke tests. Publishing
+# stays separate, in warren-docker-dev-base-image.yml, triggered only by a version tag.
+#
+# Note: this builds FROM ghcr.io/scottcowan/warren-docker-base:latest, so a
+# warren-docker-base change doesn't retrigger this workflow automatically —
+# bump/tag warren-docker-base first, then this image, same two-step flow the
+# publish workflows already assume.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - images/warren-docker-dev-base/**
+      - .github/workflows/warren-docker-dev-base-smoke.yml
+  push:
+    branches: [main]
+    paths:
+      - images/warren-docker-dev-base/**
+      - .github/workflows/warren-docker-dev-base-smoke.yml
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      # warren-docker-base is private (so is this repo), so the anonymous
+      # pull buildx would otherwise attempt for the FROM above 403s --
+      # authenticate with the job's own GITHUB_TOKEN instead.
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: images/warren-docker-dev-base
+          file: images/warren-docker-dev-base/Dockerfile
+          push: false
+          load: true
+          tags: warren-docker-dev-base:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Sanity-check the built image
+        run: |
+          docker run --rm --entrypoint node warren-docker-dev-base:smoke --version
+          docker run --rm --entrypoint npm warren-docker-dev-base:smoke --version
+          docker run --rm --entrypoint python warren-docker-dev-base:smoke --version
+          docker run --rm --entrypoint claude warren-docker-dev-base:smoke --version

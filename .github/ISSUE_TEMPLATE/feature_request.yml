@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose a feature or a change in scope. Open this before sending a feature PR.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Warren has fairly opinionated boundaries (see CONTRIBUTING.md and each package's README).
+        Agreeing on scope here first is cheaper than reworking a PR.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what stops you today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: How you'd solve it, including which package(s) it touches.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security impact
+      description: Does this change a trust boundary, credential path, or what a workspace can reach? See docs/threat-model.md.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered

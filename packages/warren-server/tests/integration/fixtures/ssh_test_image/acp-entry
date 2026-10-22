@@ -1,0 +1,11 @@
+#!/bin/sh
+if [ -n "$SSH_ORIGINAL_COMMAND" ]; then
+    exec /bin/sh -c "$SSH_ORIGINAL_COMMAND"
+fi
+
+if command -v acp-serve >/dev/null 2>&1; then
+    exec acp-serve
+fi
+
+echo "acp-entry: this test fixture image ships no ACP agent (acp-serve not found on PATH)." >&2
+exit 127
