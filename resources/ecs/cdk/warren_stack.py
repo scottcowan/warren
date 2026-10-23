@@ -144,6 +144,10 @@ class WarrenECSStack(cdk.Stack):
         env_suffix: str = "prod",
         ecs_resource_prefix: str = "warren",
         kms_key_id: str = "",
+        # KMS key for the workspace-secret SSM mirror (WARREN_KMS_KEY_ID). Mirrors
+        # terraform's create_ssm_kms_key / ssm_kms_key_arn; falls back to kms_key_id.
+        create_ssm_kms_key: bool = False,
+        ssm_kms_key_arn: str = "",
         # Audit #15: EFS is always encrypted at rest; this only picks the key (an ARN).
         # Empty means aws/elasticfilesystem. Mirrors terraform's var.efs_kms_key_arn.
         efs_kms_key_arn: str = "",
@@ -168,6 +172,21 @@ class WarrenECSStack(cdk.Stack):
     ) -> None:
         super().__init__(scope, id, **kwargs)
         control_plane_image = control_plane_image_uri or image_uri
+        server_id = f"warren-server-control-plane-{env_suffix}"
+        if create_ssm_kms_key:
+            ssm_key = kms.Key(
+                self,
+                "WarrenSsmSecretsKey",
+                description=f"warren {env_suffix}: workspace secrets mirrored to SSM",
+                enable_key_rotation=True,
+                alias=f"alias/warren-ssm-{env_suffix}",
+            )
+            ssm_kms_key_arn = ssm_key.key_arn
+        ssm_kms_key_arn = ssm_kms_key_arn or kms_key_id
+        ssm_secret_parameter_arns = (
+            f"arn:aws:ssm:{self.region}:{self.account}:parameter/{ecs_resource_prefix}/{server_id}/*"
+        )
+        ssm_via_service = {"StringEquals": {"kms:ViaService": f"ssm.{self.region}.amazonaws.com"}}
 
         # ---------------------------------------------------------------
         # VPC — Python if-branch, NOT CfnCondition (per RESEARCH.md anti-patterns)
@@ -660,13 +679,15 @@ class WarrenECSStack(cdk.Stack):
                 resources=[f"arn:aws:ssm:*:*:parameter/{ecs_resource_prefix}/*"],
             )
         )
-        if kms_key_id:
+        exec_decrypt_keys = list(dict.fromkeys(k for k in (ssm_kms_key_arn, kms_key_id) if k))
+        if exec_decrypt_keys:
             exec_role.add_to_policy(
                 iam.PolicyStatement(
                     sid="SSMSecretsResolveKMS",
                     effect=iam.Effect.ALLOW,
                     actions=["kms:Decrypt"],
-                    resources=[kms_key_id],
+                    resources=exec_decrypt_keys,
+                    conditions=ssm_via_service,
                 )
             )
 
@@ -721,7 +742,7 @@ class WarrenECSStack(cdk.Stack):
                     # resolves which SSM parameters to reference per task by verifying the
                     # calling operator's real AWS identity (warren/auth/aws_identity.py — a
                     # presigned sts:GetCallerIdentity URL, never raw credentials) and scoping
-                    # its ListParametersByPath lookup to that identity's own path segment under
+                    # its SSM secret paths to that identity's own path segment under
                     # /warren/*. No new IAM permissions were needed for this — it's additive
                     # path structure under the wildcard resources already granted above.
                     *(
@@ -945,28 +966,13 @@ class WarrenECSStack(cdk.Stack):
                         actions=["iam:PassRole"],
                         resources=[exec_role.role_arn, workspace_task_role.role_arn],
                     ),
-                    # SSMSecrets — T-08-02-03: scoped to {ecs_resource_prefix}/* path only
-                    # (finding #17: var reference, not a hardcoded "warren/" literal, so this
-                    # stays in sync with whatever WARREN_ECS_RESOURCE_PREFIX the
-                    # control-plane task actually runs with).
-                    #
-                    # R23: ssm:GetParameters (plural — reads parameter VALUES by full
-                    # ARN/name) dropped from this statement. ecs.py's
-                    # _fetch_ssm_parameter_names calls ssm.get_parameters_by_path with
-                    # WithDecryption=false — this role only ever needs parameter NAMES to
-                    # build secrets ARNs for a task definition; the values are resolved
-                    # later by the execution role (ECSSecretsResolve below), never by this
-                    # role. Mirrors terraform/main.tf's task_role_policy SSMSecrets
-                    # statement, which never granted GetParameters here either.
-                    iam.PolicyStatement(
-                        sid="SSMSecrets",
-                        effect=iam.Effect.ALLOW,
-                        actions=["ssm:GetParametersByPath"],
-                        resources=[f"arn:aws:ssm:*:*:parameter/{ecs_resource_prefix}/*"],
-                    ),
+                    # No SSM read action at all: ssm:GetParametersByPath can't be limited
+                    # to WithDecryption=false in IAM, so holding it would let this role
+                    # decrypt every workspace secret. ecs.py builds secret ARNs from
+                    # warren's own store. Mirrors terraform/main.tf.
                     # finding #17: secrets/ssm_store.py mirrors every PUT/DELETE /secrets
                     # call into SSM at /{resource_prefix}/{server_id}/{owner_id}/{name} (see
-                    # _param_path) — nothing previously granted this role
+                    # ssm_parameter_name) — nothing previously granted this role
                     # ssm:PutParameter/DeleteParameter, so since the fix making a failed
                     # mirror a 502 (issue #9), every secret write/delete call failed on ECS.
                     #
@@ -983,25 +989,36 @@ class WarrenECSStack(cdk.Stack):
                         sid="SSMSecretsWrite",
                         effect=iam.Effect.ALLOW,
                         actions=["ssm:PutParameter", "ssm:DeleteParameter"],
-                        resources=[
-                            f"arn:aws:ssm:*:*:parameter/{ecs_resource_prefix}/warren-server-control-plane-{env_suffix}/*"
-                        ],
+                        resources=[ssm_secret_parameter_arns],
                     ),
-                    # finding #17: only needed when the SSM parameters are encrypted with a
-                    # customer-managed KMS key (WarrenSettings.kms_key_id) rather than the
-                    # AWS-managed alias/aws/ssm key, which needs no explicit grant. Mirrors
-                    # this file's existing conditional-statement pattern (the EFS statements
-                    # below), gated on kms_key_id being non-empty instead of create_efs.
+                    # SSM mirror CMK: kms:Encrypt only (Standard-tier SecureString puts),
+                    # via SSM, for this server's own parameters. Never kms:Decrypt.
                     *(
                         [
                             iam.PolicyStatement(
-                                sid="SSMSecretsKMS",
+                                sid="SSMSecretsKMSEncrypt",
                                 effect=iam.Effect.ALLOW,
-                                actions=[
-                                    "kms:Encrypt",
-                                    "kms:Decrypt",
-                                    "kms:GenerateDataKey",
-                                ],
+                                actions=["kms:Encrypt"],
+                                resources=[ssm_kms_key_arn],
+                                conditions={
+                                    **ssm_via_service,
+                                    "StringLike": {
+                                        "kms:EncryptionContext:PARAMETER_ARN": ssm_secret_parameter_arns
+                                    },
+                                },
+                            ),
+                        ]
+                        if ssm_kms_key_arn
+                        else []
+                    ),
+                    # ECS Exec into this task with an encrypted session/log key. Not an SSM
+                    # read: this role can never obtain a SecureString's ciphertext.
+                    *(
+                        [
+                            iam.PolicyStatement(
+                                sid="ECSExecLogKMS",
+                                effect=iam.Effect.ALLOW,
+                                actions=["kms:Decrypt", "kms:GenerateDataKey"],
                                 resources=[kms_key_id],
                             ),
                         ]
@@ -1387,7 +1404,7 @@ class WarrenECSStack(cdk.Stack):
                     environment=[
                         ecs.CfnTaskDefinition.KeyValuePairProperty(
                             name="WARREN_SERVER_ID",
-                            value=f"warren-server-control-plane-{env_suffix}",
+                            value=server_id,
                         ),
                         ecs.CfnTaskDefinition.KeyValuePairProperty(
                             name="WARREN_RUNTIME_TYPE", value="ecs"
@@ -1453,7 +1470,7 @@ class WarrenECSStack(cdk.Stack):
                             name="WARREN_ECS_RESOURCE_PREFIX", value=ecs_resource_prefix
                         ),
                         ecs.CfnTaskDefinition.KeyValuePairProperty(
-                            name="WARREN_KMS_KEY_ID", value=kms_key_id
+                            name="WARREN_KMS_KEY_ID", value=ssm_kms_key_arn
                         ),
                     ],
                     log_configuration=ecs.CfnTaskDefinition.LogConfigurationProperty(

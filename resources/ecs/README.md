@@ -402,6 +402,66 @@ tasks on public subnets have no route to the internet.
 **Activating ECS runtime:** set `WARREN_RUNTIME_TYPE=ecs` to switch warren-server from the
 default Podman runtime to ECSRuntime.
 
+## Workspace secrets: SSM and KMS permissions
+
+warren-server's local SQLite store (encrypted with `WARREN_SECRET_KEY`) is the source of
+truth for workspace secrets. On ECS each secret is also written to an SSM SecureString at
+`/<WARREN_ECS_RESOURCE_PREFIX>/<WARREN_SERVER_ID>/<owner_id>/<name>`, and the workspace
+task definition references it by ARN, so the ECS agent resolves the value at container
+start. The control plane builds those ARNs from its own store; it never lists or reads
+SSM. That keeps `ssm:GetParametersByPath` off the control plane: IAM can't force
+`WithDecryption=false` on it, so holding it would let a compromised control plane decrypt
+every secret. A write that can't reach SSM is kept in a durable outbox in SQLite (names and
+operations only, never values) and retried at startup, every 60s, on the next write, and
+before provisioning a workspace that needs it. The API answers `202 mirror_pending` until
+it lands, and such a workspace refuses to start rather than launch without it.
+
+Settings on the control-plane task:
+
+| Env var | Meaning |
+|---------|---------|
+| `WARREN_ECS_RESOURCE_PREFIX` | Leading path segment and task-definition family prefix. Required non-empty, `[A-Za-z0-9][A-Za-z0-9_-]{0,31}`. |
+| `WARREN_SERVER_ID` | Second path segment. Set it to a stable value (e.g. the service name); no `/` or surrounding spaces. |
+| `WARREN_KMS_KEY_ID` | Optional customer-managed key (ARN, ID or alias) for every SecureString `PutParameter`. Empty uses `alias/aws/ssm`. |
+
+**Control-plane task role**, with `PARAMS = arn:aws:ssm:<region>:<account>:parameter/<prefix>/<server_id>/*`:
+
+| Actions | Resource | Condition |
+|---------|----------|-----------|
+| `ssm:PutParameter`, `ssm:DeleteParameter` | `PARAMS` | |
+| `kms:Encrypt` (only with `WARREN_KMS_KEY_ID`) | the key ARN | `kms:ViaService = ssm.<region>.amazonaws.com`, `kms:EncryptionContext:PARAMETER_ARN` like `PARAMS` |
+
+It needs no `ssm:GetParameter`, `ssm:GetParameters`, `ssm:GetParametersByPath`,
+`ssm:DescribeParameters` and no `kms:Decrypt` for secrets. Parameters are always written
+as Standard tier, so SSM encrypts them with a direct `kms:Encrypt` call; Advanced tier
+would need `kms:GenerateDataKey`. `alias/aws/ssm` needs no KMS grant.
+
+**Task execution role** (used by the ECS agent for workspace tasks):
+
+| Actions | Resource | Condition |
+|---------|----------|-----------|
+| `ssm:GetParameters` | `PARAMS` | |
+| `kms:Decrypt` (only with `WARREN_KMS_KEY_ID`) | the key ARN | `kms:ViaService = ssm.<region>.amazonaws.com` |
+
+A customer-managed key's policy must let these IAM grants apply, e.g. the standard
+"Enable IAM policies" statement for the account root. Prefer a key dedicated to these
+secrets. In Terraform/CDK, `kms_key_id` also encrypts ECS Exec sessions/logs, which gives
+the task roles `kms:Decrypt` on it. That alone can't expose a secret, because the control
+plane can't fetch SSM ciphertext, but a dedicated key keeps it clean. Terraform:
+`create_ssm_kms_key = true` (creates a rotating key and alias `alias/warren-ssm-<env>`) or
+`ssm_kms_key_arn`. CDK: context `create_ssm_kms_key=true` or `ssm_kms_key_arn`. Both fall
+back to `kms_key_id`.
+
+**Task-definition families.** Workspace task definitions are registered as family
+`<prefix>-<image slug>`, where the slug is the image reference without its registry host,
+with each run of characters outside `[A-Za-z0-9]` replaced by `-`, trimmed, and cut so the
+family is at most 64 characters. So `ecs:DeregisterTaskDefinition` (and `ecs:RunTask`) can
+be scoped to `arn:aws:ecs:<region>:<account>:task-definition/<prefix>-*:*`.
+`ecs:RegisterTaskDefinition` doesn't support resource-level scoping. That wildcard also
+matches any other family starting with `<prefix>-`, including this stack's own
+`warren-server-control-plane-<env>` with the default prefix. Keep the explicit Deny on the
+control plane's own family, and give each deployment in an account its own prefix.
+
 ## ECS Exec access
 
 Every workspace task carries a `warren.owner_id` tag (`<WARREN_ECS_RESOURCE_PREFIX>.owner_id`).
