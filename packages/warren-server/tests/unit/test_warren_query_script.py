@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-SCRIPT = Path(__file__).parents[1] / "src" / "warren_common" / "assets" / "warren_query.sh"
+SCRIPT = Path(__file__).parents[3] / "warren-common" / "src" / "warren_common" / "assets" / "warren_query.sh"
 
 
 def _gnu_or_busybox_stat() -> bool:
