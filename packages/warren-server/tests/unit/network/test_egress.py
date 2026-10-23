@@ -22,7 +22,6 @@ import pytest
 
 from warren.network.egress import (
     EgressUnavailable,
-    ensure_bridge_network,
     find_host_veth,
     read_container_egress_bytes,
     read_container_egress_bytes_via_shim,
@@ -161,37 +160,6 @@ def test_find_host_veth_timeout_raises_egress_unavailable(monkeypatch):
 
     with pytest.raises(EgressUnavailable):
         find_host_veth("abc123")
-
-
-def test_ensure_bridge_network_timeout_raises_egress_unavailable(monkeypatch):
-    def fake_run(args, **kwargs):
-        raise subprocess.TimeoutExpired(cmd=args, timeout=kwargs.get("timeout", 10.0))
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    with pytest.raises(EgressUnavailable):
-        ensure_bridge_network("warren-bridge")
-
-
-def test_ensure_bridge_network_is_idempotent(monkeypatch):
-    create_calls = []
-
-    def fake_run(args, **kwargs):
-        if args[:3] == ["podman", "network", "exists"]:
-            return _fake_completed(returncode=0)
-        if args[:3] == ["podman", "network", "create"]:
-            create_calls.append(args)
-            return _fake_completed(returncode=0)
-        raise AssertionError(f"unexpected subprocess args: {args}")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    # Calling twice when the network already exists must not raise and must not
-    # attempt to create a duplicate.
-    ensure_bridge_network("warren-egress")
-    ensure_bridge_network("warren-egress")
-
-    assert create_calls == []
 
 
 def test_read_container_egress_bytes_reresolves_veth_every_call(monkeypatch):

@@ -256,6 +256,28 @@ def _reference_git_denies(spec: WorkspaceSpec, p: _Params) -> str:
     return "; Reference clone .git always write-protected (R4, AE1)\n" + "\n".join(lines)
 
 
+def _git_store_denies(spec: WorkspaceSpec, p: _Params) -> str:
+    """Write-deny every bare `.git-store` even where a broader grant (system
+    tmpdirs, root_path, an rw bind mount) covers it: host git runs against
+    these stores outside the sandbox (BB7). Each ancestor directory is also
+    protected from unlink/rename, or the store could be moved aside and a
+    planted one put in its place."""
+    lines: list[str] = []
+    for store in spec.git_store_paths:
+        canon = Path(canonical_path(store))
+        lines.append(f"(deny file-write* (subpath {p(str(canon))}))")
+        lines += [
+            f"(deny file-write-unlink (literal {p(str(parent))}))"
+            for parent in canon.parents
+            if parent != parent.parent
+        ]
+    if not lines:
+        return ""
+    return "; Bare git stores and their ancestors always write-protected (BB7)\n" + "\n".join(
+        dict.fromkeys(lines)
+    )
+
+
 def _readonly_denies(spec: WorkspaceSpec, p: _Params) -> str:
     """Write-deny every readonly folder and `ro` bind mount. Not granting write
     isn't enough: a path under /tmp, /private/tmp or /private/var/folders is
@@ -442,6 +464,9 @@ def build_sbpl_profile(spec: WorkspaceSpec) -> SbplProfile:
     readonly_denies = _readonly_denies(spec, p)
     if readonly_denies:
         deny_sections.append(readonly_denies)
+    store_denies = _git_store_denies(spec, p)
+    if store_denies:
+        deny_sections.append(store_denies)
 
     sections = [
         _HEADER,

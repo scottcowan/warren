@@ -15,9 +15,11 @@ from warren_common.harness import grants_for_spec
 from warren_common.runtime.base import WorkspaceSpec
 from warren_common.runtime.sandbox_env import (
     ENV_MOUNT_DEST,
+    check_git_stores_not_writable,
     check_no_secret_service_mounts,
     host_mount_sources,
     nsjail_secret_env_path,
+    writable_mount_sources,
 )
 
 
@@ -225,6 +227,7 @@ class NsjailConfig:
         )
         # AG6: union of the template's harness grants; readonly re-mounted ro last.
         grants = grants_for_spec(spec, Path.home())
+        check_git_stores_not_writable(spec, writable_mount_sources(spec, list(grants.write)))
         for path in grants.read:
             mounts.append(MountEntry(src=path, dst=path, rw=False, mandatory=False))
         for path in grants.write:

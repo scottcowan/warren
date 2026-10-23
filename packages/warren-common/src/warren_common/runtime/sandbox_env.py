@@ -72,6 +72,37 @@ def check_no_secret_service_mounts(host_paths: list[str]) -> None:
                 )
 
 
+def check_git_stores_not_writable(spec, writable: list[str]) -> None:
+    """Refuse a writable mount that is or contains a bare `.git-store`: host
+    git runs against those stores outside the sandbox (BB7), and a writable
+    ancestor would let the store be moved aside and replaced. The stores
+    themselves are never mounted into a Linux sandbox."""
+    from warren_common.errors import TemplateDenied  # noqa: PLC0415
+
+    for store in spec.git_store_paths:
+        canon = os.path.realpath(store)
+        for raw in writable:
+            host = os.path.realpath(os.path.expanduser(raw))
+            if canon == host or canon.startswith(host.rstrip(os.sep) + os.sep):
+                raise TemplateDenied(
+                    f"writable mount {raw!r} would expose git store {store} to the sandbox"
+                )
+
+
+def writable_mount_sources(spec, grant_writes: list[str]) -> list[str]:
+    """Every host path a local Linux sandbox binds read-write from `spec`."""
+    return [
+        p
+        for p in (
+            spec.root_path,
+            *(h for h, _ in spec.worktree_paths),
+            *grant_writes,
+            *(h for h, _, mode in spec.bind_mounts if mode == "rw"),
+        )
+        if p
+    ]
+
+
 def host_mount_sources(spec) -> list[str]:
     """Every host path a local Linux sandbox binds from `spec`, for
     check_no_secret_service_mounts. The ssh agent socket is an exact-file bind

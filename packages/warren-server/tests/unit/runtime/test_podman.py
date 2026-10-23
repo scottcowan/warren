@@ -285,7 +285,7 @@ async def test_provision_publishes_ssh_port_when_given():
         runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
         await runtime.provision(_spec(), ssh_port=30017)
         _, kwargs = client.containers.create.call_args
-        assert kwargs["ports"] == {"22/tcp": 30017}
+        assert kwargs["ports"] == {"22/tcp": ("127.0.0.1", 30017)}
 
 
 @pytest.mark.asyncio
@@ -330,7 +330,7 @@ async def test_provision_publish_ssh_port_defaults_to_true_for_direct_callers():
         runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
         await runtime.provision(_spec(), ssh_port=30017)
         _, kwargs = client.containers.create.call_args
-        assert kwargs["ports"] == {"22/tcp": 30017}
+        assert kwargs["ports"] == {"22/tcp": ("127.0.0.1", 30017)}
 
 
 @pytest.mark.asyncio
@@ -727,6 +727,182 @@ async def test_prune_workspace_networks_removes_only_this_servers_orphans():
         runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
         await runtime.prune_workspace_networks("srv-1", {"ws-live"})
         client.networks.remove.assert_called_once_with("orphan")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("publish_host", "expected"), [("10.0.0.5", ("10.0.0.5", 30017)), ("", 30017)]
+)
+async def test_provision_publishes_ssh_port_on_configured_host(publish_host, expected):
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.create.return_value = MagicMock(id="ctr-abc")
+        runtime = PodmanRuntime(
+            socket_path="/tmp/sock", server_id="srv-1", ssh_publish_host=publish_host
+        )
+        await runtime.provision(_spec(), ssh_port=30017)
+        assert client.containers.create.call_args.kwargs["ports"] == {"22/tcp": expected}
+
+
+# --- Shared `warren-egress` bridge -> per-workspace network migration (reconcile) ---
+
+
+class _MigrationClient:
+    """Just enough of podman-py for _migrate_shared_bridge: networks + containers."""
+
+    def __init__(self, containers, networks, *, fail_connect=(), in_use=()):
+        self.ops: list[tuple] = []
+        self._containers = containers  # id -> (labels, [network names])
+        self._networks = networks  # name -> attrs
+        self._fail_connect = set(fail_connect)
+        self._in_use = set(in_use)
+        self.networks = MagicMock()
+        self.networks.get.side_effect = self._get_network
+        self.networks.remove.side_effect = self._remove_network
+        self.networks.list.return_value = []
+        self.containers = MagicMock()
+        self.containers.list.side_effect = lambda all=True: [
+            MagicMock(id=cid, labels=labels) for cid, (labels, _) in self._containers.items()
+        ]
+        self.containers.get.side_effect = lambda cid: MagicMock(
+            id=cid,
+            attrs={"NetworkSettings": {"Networks": {n: {} for n in self._containers[cid][1]}}},
+        )
+
+    def _get_network(self, name):
+        if name not in self._networks:
+            raise NotFound(name)
+        net = MagicMock(attrs=self._networks[name])
+        net.name = name
+
+        def connect(cid):
+            if (name, cid) in self._fail_connect:
+                raise APIError("connect failed")
+            self.ops.append(("connect", name, cid))
+
+        net.connect.side_effect = connect
+        net.disconnect.side_effect = lambda cid: self.ops.append(("disconnect", name, cid))
+        return net
+
+    def _remove_network(self, name):
+        if name in self._in_use:
+            raise APIError(f"network {name} is being used")
+        self.ops.append(("remove", name))
+
+
+def _ours(ws_id, server="srv-1"):
+    return {"warren.workspace_id": ws_id, "warren.server_instance": server}
+
+
+_LEGACY = {"driver": "bridge", "labels": {}}
+
+
+async def _reconcile_with(fake, keep, *, prefix="warren-egress"):
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        ClientCls.return_value = fake
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1", egress_bridge_name=prefix)
+        await runtime.reconcile_networks("srv-1", keep)
+
+
+@pytest.mark.asyncio
+async def test_migration_moves_workspace_off_shared_bridge_then_removes_it():
+    fake = _MigrationClient(
+        {"c1": (_ours("ws-1"), ["warren-egress"])},
+        {"warren-egress": _LEGACY, "warren-egress-ws-1": {}},
+    )
+    with patch("warren.runtime.podman._ensure_workspace_network") as ensure_mock:
+        await _reconcile_with(fake, {"ws-1"})
+    ensure_mock.assert_called_once()
+    assert ensure_mock.call_args.args[1:] == (
+        "warren-egress-ws-1",
+        {"warren.workspace_id": "ws-1", "warren.server_instance": "srv-1", "warren.network": "workspace"},
+    )
+    # Disconnect first, so the new network gets eth0 (the egress counter's interface).
+    assert fake.ops == [
+        ("disconnect", "warren-egress", "c1"),
+        ("connect", "warren-egress-ws-1", "c1"),
+        ("remove", "warren-egress"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_migration_skips_other_servers_unknown_rows_and_migrated_containers():
+    fake = _MigrationClient(
+        {
+            "theirs": (_ours("ws-x", server="srv-2"), ["warren-egress"]),
+            "orphan": (_ours("ws-gone"), ["warren-egress"]),
+            "done": (_ours("ws-1"), ["warren-egress-ws-1"]),
+        },
+        {"warren-egress": _LEGACY, "warren-egress-ws-1": {}},
+        in_use={"warren-egress"},
+    )
+    await _reconcile_with(fake, {"ws-1", "ws-x"})
+    assert fake.ops == []
+
+
+@pytest.mark.asyncio
+async def test_migration_connect_failure_reattaches_shared_bridge_and_continues():
+    fake = _MigrationClient(
+        {
+            "c1": (_ours("ws-1"), ["warren-egress"]),
+            "c2": (_ours("ws-2"), ["warren-egress"]),
+        },
+        {"warren-egress": _LEGACY, "warren-egress-ws-1": {}, "warren-egress-ws-2": {}},
+        fail_connect={("warren-egress-ws-1", "c1")},
+        in_use={"warren-egress"},
+    )
+    await _reconcile_with(fake, {"ws-1", "ws-2"})
+    assert fake.ops == [
+        ("disconnect", "warren-egress", "c1"),
+        ("connect", "warren-egress", "c1"),
+        ("disconnect", "warren-egress", "c2"),
+        ("connect", "warren-egress-ws-2", "c2"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_migration_ensure_failure_leaves_container_on_shared_bridge():
+    fake = _MigrationClient(
+        {"c1": (_ours("ws-1"), ["warren-egress"])},
+        {"warren-egress": _LEGACY},
+        in_use={"warren-egress"},
+    )
+    with patch(
+        "warren.runtime.podman._ensure_workspace_network", side_effect=RuntimeUnreachable("no")
+    ):
+        await _reconcile_with(fake, {"ws-1"})
+    assert fake.ops == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attrs",
+    [
+        {"driver": "macvlan", "labels": {}},
+        {"driver": "bridge", "labels": {"warren.server_instance": "srv-2"}},
+    ],
+)
+async def test_shared_bridge_not_removed_unless_plausibly_ours(attrs):
+    fake = _MigrationClient({}, {"warren-egress": attrs})
+    await _reconcile_with(fake, set())
+    assert fake.ops == []
+
+
+@pytest.mark.asyncio
+async def test_shared_bridge_labelled_for_this_server_is_removed():
+    fake = _MigrationClient(
+        {}, {"warren-egress": {"driver": "bridge", "labels": {"warren.server_instance": "srv-1"}}}
+    )
+    await _reconcile_with(fake, set())
+    assert fake.ops == [("remove", "warren-egress")]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_networks_without_prefix_only_prunes():
+    fake = _MigrationClient({"c1": (_ours("ws-1"), ["warren-egress"])}, {"warren-egress": _LEGACY})
+    await _reconcile_with(fake, {"ws-1"}, prefix="")
+    assert fake.ops == []
+    fake.networks.list.assert_called_once()
 
 
 # --- 04-04 Task 1: PodmanRuntime.build_image (LIFE-04, D-09) ---

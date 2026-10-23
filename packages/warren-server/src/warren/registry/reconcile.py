@@ -145,8 +145,9 @@ async def reconcile_from_disk(
         )
         await runtime.destroy(handle)
 
-    # Finding 9: per-workspace networks (podman) outlive a provision that failed
-    # before destroy() could run; drop any whose workspace row is gone.
-    prune = getattr(runtime, "prune_workspace_networks", None)
-    if prune is not None:
-        await prune(server_id, known_ws_ids)
+    # Finding 9 (podman): move workspaces still on the legacy shared bridge onto
+    # their own network, and drop per-workspace networks whose row is gone (a
+    # provision that failed before destroy() could run).
+    reconcile_networks = getattr(runtime, "reconcile_networks", None)
+    if reconcile_networks is not None:
+        await reconcile_networks(server_id, known_ws_ids)
