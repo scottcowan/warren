@@ -28,15 +28,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 FROM python:3.11-slim@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce
 # 3.11-slim as of 2026-10-17
-# `podman` CLI is still needed here for exactly one thing: ensure_bridge_network's
-# `podman network create`/`network exists` (network/egress.py). That does NOT hit
-# the "remote client" restriction (only `podman unshare` does), so CONTAINER_HOST
-# + any reasonably recent podman package is fine for it — no version pinning, no
-# runc/uidmap, no local-mode bind mounts needed for this one call.
-#
-# The actual per-workspace egress read (`find_host_veth`/`read_egress_bytes`,
-# which DO need `podman unshare --rootless-netns`) no longer runs inside this
-# container at all (node2 finding, 2026-09-19): a rootless container can never
+# No `podman` CLI: workspace networks are managed through the API socket
+# (podman-py), and the per-workspace egress read (`find_host_veth`/
+# `read_egress_bytes`, which need `podman unshare --rootless-netns`) can't run
+# inside this container at all (node2 finding, 2026-09-19): a rootless container can never
 # genuinely own the kernel-level subuid range `podman unshare` needs to build a
 # second nested namespace layer, no matter what's bind-mounted in or what
 # capabilities are added — confirmed via `newuidmap: write to uid_map failed:
@@ -50,11 +45,10 @@ FROM python:3.11-slim@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e57
 # (warren/git/manager.py's _ssh_key_env). Neither was ever installed here --
 # every clone, HTTPS/GitHub-App or SSH, has silently had nothing to actually
 # shell out to on a real deployment until now.
-RUN apt-get update && apt-get install -y --no-install-recommends podman git openssh-client \
+RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
-ENV CONTAINER_HOST="unix:///run/user/1000/podman/podman.sock"
 RUN useradd -u 1000 -m warren
 USER warren
 WORKDIR /var/lib/warren

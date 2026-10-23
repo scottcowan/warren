@@ -140,6 +140,7 @@ class PodmanRuntime:
         *,
         client_timeout: float = _DEFAULT_CLIENT_TIMEOUT_SECONDS,
         egress_bridge_name: str = "warren-egress",
+        ssh_publish_host: str = "127.0.0.1",
     ) -> None:
         self._socket_path = str(socket_path)
         self._server_id = server_id
@@ -149,6 +150,7 @@ class PodmanRuntime:
         # D-04: prefix of each workspace's own bridge network (Finding 9);
         # app.py threads settings.egress_bridge_name through. "" = pasta default.
         self._egress_bridge_name = egress_bridge_name
+        self._ssh_publish_host = ssh_publish_host
 
     # --- ContainerRuntime Protocol surface ---
 
@@ -251,9 +253,13 @@ class PodmanRuntime:
         # deliberately NOT "omit ssh_port" -- allocation/bookkeeping (the stored
         # ssh_port column, allocate_ssh_port()) stays exactly as it was; only
         # whether the port is actually exposed on the container changes.
+        # Bound to `ssh_publish_host` (loopback by default): rootless podman
+        # keeps host loopback unreachable from containers, so other workspaces
+        # can't reach this port via the host or the bridge gateway.
         if ssh_port is not None and publish_ssh_port:
-            ports={"22/tcp": ssh_port}
-            create_kwargs["ports"] = ports
+            create_kwargs["ports"] = {
+                "22/tcp": (self._ssh_publish_host, ssh_port) if self._ssh_publish_host else ssh_port
+            }
 
         # D-04: rootless `pasta` has no veth pair and so no host-readable byte
         # counters (04-RESEARCH.md Pitfall 1), so every workspace is attached to
@@ -271,11 +277,7 @@ class PodmanRuntime:
                 _ensure_workspace_network,
                 self._client,
                 network_name,
-                {
-                    _WARREN_LABEL_WORKSPACE_ID: spec.workspace_id,
-                    _WARREN_LABEL_SERVER_INSTANCE: self._server_id,
-                    _WARREN_LABEL_NETWORK: "workspace",
-                },
+                self._workspace_network_labels(spec.workspace_id),
             )
             create_kwargs["networks"] = {network_name: {}}
             # podman-py only populates the create payload's `netns` field when
@@ -466,6 +468,71 @@ class PodmanRuntime:
             pass
         except (APIError, PodmanError, ConnectionError):
             log.warning("workspace_network_remove_failed", network=name)
+
+    def _workspace_network_labels(self, workspace_id: str) -> dict[str, str]:
+        return {
+            _WARREN_LABEL_WORKSPACE_ID: workspace_id,
+            _WARREN_LABEL_SERVER_INSTANCE: self._server_id,
+            _WARREN_LABEL_NETWORK: "workspace",
+        }
+
+    async def reconcile_networks(self, server_id: str, keep_workspace_ids: set[str]) -> None:
+        """Startup network reconcile: migrate legacy shared-bridge workspaces, then prune."""
+        if self._egress_bridge_name:
+            await self._migrate_shared_bridge(server_id, keep_workspace_ids)
+        await self.prune_workspace_networks(server_id, keep_workspace_ids)
+
+    async def _migrate_shared_bridge(self, server_id: str, keep_workspace_ids: set[str]) -> None:
+        """Move this server's workspaces off the pre-Finding-9 shared bridge (named exactly
+        `egress_bridge_name`) onto their own isolated network, then drop the shared bridge
+        once nothing uses it.
+
+        Disconnect comes before connect so the new network takes `eth0` again, which is
+        the interface the egress byte counter reads; a failed connect reattaches the
+        shared bridge rather than leaving the workspace offline."""
+        shared = self._egress_bridge_name
+        for summary in await self.list_by_server(server_id):
+            ws_id = (summary.labels or {}).get(_WARREN_LABEL_WORKSPACE_ID)
+            if not ws_id or ws_id not in keep_workspace_ids:
+                continue
+            try:
+                container = await asyncio.to_thread(self._client.containers.get, summary.id)
+            except NotFound:
+                continue
+            networks = (container.attrs.get("NetworkSettings") or {}).get("Networks") or {}
+            if shared not in networks:
+                continue
+            target = self._workspace_network_name(ws_id)
+            try:
+                await asyncio.to_thread(
+                    _ensure_workspace_network, self._client, target, self._workspace_network_labels(ws_id)
+                )
+                await asyncio.to_thread(_switch_network, self._client, container.id, shared, target)
+            except (RuntimeUnreachable, APIError, PodmanError, ConnectionError):
+                log.exception("shared_bridge_migration_failed", workspace_id=ws_id)
+                continue
+            log.info("shared_bridge_migrated", workspace_id=ws_id, network=target)
+
+        try:
+            network = await asyncio.to_thread(self._client.networks.get, shared)
+        except NotFound:
+            return
+        except (APIError, PodmanError, ConnectionError):
+            log.warning("shared_bridge_lookup_failed", network=shared)
+            return
+        attrs = network.attrs if isinstance(network.attrs, dict) else {}
+        labels = attrs.get("labels") or {}
+        owner = labels.get(_WARREN_LABEL_SERVER_INSTANCE)
+        if attrs.get("driver") != "bridge" or (owner is not None and owner != server_id):
+            return
+        # Without force, podman refuses to remove a network any container still uses.
+        try:
+            await asyncio.to_thread(self._client.networks.remove, shared)
+            log.info("shared_bridge_removed", network=shared)
+        except NotFound:
+            pass
+        except (APIError, PodmanError, ConnectionError):
+            log.info("shared_bridge_still_in_use", network=shared)
 
     async def prune_workspace_networks(self, server_id: str, keep_workspace_ids: set[str]) -> None:
         """Remove this server's per-workspace networks whose workspace is gone (reconcile).
@@ -717,6 +784,15 @@ def _ensure_workspace_network(client: Any, name: str, labels: dict[str, str]) ->
         raise RuntimeUnreachable(
             f"network {name!r} exists but is not an isolated warren workspace network for this server"
         )
+
+
+def _switch_network(client: Any, container_id: str, old: str, new: str) -> None:
+    client.networks.get(old).disconnect(container_id)
+    try:
+        client.networks.get(new).connect(container_id)
+    except (APIError, PodmanError, ConnectionError):
+        client.networks.get(old).connect(container_id)
+        raise
 
 
 async def run_preflight(socket_path: str | Path) -> None:

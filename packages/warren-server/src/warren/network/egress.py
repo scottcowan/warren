@@ -40,7 +40,7 @@ read host-namespace `ip link` state) — everything here shells out to the `podm
 CLI binaries via `subprocess.run`. It also has no structlog/FastAPI/pydantic imports;
 callers are responsible for logging.
 
-ALL FOUR PUBLIC FUNCTIONS ARE SYNCHRONOUS AND BLOCKING. Every call site must wrap them in
+EVERY PUBLIC FUNCTION IS SYNCHRONOUS AND BLOCKING. Every call site must wrap them in
 `asyncio.to_thread(...)` (see `04-PATTERNS.md`'s "asyncio.to_thread boundary wrap") — do not
 call them bare inside an `async def`.
 """
@@ -78,40 +78,6 @@ class EgressUnavailable(RuntimeError):
     as this single exception type (with the original exception attached as `__cause__`), so
     callers only ever need to catch one thing.
     """
-
-
-def ensure_bridge_network(name: str, *, podman_binary: str = "podman") -> None:
-    """Idempotently create a Podman bridge network named `name`.
-
-    No-op (does not raise, does not create a duplicate) when the network already exists.
-    """
-    try:
-        exists = subprocess.run(
-            [podman_binary, "network", "exists", name],
-            capture_output=True,
-            timeout=_SUBPROCESS_TIMEOUT,
-        )
-        if exists.returncode == 0:
-            return
-
-        result = subprocess.run(
-            [podman_binary, "network", "create", "--driver", "bridge", name],
-            capture_output=True,
-            timeout=_SUBPROCESS_TIMEOUT,
-        )
-        if result.returncode != 0:
-            stderr = _decode(result.stderr)
-            if "already exists" in stderr.lower():
-                return
-            raise EgressUnavailable(
-                f"failed to create bridge network {name!r}: {stderr}"
-            )
-    except FileNotFoundError as e:
-        raise EgressUnavailable(f"podman binary not found: {podman_binary!r}") from e
-    except subprocess.CalledProcessError as e:
-        raise EgressUnavailable(f"failed to create bridge network {name!r}") from e
-    except subprocess.TimeoutExpired as e:
-        raise EgressUnavailable(f"timed out creating bridge network {name!r}") from e
 
 
 def find_host_veth(container_id: str, *, podman_binary: str = "podman") -> str:

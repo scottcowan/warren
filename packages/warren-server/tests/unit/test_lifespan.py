@@ -298,6 +298,7 @@ async def test_lifespan_passes_bridge_name_to_podman_runtime(env_defaults):
         async with lifespan(app):
             _, kwargs = runtime_cls.call_args
             assert kwargs["egress_bridge_name"] == app.state.settings.egress_bridge_name
+            assert kwargs["ssh_publish_host"] == app.state.settings.ssh_publish_host == "127.0.0.1"
 
 
 @pytest.mark.asyncio

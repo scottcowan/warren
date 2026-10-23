@@ -77,6 +77,12 @@ class WarrenSettings(BaseSettings):
     ssh_port_range_start: int = 30000
     ssh_port_range_end: int = 31000
     ssh_advertised_host: str = ""
+    # Host address the podman workspace SSH port is published on. Loopback keeps it
+    # unreachable from other workspaces (rootless podman gives containers no route to
+    # host loopback); "" or a LAN address exposes it to the LAN and to workspaces alike,
+    # leaving the per-workspace SSH key as the only barrier. `warren connect` doesn't use
+    # this port (it runs `podman exec` over the operator's own SSH to the host).
+    ssh_publish_host: str = "127.0.0.1"
     # Audit R12: the allocated SSH host port used to be published on every podman
     # workspace's container unconditionally, even though the in-container sshd this was
     # meant to serve was never actually built into the reference image (images/

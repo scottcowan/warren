@@ -10,7 +10,7 @@ import pytest as _pytest
 # throwaway HOME is set before any test module (and any import-time
 # Path.home()) loads, and each test then gets its own.
 #
-# Rootless `podman` CLI calls (e.g. egress.ensure_bridge_network) locate their
+# Rootless `podman` CLI calls (e.g. egress.read_container_egress_bytes) locate their
 # config and storage via XDG_CONFIG_HOME/XDG_DATA_HOME, falling back to $HOME.
 # Pin those to the runner's real locations before HOME moves, so live-podman
 # integration tests share the store the podman API socket uses (see
