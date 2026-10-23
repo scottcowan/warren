@@ -2,6 +2,10 @@
 
 Image releases, newest first. Written by scripts/release.py.
 
+## warren-server 1.1.3 (2026-10-23)
+
+- fix: control plane never reads SSM (outbox mirror), Encrypt-only KMS, session-manager-plugin in the server image (#39) (cf22f5f)
+
 ## warren-server 1.1.2 (2026-10-23)
 
 - refactor(sidecar): reduce warren-sidecar to the in-container agent-state recorder (#38) (ab4a740)
