@@ -107,6 +107,13 @@ class WarrenSettings(BaseSettings):
     # 2026-10-13) -- confusing, since the clone itself succeeds (it's visible
     # from inside warren-server's own container just fine).
     host_data_dir: Path | None = None
+    # Audit #10: SQLite journal mode for warren.db. "auto" uses WAL on a local
+    # filesystem and DELETE when data_dir is on a network filesystem (EFS/NFS),
+    # where WAL's shared-memory index is not safe. Explicit "wal"/"delete" override.
+    sqlite_journal_mode: Literal["auto", "wal", "delete"] = "auto"
+    # Audit #10: how long startup waits for warren.db.lock (a stopped Fargate task's
+    # NFSv4 lock can outlive it until the lease expires). 0 fails fast.
+    writer_lock_wait_s: float = Field(default=120.0, ge=0)
     projects_dir: Path = Path.home() / ".warren" / "projects"
     server_id: str = Field(default_factory=socket.gethostname)
 

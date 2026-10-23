@@ -296,6 +296,79 @@ def test_ssm_mirror_called_on_ecs_put_and_delete(env_defaults, monkeypatch, auth
             fake_ssm.delete_parameter.assert_called_once()
 
 
+@contextmanager
+def _ecs_client(monkeypatch, auth_headers):
+    monkeypatch.setenv("WARREN_RUNTIME_TYPE", "ecs")
+    fake_ssm = MagicMock()
+    fake_ssm.get_parameters_by_path.return_value = {"Parameters": []}
+    fake_runtime = MagicMock()
+    fake_runtime.ssm_client.return_value = fake_ssm
+    aws_headers = {"X-AWS-STS-Signed-Request": '{"url": "https://sts.amazonaws.com/"}'}
+    with (
+        patch("warren.app.WorkspaceRegistry", return_value=_make_fake_registry()),
+        patch("warren.runtime.ecs.ECSRuntime", return_value=fake_runtime),
+        patch(
+            "warren.auth.aws_identity.verify_signed_caller_identity",
+            AsyncMock(return_value="deadbeef" * 4),
+        ),
+    ):
+        with TestClient(
+            app, headers={**auth_headers, **aws_headers}, raise_server_exceptions=False
+        ) as client:
+            yield client, fake_ssm
+
+
+def test_put_failed_local_write_deletes_new_ssm_parameter(env_defaults, monkeypatch, auth_headers):
+    # Audit #13: SSM is written first; if the local write then fails, ECS must not
+    # keep injecting a secret GET /secrets doesn't report.
+    with _ecs_client(monkeypatch, auth_headers) as (client, fake_ssm):
+        with patch("warren.secrets.store.set_secret", AsyncMock(side_effect=RuntimeError("disk"))):
+            resp = client.put("/secrets", json={"name": "A", "value": "new"})
+        assert resp.status_code == 500
+        fake_ssm.put_parameter.assert_called_once()
+        fake_ssm.delete_parameter.assert_called_once_with(Name=f"/warren/test-server/{'deadbeef' * 4}/A")
+        assert client.get("/secrets").json() == []
+
+
+def test_put_failed_local_overwrite_restores_previous_ssm_value(
+    env_defaults, monkeypatch, auth_headers
+):
+    with _ecs_client(monkeypatch, auth_headers) as (client, fake_ssm):
+        assert client.put("/secrets", json={"name": "A", "value": "old"}).status_code == 204
+        with patch("warren.secrets.store.set_secret", AsyncMock(side_effect=RuntimeError("disk"))):
+            resp = client.put("/secrets", json={"name": "A", "value": "new"})
+        assert resp.status_code == 500
+        values = [c.kwargs["Value"] for c in fake_ssm.put_parameter.call_args_list]
+        assert values == ["old", "new", "old"]
+        fake_ssm.delete_parameter.assert_not_called()
+
+
+def test_rotate_failed_local_write_restores_previous_ssm_value(
+    env_defaults, monkeypatch, auth_headers
+):
+    with _ecs_client(monkeypatch, auth_headers) as (client, fake_ssm):
+        assert client.put("/secrets", json={"name": "A", "value": "old"}).status_code == 204
+        with patch("warren.secrets.store.set_secret", AsyncMock(side_effect=RuntimeError("disk"))):
+            resp = client.post("/secrets/A/rotate", json={"value": "new"})
+        assert resp.status_code == 500
+        values = [c.kwargs["Value"] for c in fake_ssm.put_parameter.call_args_list]
+        assert values == ["old", "new", "old"]
+
+
+def test_delete_failed_local_delete_restores_ssm_parameter(env_defaults, monkeypatch, auth_headers):
+    with _ecs_client(monkeypatch, auth_headers) as (client, fake_ssm):
+        assert client.put("/secrets", json={"name": "A", "value": "keep"}).status_code == 204
+        with patch(
+            "warren.secrets.store.delete_secret", AsyncMock(side_effect=RuntimeError("disk"))
+        ):
+            resp = client.delete("/secrets/A")
+        assert resp.status_code == 500
+        fake_ssm.delete_parameter.assert_called_once()
+        values = [c.kwargs["Value"] for c in fake_ssm.put_parameter.call_args_list]
+        assert values == ["keep", "keep"]
+        assert client.get("/secrets").json() == [{"name": "A"}]
+
+
 def test_put_secret_logs_audit_line_never_value(env_defaults, auth_headers, caplog):
     """Audit #46: secret writes weren't logged at all. Must log name/owner/action, and
     must never log the secret value."""
