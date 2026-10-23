@@ -106,6 +106,10 @@ class WarrenSettings(BaseSettings):
     # 2026-10-13) -- confusing, since the clone itself succeeds (it's visible
     # from inside warren-server's own container just fine).
     host_data_dir: Path | None = None
+    # Audit #10: SQLite journal mode for warren.db. "auto" uses WAL on a local
+    # filesystem and DELETE when data_dir is on a network filesystem (EFS/NFS),
+    # where WAL's shared-memory index is not safe. Explicit "wal"/"delete" override.
+    sqlite_journal_mode: Literal["auto", "wal", "delete"] = "auto"
     projects_dir: Path = Path.home() / ".warren" / "projects"
     server_id: str = Field(default_factory=socket.gethostname)
 

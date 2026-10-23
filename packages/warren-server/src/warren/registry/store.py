@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sqlite3
 import stat
 from datetime import datetime, timezone
@@ -99,8 +100,88 @@ async def _scrub_legacy_plaintext_env(db: aiosqlite.Connection) -> None:
         )
 
 
-async def open_db(path: str | Path) -> aiosqlite.Connection:
-    """Open an aiosqlite connection in autocommit + WAL mode and apply schema.
+_NETWORK_FS_TYPES = frozenset({"nfs", "nfs4", "efs", "cifs", "smb3", "smbfs", "9p", "fuse.sshfs"})
+
+
+class WriterLockHeld(RuntimeError):
+    """Another warren-server process already owns this database."""
+
+
+class WriterLock:
+    """Audit #10: an exclusive advisory lock on `<db>.lock`, held for the server's
+    lifetime so a rolling deployment (or a second task) sharing the same data dir
+    on EFS can never become a second SQLite writer. flock(2) is emulated with a
+    whole-file POSIX lock on Linux NFS clients, which EFS (NFSv4) enforces across
+    hosts; a crashed holder's lock is released when its NFS lease expires."""
+
+    def __init__(self, path: Path, fd: int) -> None:
+        self.path = path
+        self._fd: int | None = fd
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        import fcntl
+
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self._fd)
+            self._fd = None
+
+
+def acquire_writer_lock(db_file: str | Path) -> WriterLock:
+    """Take the single-writer lock for `db_file`, or raise WriterLockHeld at once."""
+    import fcntl
+
+    lock_path = Path(f"{db_file}.lock")
+    if not lock_path.parent.exists():
+        lock_path.parent.mkdir(parents=True)
+        os.chmod(lock_path.parent, stat.S_IRWXU)  # 0700, same as open_db
+    fd =os.open(lock_path, os.O_RDWR | os.O_CREAT, stat.S_IRUSR | stat.S_IWUSR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(fd)
+        raise WriterLockHeld(
+            f"{lock_path} is held by another warren-server process; refusing to open "
+            f"{db_file} as a second writer"
+        ) from exc
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()} {socket.gethostname()}\n".encode())
+    return WriterLock(lock_path, fd)
+
+
+def _filesystem_type(path: Path) -> str:
+    """fstype of the mount containing `path`, from /proc/self/mounts; "" if unknown."""
+    try:
+        mounts = Path("/proc/self/mounts").read_text().splitlines()
+    except OSError:
+        return ""
+    target = os.path.realpath(path)
+    best, fstype = "", ""
+    for line in mounts:
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        mount_point = fields[1].replace("\\040", " ")
+        inside = target == mount_point or target.startswith(mount_point.rstrip("/") + "/")
+        if inside and len(mount_point) >= len(best):
+            best, fstype = mount_point, fields[2]
+    return fstype
+
+
+def resolve_journal_mode(data_dir: Path, setting: str = "auto") -> str:
+    """WAL needs a shared-memory index that network filesystems can't provide
+    safely, so "auto" falls back to DELETE when data_dir is on NFS/EFS."""
+    if setting in ("wal", "delete"):
+        return setting.upper()
+    return "DELETE" if _filesystem_type(data_dir) in _NETWORK_FS_TYPES else "WAL"
+
+
+async def open_db(path: str | Path, journal_mode: str = "auto") -> aiosqlite.Connection:
+    """Open an aiosqlite connection in autocommit mode (WAL, or DELETE on a network
+    filesystem -- see resolve_journal_mode) and apply schema.
 
     Audit 2026-10-16 P2 #44: the DB holds Fernet-encrypted secrets and hashed
     auth tokens, so its permissions matter. The data directory is only chmod'd
@@ -117,7 +198,7 @@ async def open_db(path: str | Path) -> aiosqlite.Connection:
         os.chmod(data_dir, stat.S_IRWXU)  # 0700
 
     db = await aiosqlite.connect(str(path), isolation_level=None)
-    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute(f"PRAGMA journal_mode={resolve_journal_mode(data_dir, journal_mode)}")
     await db.execute("PRAGMA synchronous=NORMAL")
     await db.execute("PRAGMA foreign_keys=ON")
     await db.execute("PRAGMA busy_timeout=5000")
