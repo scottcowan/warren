@@ -10,6 +10,8 @@ on:
       - packages/warren-common/src/warren_common/assets/warren_banner.zsh
       - .github/workflows/warren-ecs-base-smoke.yml
       - .github/scripts/resolve-base-registry.sh
+      - .github/scripts/warren-query-smoke.sh
+      - packages/warren-common/src/warren_common/assets/warren_query.sh
       - packages/warren-cli/src/warren_cli/dispatch.py
   push:
     branches: [main]
@@ -18,6 +20,8 @@ on:
       - packages/warren-common/src/warren_common/assets/warren_banner.zsh
       - .github/workflows/warren-ecs-base-smoke.yml
       - .github/scripts/resolve-base-registry.sh
+      - .github/scripts/warren-query-smoke.sh
+      - packages/warren-common/src/warren_common/assets/warren_query.sh
       - packages/warren-cli/src/warren_cli/dispatch.py
 
 jobs:
@@ -74,6 +78,9 @@ jobs:
         run: |
           uv sync --package warren
           uv run --package warren python -c "from warren_cli.dispatch import ecs_session_command; print(ecs_session_command('bash'))" > "$RUNNER_TEMP/ecs-exec-cmd.txt"
+
+      - name: warren-query drops to an unprivileged user and honours exclusions
+        run: docker run --rm -i --user 0 --entrypoint /bin/sh warren-ecs-base:smoke -s < .github/scripts/warren-query-smoke.sh
 
       - name: Sanity-check the built image
         # entrypoint.sh ignores CMD args entirely (only reacts to WARREN_APP_CMD),

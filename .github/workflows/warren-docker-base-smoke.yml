@@ -10,12 +10,16 @@ on:
       - images/warren-docker-base/**
       - .github/workflows/warren-docker-base-smoke.yml
       - .github/scripts/resolve-base-registry.sh
+      - .github/scripts/warren-query-smoke.sh
+      - packages/warren-common/src/warren_common/assets/warren_query.sh
   push:
     branches: [main]
     paths:
       - images/warren-docker-base/**
       - .github/workflows/warren-docker-base-smoke.yml
       - .github/scripts/resolve-base-registry.sh
+      - .github/scripts/warren-query-smoke.sh
+      - packages/warren-common/src/warren_common/assets/warren_query.sh
 
 jobs:
   smoke-test:
@@ -66,3 +70,6 @@ jobs:
           docker run --rm --entrypoint git warren-docker-base:smoke --version
           docker run --rm --entrypoint curl warren-docker-base:smoke --version
           docker run --rm --entrypoint uv warren-docker-base:smoke --version
+
+      - name: warren-query drops to an unprivileged user and honours exclusions
+        run: docker run --rm -i --user 0 --entrypoint /bin/sh warren-docker-base:smoke -s < .github/scripts/warren-query-smoke.sh

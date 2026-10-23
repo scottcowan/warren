@@ -68,6 +68,7 @@ COPY --chown=0:0 --chmod=0755 packages/warren-server/images/ecs-base/warren-init
 COPY --chown=0:0 --chmod=0755 packages/warren-common/src/warren_common/assets/warren_harness_init.sh /usr/local/bin/warren-harness-init
 # AG5: the state hook the harness hook configs call (root-owned, read-only to the workspace).
 COPY --chown=0:0 --chmod=0755 packages/warren-common/src/warren_common/assets/warren_state_hook.sh /usr/local/bin/warren-state-hook
+COPY --chown=0:0 --chmod=0755 packages/warren-common/src/warren_common/assets/warren_query.sh /usr/local/bin/warren-query
 COPY --chown=0:0 --chmod=0755 packages/warren-common/src/warren_common/agent_supervisor.py /usr/local/bin/warren-agent-supervisor
 # AH1: run as the task's `git-init` container (runtime/ecs_git.py), never by the workspace.
 COPY --chown=0:0 --chmod=0755 packages/warren-server/images/ecs-base/git-materialize.sh /usr/local/bin/warren-git-materialize

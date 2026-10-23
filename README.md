@@ -114,7 +114,9 @@ remote — exactly like running `warren` by hand would.
 warren-server (packages/warren-server)
 ├── /projects        project registry (YAML configs)
 ├── /workspaces      lifecycle: provision, start, stop, destroy, connect
-└── /workspaces/{id}/events   NDJSON event stream (tailed from the workspace container's log)
+├── /workspaces/{id}/events   NDJSON event stream (tailed from the workspace container's log)
+└── /workspaces/{id}/files, /files/{path}, /diff, /agent-state
+                     read-only queries, run as the workspace user over the runtime's exec channel
 
 server-side runtimes (warren-server)
 ├── PodmanRuntime    rootless, daemonless — remote Docker/Podman hosts over SSH

@@ -39,6 +39,7 @@ COPY packages/warren-common/src/warren_common/assets/warren_banner.bash /etc/war
 COPY --chmod=0755 packages/warren-common/src/warren_common/assets/warren_harness_init.sh /usr/local/bin/warren-harness-init
 # AG5: the state hook the harness hook configs call (root-owned, read-only to the workspace).
 COPY --chmod=0755 packages/warren-common/src/warren_common/assets/warren_state_hook.sh /usr/local/bin/warren-state-hook
+COPY --chmod=0755 packages/warren-common/src/warren_common/assets/warren_query.sh /usr/local/bin/warren-query
 # AG2b: supervises a `kind: agent` workspace's harness next to the shell.
 COPY --chmod=0755 packages/warren-common/src/warren_common/agent_supervisor.py /usr/local/bin/warren-agent-supervisor
 RUN printf '\n[ -r /etc/warren/harness.sh ] && . /etc/warren/harness.sh\n' >> /etc/zsh/zshrc \

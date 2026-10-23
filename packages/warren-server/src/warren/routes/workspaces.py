@@ -1161,30 +1161,38 @@ class ExecRequest(BaseModel):
     timeout_seconds: float | None = Field(default=None, gt=0)
 
 
-async def open_exec(
-    request: Request, workspace_id: str, argv: list[str], timeout_seconds: float | None
-) -> AsyncIterator[dict]:
-    """#59: owner/scope-checked, audit-logged exec frames (see warren.exec_relay)."""
-    from warren import exec_relay  # noqa: PLC0415
-
+async def _owned_exec_target(request: Request, workspace_id: str, audit_name: str):
+    """The caller's own running workspace and a runtime with an exec channel, or the
+    same 404/403/409/501 as exec. Shared by exec and the read-only queries below."""
     user = current_user(request)
     require_workspace_access(request, workspace_id)
-    try:
-        exec_relay.validate_argv(argv)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail={"error": "invalid_argv", "detail": str(exc)}) from exc
     registry = request.app.state.registry
     ws = await registry.store.get(workspace_id)
     if ws is None:
         raise HTTPException(status_code=404, detail="workspace not found")
     if ws.owner_id is None or ws.owner_id != user.user_id:
-        audit_event("workspace.exec", request=request, outcome="denied", workspace_id=workspace_id)
+        audit_event(audit_name, request=request, outcome="denied", workspace_id=workspace_id)
         raise HTTPException(status_code=403, detail="not workspace owner")
     if ws.status != "running" or not ws.container_id:
         raise HTTPException(status_code=409, detail={"error": "not_running", "detail": f"workspace is {ws.status}"})
     runtime = registry.runtime
     if not hasattr(runtime, "exec_stream"):
         raise HTTPException(status_code=501, detail={"error": "exec_unavailable", "detail": "runtime has no exec channel"})
+    return ws, runtime
+
+
+async def open_exec(
+    request: Request, workspace_id: str, argv: list[str], timeout_seconds: float | None
+) -> AsyncIterator[dict]:
+    """#59: owner/scope-checked, audit-logged exec frames (see warren.exec_relay)."""
+    from warren import exec_relay  # noqa: PLC0415
+
+    require_workspace_access(request, workspace_id)
+    try:
+        exec_relay.validate_argv(argv)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"error": "invalid_argv", "detail": str(exc)}) from exc
+    ws, runtime = await _owned_exec_target(request, workspace_id, "workspace.exec")
 
     settings = request.app.state.settings
     timeout = exec_relay.bounded_timeout(settings, timeout_seconds)
@@ -1231,6 +1239,72 @@ async def exec_in_workspace(workspace_id: str, body: ExecRequest, request: Reque
 
     frames = await open_exec(request, workspace_id, body.argv, body.timeout_seconds)
     return StreamingResponse(relay_ndjson(frames), media_type="application/x-ndjson")
+
+
+async def _query(request: Request, workspace_id: str, kind: str, call, **audit):
+    """Run one workspace_query call over the control channel, owner-only and audited."""
+    from warren import exec_relay, workspace_query  # noqa: PLC0415
+
+    ws, runtime = await _owned_exec_target(request, workspace_id, "workspace.query")
+    audit_event("workspace.query", request=request, owner_id=ws.owner_id, workspace_id=workspace_id, query=kind, **audit)
+    try:
+        return await call(runtime, exec_relay.handle_for(ws))
+    except workspace_query.QueryError as exc:
+        raise HTTPException(status_code=exc.status, detail={"error": exc.error, "detail": exc.detail}) from None
+
+
+@router.get("/workspaces/{workspace_id}/files")
+async def list_workspace_files(workspace_id: str, request: Request) -> list[dict]:
+    """Files under /workspace, minus .git, node_modules, .venv, __pycache__, .env* and
+    gitignored paths; symlinks are never followed. Read through the runtime's exec
+    channel as the workspace's unprivileged user, never via the sidecar."""
+    from warren import workspace_query  # noqa: PLC0415
+
+    return await _query(request, workspace_id, "files", workspace_query.list_files)
+
+
+@router.get("/workspaces/{workspace_id}/files/{file_path:path}")
+async def read_workspace_file(workspace_id: str, file_path: str, request: Request) -> Response:
+    """One file's bytes (1 MiB cap). Excluded paths 404 as if absent; symlinks are refused."""
+    from warren import workspace_query  # noqa: PLC0415
+
+    try:
+        workspace_query.validate_path(file_path)
+    except workspace_query.QueryError as exc:
+        raise HTTPException(status_code=exc.status, detail={"error": exc.error, "detail": exc.detail}) from None
+
+    async def _read(runtime, handle):
+        return await workspace_query.read_file(runtime, handle, file_path)
+
+    data = await _query(request, workspace_id, "file", _read, path_chars=len(file_path))
+    return Response(content=data, media_type="application/octet-stream")
+
+
+@router.get("/workspaces/{workspace_id}/diff")
+async def workspace_diff(workspace_id: str, request: Request) -> dict:
+    """The working-tree diff against HEAD for every repository under /workspace (1 MiB each)."""
+    from warren import workspace_query  # noqa: PLC0415
+
+    repos = await _query(request, workspace_id, "diff", workspace_query.diff)
+    return {"repos": [{"repo": r.repo, "diff": r.diff, "truncated": r.truncated} for r in repos]}
+
+
+@router.get("/workspaces/{workspace_id}/agent-state")
+async def workspace_agent_state(workspace_id: str, request: Request) -> dict:
+    """The agent state the workspace last reported (AM1), read host-side by the
+    registry; "unverifiable" where the runtime keeps it out of reach (ECS)."""
+    user = current_user(request)
+    require_workspace_access(request, workspace_id)
+    registry = request.app.state.registry
+    ws = await registry.store.get(workspace_id)
+    if ws is None:
+        raise HTTPException(status_code=404, detail="workspace not found")
+    if ws.owner_id is None or ws.owner_id != user.user_id:
+        raise HTTPException(status_code=403, detail="not workspace owner")
+    state = await registry.agent_state(ws)
+    if state is None:
+        return {"state": "unverifiable", "ts": 0.0, "harness": "", "event": "", "source": "none"}
+    return {"state": state.state, "ts": state.ts, "harness": state.harness, "event": state.event, "source": state.source}
 
 
 @router.delete("/workspaces/{workspace_id}")

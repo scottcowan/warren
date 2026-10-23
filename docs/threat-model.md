@@ -57,6 +57,15 @@ from inside a workspace, it runs a command through the control channel (which ma
 the local socket) and reads the output. No runtime has an inbound network listener on
 a workspace.
 
+`GET /workspaces/{id}/files`, `/files/{path}` and `/diff` work this way: the server runs
+the image's `warren-query` script with a fixed argv. The only caller-supplied value is a
+validated relative path, passed as its own argv item. The script drops from root to the
+workspace user (`warren`, else `nobody`) and never follows a symlink below the root. Its
+output comes from inside the workspace, so the server parses it strictly, re-applies the
+exclusions and caps its size. The script's git calls ignore system and global config and
+pin `core.fsmonitor`, hooks, external diff and textconv off. The workspace's own repo
+config still applies, but only as the workspace user, inside the workspace.
+
 ### ECS Fargate
 
 Verified 2026-10-18 on platform 1.4.0: `unshare -U`, `bwrap` and every `--unshare-*` flag
