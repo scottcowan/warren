@@ -322,3 +322,59 @@ async def test_revoke_all_tokens_for_user_with_no_tokens_returns_zero(sqlite_pat
     store = await AuthStore.open(sqlite_path)
     user = await store.create_user(username="notokens", is_admin=False)
     assert await store.revoke_all_tokens_for_user(user.user_id) == 0
+
+
+async def test_create_token_max_active_is_atomic_under_concurrency(sqlite_path: str):
+    import asyncio
+
+    from warren.auth.store import TokenLimitReached
+
+    store = await AuthStore.open(sqlite_path)
+    user = await store.create_user(username="racer", is_admin=False)
+    results = await asyncio.gather(
+        *(store.create_token(user_id=user.user_id, hashed_token=f"h{i}", max_active=4) for i in range(15)),
+        return_exceptions=True,
+    )
+    assert sum(not isinstance(r, BaseException) for r in results) == 4
+    assert all(isinstance(r, TokenLimitReached) for r in results if isinstance(r, BaseException))
+    assert await store.count_active_tokens_for_user(user.user_id) == 4
+    await store.close()
+
+
+async def test_create_token_max_active_ignores_revoked_and_expired(sqlite_path: str):
+    from warren.auth.store import TokenLimitReached
+
+    store = await AuthStore.open(sqlite_path)
+    user = await store.create_user(username="cap", is_admin=False)
+    revoked = await store.create_token(user_id=user.user_id, hashed_token="r", max_active=1)
+    await store.revoke_token(revoked.token_id)
+    await store.create_token(
+        user_id=user.user_id, hashed_token="e", expires_at=datetime.now(timezone.utc) - timedelta(days=1)
+    )
+    await store.create_token(user_id=user.user_id, hashed_token="live", max_active=1)
+    with pytest.raises(TokenLimitReached):
+        await store.create_token(user_id=user.user_id, hashed_token="over", max_active=1)
+    await store.close()
+
+
+async def test_disable_user_keep_last_admin(sqlite_path: str):
+    import asyncio
+
+    from warren.auth.store import LastAdminError
+
+    store = await AuthStore.open(sqlite_path)
+    admins = [await store.create_user(username=f"admin{i}", is_admin=True) for i in range(3)]
+    results = await asyncio.gather(
+        *(store.disable_user(a.user_id, keep_last_admin=True) for a in admins), return_exceptions=True
+    )
+    assert sum(r is True for r in results) == 2
+    assert sum(isinstance(r, LastAdminError) for r in results) == 1
+    assert await store.count_enabled_admins() == 1
+    # Re-disabling an already-disabled admin stays an idempotent no-op, not a LastAdminError.
+    disabled = next(a for a, r in zip(admins, results) if r is True)
+    assert await store.disable_user(disabled.user_id, keep_last_admin=True) is True
+    assert await store.disable_user("missing", keep_last_admin=True) is False
+    # Without keep_last_admin the guard doesn't apply.
+    last = next(a for a, r in zip(admins, results) if isinstance(r, LastAdminError))
+    assert await store.disable_user(last.user_id) is True
+    await store.close()

@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 from warren.auth.deps import current_token_id, current_user
 from warren.auth.models import Token, User
+from warren.auth.store import TokenLimitReached
 from warren.auth.tokens import derive_token_pepper, generate_token, hash_token
 
 log = structlog.get_logger(__name__)
@@ -52,22 +53,22 @@ async def mint_own_token(
     settings = request.app.state.settings
     pepper = derive_token_pepper(settings.secret_key.get_secret_value())
 
-    live_count = await store.count_active_tokens_for_user(user.user_id)
-    if live_count >= settings.max_tokens_per_user:
-        raise HTTPException(
-            status_code=429,
-            detail=f"max_tokens_per_user ({settings.max_tokens_per_user}) reached",
-        )
-
     raw_token = generate_token()
     hashed = hash_token(raw_token, pepper)
     expires_at = datetime.now(timezone.utc) + timedelta(days=settings.token_ttl_days)
-    token = await store.create_token(
-        user_id=user.user_id,
-        hashed_token=hashed,
-        expires_at=expires_at,
-        created_by_token_id=acting_token_id,
-    )
+    try:
+        token = await store.create_token(
+            user_id=user.user_id,
+            hashed_token=hashed,
+            expires_at=expires_at,
+            created_by_token_id=acting_token_id,
+            max_active=settings.max_tokens_per_user,
+        )
+    except TokenLimitReached:
+        raise HTTPException(
+            status_code=429,
+            detail=f"max_tokens_per_user ({settings.max_tokens_per_user}) reached",
+        ) from None
 
     log.info("self_token_minted", user_id=user.user_id, token_id=token.token_id)
 

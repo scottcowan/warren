@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from warren.auth.deps import current_token_id, require_admin
 from warren.auth.models import Token, User
+from warren.auth.store import LastAdminError, TokenLimitReached
 from warren.auth.tokens import derive_token_pepper, generate_token, hash_token
 
 log = structlog.get_logger(__name__)
@@ -114,12 +115,8 @@ async def mint_token(
     Issue #11: subject to the same per-user live-token cap as self-service minting
     (routes/tokens.py) -- the admin surface is not a way around that cap.
 
-    Audit V5: check-then-insert has the same acknowledged race max_workspaces/
-    allocate_ssh_port already document elsewhere in this codebase (mitigated by
-    aiosqlite's WAL + busy_timeout, not a new locking primitive) -- two concurrent
-    mint calls for the same user can both pass this check and both insert, exceeding
-    the cap by a small amount in the worst case. Same accepted tradeoff, applied
-    consistently rather than inventing a different one here.
+    The cap is checked and the token inserted in one statement (AuthStore.create_token's
+    `max_active`), so concurrent mints can't overshoot it.
     """
     store = request.app.state.auth_store
     settings = request.app.state.settings
@@ -129,21 +126,21 @@ async def mint_token(
     if user is None:
         raise HTTPException(status_code=404, detail="user not found")
 
-    live_count = await store.count_active_tokens_for_user(user.user_id)
-    if live_count >= settings.max_tokens_per_user:
+    raw_token = generate_token()
+    hashed = hash_token(raw_token, pepper)
+    try:
+        token = await store.create_token(
+            user_id=user.user_id,
+            hashed_token=hashed,
+            expires_at=_token_expiry(request),
+            created_by_token_id=acting_token_id,
+            max_active=settings.max_tokens_per_user,
+        )
+    except TokenLimitReached:
         raise HTTPException(
             status_code=429,
             detail=f"max_tokens_per_user ({settings.max_tokens_per_user}) reached for this user",
-        )
-
-    raw_token = generate_token()
-    hashed = hash_token(raw_token, pepper)
-    token = await store.create_token(
-        user_id=user.user_id,
-        hashed_token=hashed,
-        expires_at=_token_expiry(request),
-        created_by_token_id=acting_token_id,
-    )
+        ) from None
 
     log.info("admin.token_minted", user_id=user.user_id, token_id=token.token_id)
 
@@ -198,21 +195,17 @@ async def disable_user(
             },
         )
 
-    target = await store.get_user(user_id)
-    if target is None:
-        raise HTTPException(status_code=404, detail="user not found")
-    if target.is_admin and target.disabled_at is None:
-        if await store.count_enabled_admins() <= 1:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "error": "cannot_disable_last_admin",
-                    "detail": "refusing to disable the only enabled admin -- "
-                    "promote another admin first",
-                },
-            )
-
-    disabled = await store.disable_user(user_id)
+    try:
+        disabled = await store.disable_user(user_id, keep_last_admin=True)
+    except LastAdminError:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "cannot_disable_last_admin",
+                "detail": "refusing to disable the only enabled admin -- "
+                "promote another admin first",
+            },
+        ) from None
     if not disabled:
         raise HTTPException(status_code=404, detail="user not found")
 

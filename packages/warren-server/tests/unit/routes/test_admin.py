@@ -420,3 +420,39 @@ def test_disabled_users_new_tokens_also_fail_to_authenticate(
     # authenticate, since AuthStore's resolve query gates on disabled_at.
     mint_resp = client.post(f"/admin/users/{user_id}/tokens")
     assert mint_resp.status_code == 201
+
+
+async def test_concurrent_admin_mints_never_exceed_cap(app: FastAPI, auth_store: AuthStore):
+    import asyncio
+
+    import httpx
+
+    app.state.settings.max_tokens_per_user = 2
+    target = await auth_store.create_user(username="racer", is_admin=False)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        responses = await asyncio.gather(
+            *(ac.post(f"/admin/users/{target.user_id}/tokens") for _ in range(10))
+        )
+    assert [r.status_code for r in responses].count(201) == 2
+    assert await auth_store.count_active_tokens_for_user(target.user_id) == 2
+
+
+async def test_concurrent_disables_of_last_two_admins_leave_one_enabled(
+    app: FastAPI, auth_store: AuthStore
+):
+    """Finding 11: both disables used to observe two enabled admins and both succeed."""
+    import asyncio
+
+    import httpx
+
+    first = await auth_store.create_user(username="admin-a", is_admin=True)
+    second = await auth_store.create_user(username="admin-b", is_admin=True)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        responses = await asyncio.gather(
+            ac.post(f"/admin/users/{first.user_id}/disable"),
+            ac.post(f"/admin/users/{second.user_id}/disable"),
+        )
+    assert sorted(r.status_code for r in responses) == [200, 422]
+    assert await auth_store.count_enabled_admins() == 1
