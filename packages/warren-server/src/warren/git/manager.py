@@ -53,6 +53,7 @@ from warren_common.errors import ProvisionError
 from warren_common.safe_git import (
     SafeGitError,
     SafeGitTimeout,
+    drop_object_cache,
     read_repo_config,
     run_git,
     safe_git_env,
@@ -315,6 +316,14 @@ def _verify_existing_clone(path: Path, repo_url: str, shadow_root: Path) -> str 
     return None
 
 
+def _child_dirs(path: Path) -> list[Path]:
+    try:
+        with os.scandir(path) as entries:
+            return [path / e.name for e in entries if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        return []
+
+
 class GitManager:
     """Clones and pulls per-workspace git worktrees under `worktree_root`."""
 
@@ -346,15 +355,21 @@ class GitManager:
         """Remove `workspace_id`'s entire worktree root from disk (finding #25),
         called from `registry.py`'s `destroy()` so a destroyed workspace's
         cloned repos -- PRIVATE repo clones included -- don't accumulate on
-        disk forever. One `rmtree` of `worktree_path(workspace_id)` removes
-        the single-repo clone AND every multi-folder clone nested under it
-        (`folder_worktree_path` places each folder clone inside this same
-        root), so no separate per-folder cleanup is needed. A missing
-        directory (never cloned, or already removed) is a silent no-op --
-        `destroy()` is idempotent and must stay that way.
+        disk forever: the single-repo clone and every multi-folder clone
+        (`folders_root`, plus any legacy one nested in the root clone). A
+        missing directory (never cloned, or already removed) is a silent
+        no-op -- `destroy()` is idempotent and must stay that way.
         """
-        path = self.worktree_path(workspace_id)
-        await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)
+        roots = (self.worktree_path(workspace_id), self.folders_root(workspace_id))
+        await asyncio.to_thread(self._drop_object_caches, roots)
+        for path in roots:
+            await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)
+
+    def _drop_object_caches(self, roots: tuple[Path, Path]) -> None:
+        root, folders = roots
+        repos = [root, *_child_dirs(root), *_child_dirs(folders)]
+        for repo in repos:
+            drop_object_cache(repo / ".git", self.shadow_root)
 
     async def clone(
         self,
@@ -393,16 +408,59 @@ class GitManager:
             path, repo_url, ref=ref, ssh_key=ssh_key, pat=pat, log_id=workspace_id
         )
 
+    def folders_root(self, workspace_id: str) -> Path:
+        """`worktree_root / "<workspace_id>.folders"`: never mounted into a
+        workspace, so no folder clone's directory is renamable from inside one
+        (each is only ever a bind-mount root). A `.` can't occur in a valid
+        workspace_id, so this never collides with another workspace's root."""
+        _validate_workspace_id(workspace_id)
+        return self.worktree_root / f"{workspace_id}.folders"
+
     def folder_worktree_path(self, workspace_id: str, folder_name: str) -> Path:
-        """Return `worktree_path(workspace_id) / folder_name`, for one repo in a
-        multi-folder template (registry.py's per-folder clone loop) -- validates
-        both components are safe path segments, same discipline as
-        `worktree_path`/`_validate_workspace_id` already apply to `workspace_id`
-        alone.
+        """Where one repo of a multi-folder template is cloned (registry.py's
+        per-folder loop): `folders_root(workspace_id) / folder_name`, or, for a
+        workspace provisioned before that layout and not yet migrated, the
+        legacy `worktree_path(workspace_id) / folder_name` (which `pull_at`
+        refuses while it's nested in the root clone). Both components are
+        validated as safe path segments.
         """
-        base = self.worktree_path(workspace_id)
         _validate_folder_name(folder_name)
-        return base / folder_name
+        path = self.folders_root(workspace_id) / folder_name
+        legacy = self.worktree_path(workspace_id) / folder_name
+        if not os.path.lexists(path) and os.path.lexists(legacy / ".git"):
+            return legacy
+        return path
+
+    def _nested_in_root_clone(self, path: Path) -> bool:
+        return path.parent.parent == self.worktree_root and os.path.lexists(path.parent / ".git")
+
+    def _adopt_legacy_folder(self, legacy: Path) -> Path:
+        """Move a legacy folder clone (nested in the root clone, so renamable
+        from inside the workspace) under `folders_root`, returning its new
+        path. Runs at provision time, before the workspace's container exists;
+        the moved entry must be the same plain directory that was checked."""
+        dest = self.worktree_root / f"{legacy.parent.name}.folders" / legacy.name
+        if os.path.lexists(dest):
+            return dest
+        try:
+            before = os.lstat(legacy)
+        except FileNotFoundError:
+            return dest
+        if not stat.S_ISDIR(before.st_mode) or not os.path.lexists(legacy / ".git"):
+            return dest
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(legacy, dest)
+        after = os.lstat(dest)
+        if not stat.S_ISDIR(after.st_mode) or (after.st_dev, after.st_ino) != (
+            before.st_dev, before.st_ino
+        ):
+            if stat.S_ISDIR(after.st_mode):
+                os.rename(dest, legacy)
+            else:
+                os.unlink(dest)
+            raise GitError(f"legacy folder clone {legacy.name!r} was replaced during migration")
+        log.info("git_folder_clone_migrated", dest=str(dest))
+        return dest
 
     async def clone_into(
         self,
@@ -418,8 +476,12 @@ class GitManager:
         per-repo directory layout rather than the single-repo-per-workspace
         convention `clone()`/`worktree_path()` assume. Same idempotent/
         credential/error-handling behavior as `clone()` -- this *is* `clone()`
-        with the destination path decoupled from `workspace_id`.
+        with the destination path decoupled from `workspace_id`. A legacy
+        `dest` nested in the root clone is migrated under `folders_root` first;
+        the returned path is the one to mount.
         """
+        if self._nested_in_root_clone(dest):
+            dest = await asyncio.to_thread(self._adopt_legacy_folder, dest)
         return await self._clone_to_path(
             dest, repo_url, ref=ref, ssh_key=ssh_key, pat=pat, log_id=str(dest)
         )
@@ -580,6 +642,13 @@ class GitManager:
         `worktree_path(workspace_id)` itself, so pulling them needs this).
         """
         log_id = log_id if log_id is not None else str(path)
+        if self._nested_in_root_clone(path):
+            # The workspace can rename this directory (it's inside the root
+            # clone's mount) while git checks out into it.
+            raise GitPullError(
+                f"folder clone {log_id} predates the isolated folder layout; "
+                "re-provision the workspace to migrate it"
+            )
         if not (path / ".git").exists():
             raise GitPullError(f"no worktree at {log_id}")
 
