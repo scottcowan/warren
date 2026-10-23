@@ -118,6 +118,13 @@ async def _preflight() -> str:
     else:
         fail("sidecar_socket_timeout", SOCK)
 
+    # Audit finding 12: uvicorn leaves its uds socket 0o666 and the sidecar runs as
+    # root. Restrict it, and keep the token (already read during the sidecar's
+    # lifespan startup, which precedes the bind) out of the workspace app's env.
+    # Nothing workspace-controlled has started yet.
+    os.chmod(SOCK, 0o600)
+    os.environ.pop("WARREN_SIDECAR_TOKEN", None)
+
     emit({"type": "sidecar_ready", "socket": SOCK})
 
     # ── D-06 step 4: workspace_ready ─────────────────────────────────────────

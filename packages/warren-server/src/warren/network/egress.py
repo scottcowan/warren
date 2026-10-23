@@ -19,11 +19,12 @@ increases correctly through this path (1640 -> 3055 after generating traffic), o
 4.9.3 rootless/netavark on node2 — one version below 04-RESEARCH.md's assumed >=5.0 floor,
 so this fix also unblocks the effective minimum-supported-version footnote for D-04.
 
-WHY a shared bridge network instead of `network_mode="none"`: D-04 requires an idle-vs-busy
+WHY a bridge network instead of `network_mode="none"`: D-04 requires an idle-vs-busy
 signal for LIFE-01's reaper. A workspace provisioned with no network at all produces a
 permanently-idle reading regardless of actual activity, which is useless as a signal. A
-shared bridge network (see `ensure_bridge_network`) gives every workspace a real veth pair
-whose byte counters move when the workspace does anything network-bound.
+bridge network gives every workspace a real veth pair whose byte counters move when the
+workspace does anything network-bound. PodmanRuntime gives each workspace its own isolated
+bridge (Finding 9), so workspaces can't reach each other over it.
 
 D-05 SCOPE BOUNDARY (verbatim in spirit — do not weaken this invariant): this module
 OBSERVES traffic and never blocks it. It reads cumulative byte COUNTS only, never packet

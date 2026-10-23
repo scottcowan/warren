@@ -226,9 +226,10 @@ def _link_into_workspace(workspace_root: Path, mount: str, source: Path) -> None
     """Symlink `workspace_root/mount` -> `source`, refusing any mount whose
     link location resolves outside the workspace (persisted specs may predate
     FolderSpec.mount validation)."""
+    from warren_common.models import normalise_mount  # noqa: PLC0415
     from warren_common.paths import ensure_within  # noqa: PLC0415
 
-    link = workspace_root / mount
+    link = workspace_root / normalise_mount(mount)
     if link.exists() or link.is_symlink():
         return
     ensure_within(workspace_root, link)
@@ -330,9 +331,9 @@ _LOCAL_SANDBOXES = ("seatbelt", "bwrap", "nsjail")
 
 def _local_harness_root(workspace_id: str) -> Path:
     """Inside the workspace's 0700 sandbox state dir, which the sandbox can't write."""
-    from warren_common.runtime.sandbox_env import state_root  # noqa: PLC0415
+    from warren_common.runtime.sandbox_env import workspace_state_dir  # noqa: PLC0415
 
-    return state_root() / workspace_id / "harness"
+    return workspace_state_dir(workspace_id) / "harness"
 
 
 def _prepare_local_harness_dirs(harnesses: Any, harness_root: str, *, bedrock: bool = False) -> None:

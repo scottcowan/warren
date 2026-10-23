@@ -15,6 +15,23 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from warren_common.runtime import docker as docker_runtime
+
+_real_ensure_isolated_network = docker_runtime._ensure_isolated_network
+
+
+@pytest.fixture(autouse=True)
+def _isolated_network(monkeypatch):
+    """Keep provision() tests' networks.get/create mocks about docker_networks only."""
+    net = MagicMock()
+    net.name = docker_runtime.ISOLATED_NETWORK
+
+    async def _fake(client):
+        return net
+
+    monkeypatch.setattr(docker_runtime, "_ensure_isolated_network", _fake)
+    return net
+
 
 def _spec(root_path: str, docker_networks=None):
     from warren_common.runtime.base import WorkspaceSpec
@@ -102,6 +119,23 @@ def test_provision_injects_warren_project_and_template(mock_docker_client, tmp_p
     assert env["WARREN_TEMPLATE"] == "claude"
 
 
+def test_provision_mints_sidecar_token(mock_docker_client, tmp_path):
+    """Audit finding 12: the sidecar refuses every request without a token."""
+    root = str(tmp_path / "ws")
+    spec = _spec(root)
+    spec.env["WARREN_SIDECAR_TOKEN"] = "attacker-chosen"
+    _mkdirs(root, spec)
+    mock_docker_client.containers.run.return_value = MagicMock(id="cid-1234abcd")
+
+    handle = asyncio.run(_make_runtime(mock_docker_client).provision(spec))
+
+    token = mock_docker_client.containers.run.call_args.kwargs["environment"]["WARREN_SIDECAR_TOKEN"]
+    assert len(token) >= 32
+    assert handle.sidecar_token == token
+    assert token not in repr(handle)
+    assert json.loads((Path(root) / "state.json").read_text())["sidecar_token"] == token
+
+
 def test_provision_uses_mount_objects(mock_docker_client, tmp_path):
     from docker.types import Mount
 
@@ -159,6 +193,65 @@ def test_warren_default_network_created_on_notfound(mock_docker_client, tmp_path
         "warren_default", driver="bridge"
     )
     created_net.connect.assert_called_once_with(container)
+
+
+def test_provision_joins_isolated_network_not_default_bridge(mock_docker_client, tmp_path):
+    """Finding 9: never the default `bridge` (ICC on), always the ICC-off network."""
+    root = str(tmp_path / "ws")
+    spec = _spec(root)
+    _mkdirs(root, spec)
+    mock_docker_client.containers.run.return_value = MagicMock(id="cid-iso")
+
+    rt = _make_runtime(mock_docker_client)
+    asyncio.run(rt.provision(spec))
+
+    assert mock_docker_client.containers.run.call_args.kwargs["network"] == "warren-isolated"
+
+
+def test_isolated_network_created_with_icc_disabled(mock_docker_client):
+    import docker.errors
+
+    mock_docker_client.networks.get.side_effect = docker.errors.NotFound("no such network")
+    created = MagicMock()
+    mock_docker_client.networks.create.return_value = created
+
+    assert asyncio.run(_real_ensure_isolated_network(mock_docker_client)) is created
+    mock_docker_client.networks.create.assert_called_once_with(
+        "warren-isolated",
+        driver="bridge",
+        options={"com.docker.network.bridge.enable_icc": "false"},
+        labels={"warren.network": "isolated"},
+    )
+
+
+def test_isolated_network_reused_when_icc_disabled(mock_docker_client):
+    net = MagicMock(attrs={"Options": {"com.docker.network.bridge.enable_icc": "false"}})
+    mock_docker_client.networks.get.return_value = net
+
+    assert asyncio.run(_real_ensure_isolated_network(mock_docker_client)) is net
+    mock_docker_client.networks.create.assert_not_called()
+
+
+@pytest.mark.parametrize("options", [{}, {"com.docker.network.bridge.enable_icc": "true"}])
+def test_isolated_network_with_icc_enabled_fails_closed(mock_docker_client, options):
+    from warren_common.errors import ProvisionError
+
+    mock_docker_client.networks.get.return_value = MagicMock(attrs={"Options": options})
+
+    with pytest.raises(ProvisionError, match="enable_icc"):
+        asyncio.run(_real_ensure_isolated_network(mock_docker_client))
+
+
+def test_isolated_network_create_race_rereads(mock_docker_client):
+    import docker.errors
+
+    winner = MagicMock(attrs={"Options": {"com.docker.network.bridge.enable_icc": "false"}})
+    mock_docker_client.networks.get.side_effect = [docker.errors.NotFound("missing"), winner]
+    conflict = docker.errors.APIError("409 Conflict")
+    conflict.response = MagicMock(status_code=409)
+    mock_docker_client.networks.create.side_effect = conflict
+
+    assert asyncio.run(_real_ensure_isolated_network(mock_docker_client)) is winner
 
 
 def test_status_reloads_before_read(mock_docker_client, tmp_path):
