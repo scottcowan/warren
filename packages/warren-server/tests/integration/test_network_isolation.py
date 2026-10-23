@@ -166,14 +166,16 @@ async def test_workspace_cannot_reach_published_ports_or_host_loopback(
             assert code != 0, f"workspace A reached {target}: {out!r}"
             assert "published-ok" not in out and "host-ok" not in out, target
 
-        # Outbound internet still goes out through the workspace's own bridge.
+        # Outbound internet still goes out through the workspace's own bridge. Any HTTP
+        # response counts (example.com occasionally answers CI with a 503).
         for _ in range(3):
             code, out = await _exec(
                 runtime, handle_a.runtime_id, "wget -q -T 10 -O /dev/null http://example.com/"
             )
-            if code == 0:
+            reached = code == 0 or "server returned error: HTTP/" in out
+            if reached:
                 break
-        assert code == 0, f"workspace A has no outbound access: {out!r}"
+        assert reached, f"workspace A has no outbound access: {out!r}"
     finally:
         host_server.shutdown()
         host_server.server_close()
