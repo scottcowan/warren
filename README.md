@@ -97,7 +97,7 @@ remote — exactly like running `warren` by hand would.
 - **Runtimes** — pluggable: Bubblewrap/Seatbelt/Nsjail/Docker (local, no server), Podman (remote host), ECS Fargate (cloud)
 - **Secret store** — SQLite + Fernet; secrets injected at provision time, never written to container filesystem
 - **Multi-server** — `warren server add`/`warren remote add` register any number of warren-server instances; the CLI fans commands out across all of them
-- **NDJSON event stream** — workspace sidecar emits structured events over HTTP
+- **NDJSON event stream** — the server streams each workspace's structured lifecycle events over HTTP
 
 ## What it doesn't do
 
@@ -114,7 +114,7 @@ remote — exactly like running `warren` by hand would.
 warren-server (packages/warren-server)
 ├── /projects        project registry (YAML configs)
 ├── /workspaces      lifecycle: provision, start, stop, destroy, connect
-└── /workspaces/{id}/events   NDJSON event stream from workspace sidecar
+└── /workspaces/{id}/events   NDJSON event stream (tailed from the workspace container's log)
 
 server-side runtimes (warren-server)
 ├── PodmanRuntime    rootless, daemonless — remote Docker/Podman hosts over SSH
@@ -132,7 +132,10 @@ container images
 └── warren-agent-base / warren-ecs-agent-base   stubs for purpose-built agent tooling (deferred)
 
 warren-sidecar (in-workspace)
-└── tiny HTTP server: file API, exec API, NDJSON event emitter
+└── records the agent's terminal state for the server; also serves a file/exec/events
+    HTTP API on a root-only in-container socket, gated by a per-container random token.
+    Nothing outside the container calls that API: the server uses the runtime's own
+    exec, log stream and host-side state reads instead.
 ```
 
 Interactive remote SSH access (for a Docker/Podman-backed workspace on a remote host) uses

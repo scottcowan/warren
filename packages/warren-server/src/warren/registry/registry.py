@@ -543,37 +543,6 @@ class WorkspaceRegistry:
             f"SSH port range [{start}, {end}) is fully occupied"
         )
 
-    def _sidecar_cipher(self):
-        secret_key = getattr(self.settings, "secret_key", None)
-        if secret_key is None:
-            return None
-        from warren.secrets.cipher import LocalCipher  # noqa: PLC0415
-
-        return LocalCipher(secret_key.get_secret_value())
-
-    async def sidecar_token(self, workspace_id: str) -> str:
-        """This workspace's sidecar token (audit finding 12), minted on first use.
-
-        Stored Fernet-encrypted so every (re)provision hands the sidecar the same
-        token and the server can authenticate its own sidecar calls. With no
-        settings (no key to encrypt with) a fresh, unstored token is returned.
-        """
-        from cryptography.fernet import InvalidToken  # noqa: PLC0415
-        from warren_common.runtime.base import new_sidecar_token  # noqa: PLC0415
-
-        cipher = self._sidecar_cipher()
-        if cipher is None:
-            return new_sidecar_token()
-        stored = await self.store.get_sidecar_token_enc(workspace_id)
-        if stored is not None:
-            try:
-                return cipher.decrypt(stored)
-            except InvalidToken:  # secret_key changed: mint a new one
-                log.warning("sidecar_token_undecryptable", workspace_id=workspace_id)
-        token = new_sidecar_token()
-        await self.store.set_sidecar_token_enc(workspace_id, cipher.encrypt(token))
-        return token
-
     async def provision(self, workspace_id: str, spec: "WorkspaceSpec") -> None:
         """Fire _do_provision as a background task and return immediately."""
         asyncio.create_task(self._do_provision(workspace_id, spec))
@@ -608,8 +577,6 @@ class WorkspaceRegistry:
         spec.env["WARREN_GIT_REPO_URL"] (see 04-06-SUMMARY.md for the wiring
         gap this leaves in create_workspace).
         """
-        if not spec.sidecar_token:
-            spec.sidecar_token = await self.sidecar_token(workspace_id)
         repo_url = getattr(spec, "repo_url", None) or spec.env.get(
             "WARREN_GIT_REPO_URL"
         )

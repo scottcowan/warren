@@ -47,6 +47,16 @@ Warren's own processes are trusted: the CLI on the user's host, the control plan
 | **docker / podman** | container: separate mount/pid/net namespaces, bind mounts only for the workspace and declared folders (`ro` where declared); server-side podman is rootless | Medium–high | No east-west path between workspaces: each podman workspace has its own `isolate`d bridge (`<egress_bridge_name>-<id>`, used for egress byte counting, removed on destroy, orphans pruned at startup, workspaces still on the old shared bridge migrated at startup); docker workspaces join `warren-isolated`, a bridge with inter-container communication off. A podman workspace's SSH port is published on `127.0.0.1` only (`WARREN_SSH_PUBLISH_HOST`), and containers can't reach host loopback, so other workspaces can't reach it; docker workspaces publish nothing. Outbound traffic is unrestricted. Templates' `docker_networks` attach extra, shared networks by design. |
 | **ECS Fargate** | **the task itself.** Firecracker micro-VM per task, minimal task role, EFS access point per workspace | High against the host; **none inside the task** | See the residual risks below. |
 
+### Orchestrator → workspace traffic
+
+The orchestrator never dials the sidecar. All orchestrator→workspace traffic uses the
+runtime's own authenticated control channel: podman API exec or the ECS Exec relay,
+container logs, and host-side state files read without following links. The sidecar is an
+in-container helper on a root-only Unix socket. If the orchestrator needs structured data
+from inside a workspace, it runs a command through the control channel (which may talk to
+the local socket) and reads the output. No runtime has an inbound network listener on
+a workspace.
+
 ### ECS Fargate
 
 Verified 2026-10-18 on platform 1.4.0: `unshare -U`, `bwrap` and every `--unshare-*` flag

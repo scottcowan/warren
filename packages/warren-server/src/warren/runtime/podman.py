@@ -187,7 +187,6 @@ class PodmanRuntime:
         worktree_paths_val = ":".join(
             container_path for _, container_path in spec.worktree_paths
         )
-        sidecar_token = spec.sidecar_token or new_sidecar_token()
         env = {
             **template_env_for(spec.template_env, exclude=spec.env),
             **spec.env,
@@ -207,7 +206,7 @@ class PodmanRuntime:
             # connect, same as the local workspace zshrc already gets from spec.env.
             "WARREN_PROJECT": spec.project,
             "WARREN_TEMPLATE": spec.intent,
-            SIDECAR_TOKEN_ENV: sidecar_token,
+            SIDECAR_TOKEN_ENV: new_sidecar_token(),
         }
         if spec.model_access == "bedrock" and not (
             "AWS_ACCESS_KEY_ID" in env or "AWS_CONTAINER_CREDENTIALS_FULL_URI" in env
@@ -327,7 +326,6 @@ class PodmanRuntime:
             root_path=spec.root_path,
             sidecar_url="",
             sidecar_socket_path="/tmp/warren-sidecar.sock",  # D-12: fixed path
-            sidecar_token=sidecar_token,
         )
 
     async def start(self, handle: WorkspaceHandle) -> None:

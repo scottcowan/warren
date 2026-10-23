@@ -1342,7 +1342,10 @@ def workspaces_exec(
     """
     cfg = _load_cfg(config)
     if cfg.defaults.mode != "local":
-        ui.error("server-mode workspace exec requires the sidecar — available in Phase 4")
+        ui.error(
+            "warren exec runs commands in local workspaces only; for a server workspace use "
+            "`warren connect`, or the server's POST /workspaces/{id}/exec API"
+        )
         raise typer.Exit(1)
     if not cmd:
         ui.error("no command specified")
@@ -1379,7 +1382,7 @@ def workspaces_connect(
     # below whenever `[defaults] mode = "local"` was set, never considering
     # `[remotes.*]` at all -- so a config with remotes configured (the normal
     # shape, e.g. node2) silently showed no remote picker and no error naming
-    # them, just a generic "requires the sidecar PTY" message or a local
+    # them, just a generic "no server configured" message or a local
     # picker with nothing in it. Every other remote command (`tunnel`,
     # `healthz`, `projects`, `list`) already prefers a configured remote over
     # local mode when `--server` is omitted; this brings `connect` in line.
@@ -1505,7 +1508,10 @@ def workspaces_connect(
         wid = workspace_id or workspaces_local.pick_workspace("Select workspace to connect")
         workspaces_local.connect_local(wid, harness=harness, new=new)
         return
-    ui.error("server-mode workspace connect requires the sidecar PTY — available in Phase 4")
+    ui.error(
+        "no warren-server to connect through: pass --server, add one with `warren remote add`, "
+        'or set [defaults] mode = "local"'
+    )
     raise typer.Exit(1)
 
 

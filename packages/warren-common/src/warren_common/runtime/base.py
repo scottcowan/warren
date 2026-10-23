@@ -9,6 +9,11 @@ from warren_common.errors import ProvisionError as ProvisionError  # noqa: F401
 from warren_common.models import AwsConfig, CustomHarness, FolderSpec, ScopeConfig
 
 # Audit finding 12: the shared secret every sidecar request (bar /healthz) must carry.
+# Nothing outside the container calls the sidecar's HTTP API -- the server serves
+# exec/events/agent state through the runtime (podman exec, log tail, host-side
+# no-follow reads) and its socket isn't reachable from the host -- so each container
+# gets a fresh random token that lives only in its own env and is never stored or
+# returned. The sidecar fails closed without it.
 SIDECAR_TOKEN_ENV = "WARREN_SIDECAR_TOKEN"
 
 
@@ -63,9 +68,6 @@ class WorkspaceSpec:
     mode: str = "interactive"
     # AG2b/AM3: a `kind: agent` workspace's supervisor launch spec (warren_common.agent_launch); None for user workspaces.
     agent: dict | None = None
-    # Audit finding 12: this workspace's sidecar token; the registry mints and stores it
-    # (encrypted), a runtime mints one when it is unset. Never persisted in spec_json.
-    sidecar_token: str = field(default="", repr=False)
 
 
 def harness_state(spec: WorkspaceSpec) -> dict:
@@ -95,7 +97,6 @@ class WorkspaceHandle:
     root_path: str
     sidecar_url: str = ""               # http://... for file/exec/events API (empty for ECS/Fargate)
     sidecar_socket_path: str = ""       # AF_UNIX socket path inside container (D-12)
-    sidecar_token: str = field(default="", repr=False)  # sent as X-Warren-Sidecar-Token
     state_dir: str = ""                 # where this runtime's own sandbox.sb/state.json live, when that
                                          # MUST live outside root_path (audit finding #1: root_path is
                                          # writable from inside the sandbox, so a sandboxed process could

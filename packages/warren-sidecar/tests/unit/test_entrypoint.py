@@ -73,3 +73,24 @@ def test_sidecar_socket_is_restricted_to_its_owner():
     ready = [json.loads(line) for line in result.stdout.splitlines() if '"sidecar_ready"' in line]
     assert ready
     assert os.stat(ready[0]["socket"]).st_mode & 0o777 == 0o600
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell shim")
+def test_workspace_app_does_not_inherit_the_sidecar_token(tmp_path):
+    """Audit finding 12: the token is for the sidecar alone. A `tmux` shim on PATH
+    records the env the entrypoint launches the workspace app's session with."""
+    dump = tmp_path / "app-env"
+    shim = tmp_path / "bin" / "tmux"
+    shim.parent.mkdir()
+    shim.write_text(f'#!/bin/sh\ncase "$1" in new-session) env > "{dump}";; esac\nexit 0\n')
+    shim.chmod(0o755)
+    result = _run_entrypoint({
+        "WARREN_WORKSPACE_ID": "ws-test",
+        "WARREN_SIDECAR_TOKEN": "tok-must-not-leak",
+        "PATH": f"{shim.parent}{os.pathsep}{_BASE_ENV['PATH']}",
+    })
+    assert '"workspace_ready"' in result.stdout
+    app_env = dump.read_text()
+    assert "WARREN_WORKSPACE_ID=ws-test" in app_env
+    assert "WARREN_SIDECAR_TOKEN" not in app_env
+    assert "tok-must-not-leak" not in app_env

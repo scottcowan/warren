@@ -133,7 +133,6 @@ class DockerRuntime:
         worktree_paths_val = ":".join(
             container_path for _, container_path in spec.worktree_paths
         )
-        sidecar_token = spec.sidecar_token or new_sidecar_token()
         env = {
             **spec.env,
             "WARREN_WORKSPACE_ID": spec.workspace_id,
@@ -145,7 +144,7 @@ class DockerRuntime:
             # connect, same as the local workspace zshrc already gets from spec.env.
             "WARREN_PROJECT": spec.project,
             "WARREN_TEMPLATE": spec.intent,
-            SIDECAR_TOKEN_ENV: sidecar_token,
+            SIDECAR_TOKEN_ENV: new_sidecar_token(),
         }
 
         name = f"warren-{spec.workspace_id[:8]}"
@@ -202,7 +201,6 @@ class DockerRuntime:
                 "worktree_paths": [list(p) for p in spec.worktree_paths],
                 "reference_paths": [list(p) for p in spec.reference_paths],
                 "docker_networks": list(spec.docker_networks),
-                "sidecar_token": sidecar_token,
                 "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "status": "provisioned",
             }
@@ -222,7 +220,6 @@ class DockerRuntime:
             runtime_id=container.id,
             root_path=str(workspace_dir),
             sidecar_url="",
-            sidecar_token=sidecar_token,
         )
 
     async def start(self, handle: WorkspaceHandle) -> None:
