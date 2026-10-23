@@ -59,7 +59,13 @@ jobs:
       # they never caught it. This loads the just-pushed image fresh (same tag
       # metadata-action just resolved) rather than re-asserting against the
       # local build cache.
-      - name: Sanity-check git/ssh exist in the published image
+      # session-manager-plugin is checked on both platforms: ECSRuntime.exec_stream
+      # needs it, and it's a per-arch .deb (QEMU, set up above, runs the arm64 one).
+      - name: Sanity-check git/ssh/session-manager-plugin exist in the published image
         run: |
-          docker run --rm --entrypoint git "${{ fromJSON(steps.meta.outputs.json).tags[0] }}" --version
-          docker run --rm --entrypoint ssh "${{ fromJSON(steps.meta.outputs.json).tags[0] }}" -V
+          image="${{ fromJSON(steps.meta.outputs.json).tags[0] }}"
+          docker run --rm --entrypoint git "$image" --version
+          docker run --rm --entrypoint ssh "$image" -V
+          for platform in linux/amd64 linux/arm64; do
+            docker run --rm --platform "$platform" --entrypoint session-manager-plugin "$image" --version
+          done
