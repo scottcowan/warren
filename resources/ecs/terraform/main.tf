@@ -190,6 +190,12 @@ resource "aws_efs_file_system" "warren" {
 
   creation_token = "warren-efs-${var.env_suffix}"
 
+  # Audit #15: encryption at rest is explicit. Both attributes force replacement, so
+  # an existing unencrypted filesystem is blocked by prevent_destroy below and needs
+  # the migration described in resources/ecs/README.md.
+  encrypted  = true
+  kms_key_id = var.efs_kms_key_arn != "" ? var.efs_kms_key_arn : null
+
   tags = {
     Name       = "warren-efs-${var.env_suffix}"
     warren     = "true"
@@ -1587,6 +1593,12 @@ resource "aws_ecs_service" "warren_server" {
   task_definition = aws_ecs_task_definition.warren_server.arn
   launch_type     = "FARGATE"
   desired_count   = 1
+
+  # Audit #10: stop the old task before starting the new one. The control plane is a
+  # single SQLite writer on EFS; the default 100/200 rolling deployment briefly runs two.
+  # warren-server also refuses to start while another process holds warren.db.lock.
+  deployment_minimum_healthy_percent = 0
+  deployment_maximum_percent         = 100
 
   # Required for `aws ecs execute-command exec` into the running service task
   # (POC-02) — previously passed as `run-task --enable-execute-command`, which has no
