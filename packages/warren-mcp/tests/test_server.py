@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from warren_mcp.cli_bridge import CLIResult
 from warren_mcp.server import (
     destroy_workspace,
@@ -88,11 +90,10 @@ def test_workspace_status_requires_server_arg(mock_run):
 
 
 @patch("warren_mcp.server.run_warren")
-def test_workspace_status_flag_looking_workspace_id_is_not_parsed_as_an_option(mock_run):
-    mock_run.return_value = _ok("{}")
-    workspace_status("--server", "node2")
-    args = mock_run.call_args[0][0]
-    assert args == ["status", "--server", "node2", "--", "--server"]
+def test_workspace_status_flag_looking_workspace_id_is_refused(mock_run):
+    result = workspace_status("--server", "node2")
+    assert result["ok"] is False
+    mock_run.assert_not_called()
 
 
 @patch("warren_mcp.server.run_warren")
@@ -161,3 +162,20 @@ def test_new_workspace_timeout_surfaces_as_error_dict_not_exception(mock_run):
     result = new_workspace("myproject", "observe")
     assert result["ok"] is False
     assert "150.0s" in result["stderr"]
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    ["/var/victim", "../../etc", "ws/../..", "a/b", "..", ".", "", "~", "ws-1\\x", " ws-1"],
+)
+@pytest.mark.parametrize("tool", ["destroy", "exec", "status"])
+@patch("warren_mcp.server.run_warren")
+def test_path_like_workspace_ids_never_reach_the_cli(mock_run, tool, bad_id):
+    if tool == "destroy":
+        result = destroy_workspace(bad_id)
+    elif tool == "exec":
+        result = exec_command(bad_id, ["true"])
+    else:
+        result = workspace_status(bad_id, "node2")
+    assert result["ok"] is False
+    mock_run.assert_not_called()

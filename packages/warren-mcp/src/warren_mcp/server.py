@@ -13,6 +13,8 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from warren_common.paths import PathEscapeError, validate_workspace_id
+
 from .cli_bridge import CLIResult, WarrenCLITimeout, run_warren
 
 
@@ -23,6 +25,17 @@ def _run_warren_safe(args: list[str]) -> CLIResult:
         return run_warren(args)
     except WarrenCLITimeout as exc:
         return CLIResult(returncode=-1, stdout="", stderr=str(exc))
+
+
+def _invalid_workspace_id(workspace_id: str) -> dict[str, Any] | None:
+    """A failed-result dict unless `workspace_id` is a plain warren id, so a
+    model-chosen path (absolute, `..`, separators) never reaches the CLI."""
+    try:
+        validate_workspace_id(workspace_id)
+    except PathEscapeError as exc:
+        return CLIResult(returncode=2, stdout="", stderr=str(exc)).as_dict()
+    return None
+
 
 mcp = FastMCP(
     name="warren",
@@ -89,6 +102,8 @@ def new_workspace(project: str, template: str = "observe", server: str | None = 
 def workspace_status(workspace_id: str, server: str) -> dict[str, Any]:
     """Status of a workspace on a remote warren-server. Local workspaces have
     no server-tracked status — use list_workspaces for those instead."""
+    if (invalid := _invalid_workspace_id(workspace_id)) is not None:
+        return invalid
     result = _run_warren_safe(["status", "--server", server, "--", workspace_id])
     return result.json_or_raise() if result.ok else result.as_dict()
 
@@ -101,6 +116,8 @@ def exec_command(workspace_id: str, command: list[str]) -> dict[str, Any]:
 
     command: the argv to run, e.g. ["pytest", "packages/warren-server/tests/unit"].
     """
+    if (invalid := _invalid_workspace_id(workspace_id)) is not None:
+        return invalid
     result = _run_warren_safe(["exec", "--", workspace_id, *command])
     return result.as_dict()
 
@@ -115,6 +132,8 @@ def exec_command(workspace_id: str, command: list[str]) -> dict[str, Any]:
 def destroy_workspace(workspace_id: str, server: str | None = None) -> dict[str, Any]:
     """Stop and destroy a workspace. Local mode removes its workspace
     directory; server mode deletes the server-side record."""
+    if (invalid := _invalid_workspace_id(workspace_id)) is not None:
+        return invalid
     args = ["destroy"]
     if server:
         args.extend(["--server", server])

@@ -119,6 +119,41 @@ def pick_workspace(prompt: str = "Select workspace") -> str:
     return ui.arrow_select(f"{prompt}:", choices, non_tty_hint="pass the workspace ID argument")
 
 
+def resolve_local_workspace_dir(root: Path, workspace_id: str) -> Path:
+    """Map a workspace id (or unique prefix) to its directory directly under
+    `root`. The id must be a single safe component and the match a real,
+    non-symlinked directory whose parent is exactly `root`; exits otherwise."""
+    from warren_common.paths import PathEscapeError, validate_workspace_id, workspace_child  # noqa: PLC0415
+
+    try:
+        validate_workspace_id(workspace_id)
+    except PathEscapeError as e:
+        ui.error(str(e))
+        raise typer.Exit(1) from e
+    ws_dir = root / workspace_id
+    if not (ws_dir.is_dir() or ws_dir.is_symlink()):
+        matches = [
+            d for d in root.iterdir()
+            if d.name.startswith(workspace_id) and (d.is_dir() or d.is_symlink())
+        ]
+        if len(matches) == 0:
+            ui.error(f"workspace {workspace_id!r} not found")
+            raise typer.Exit(1)
+        if len(matches) > 1:
+            ui.error(f"ambiguous workspace id {workspace_id!r}: {[m.name for m in matches]}")
+            raise typer.Exit(1)
+        ws_dir = matches[0]
+    try:
+        ws_dir = workspace_child(root, ws_dir.name)
+    except PathEscapeError as e:
+        ui.error(f"refusing workspace {workspace_id!r}: {e}")
+        raise typer.Exit(1) from e
+    if not ws_dir.is_dir():
+        ui.error(f"workspace {workspace_id!r} not found")
+        raise typer.Exit(1)
+    return ws_dir
+
+
 def _load_workspace_state(workspace_id: str) -> dict:
     """Resolve a workspace ID (or prefix) to its state dict.
 
@@ -134,17 +169,7 @@ def _load_workspace_state(workspace_id: str) -> dict:
         ui.error(f"no local workspaces found under {root}")
         raise typer.Exit(1)
 
-    ws_dir = root / workspace_id
-    if not ws_dir.is_dir():
-        matches = [d for d in root.iterdir() if d.is_dir() and d.name.startswith(workspace_id)]
-        if len(matches) == 1:
-            ws_dir = matches[0]
-        elif len(matches) == 0:
-            ui.error(f"workspace {workspace_id!r} not found")
-            raise typer.Exit(1)
-        else:
-            ui.error(f"ambiguous workspace id {workspace_id!r}: {[m.name for m in matches]}")
-            raise typer.Exit(1)
+    ws_dir = resolve_local_workspace_dir(root, workspace_id)
 
     # seatbelt/bwrap/nsjail keep sandbox.sb/state.json OUTSIDE the workspace
     # root, under ~/.warren/state/<id>/ (audit finding #1: root_path is
@@ -152,7 +177,14 @@ def _load_workspace_state(workspace_id: str) -> dict:
     # there could be rewritten by the sandboxed process and trusted on THIS
     # next connect — the exact attack this function exists to prevent). Check
     # there first; only docker has no such out-of-tree state at all.
+    from warren_common.paths import PathEscapeError, ensure_private_dir  # noqa: PLC0415
+
     proper_state_dir = _wh / ".warren" / "state" / ws_dir.name
+    try:
+        ensure_private_dir(proper_state_dir)
+    except PathEscapeError as e:
+        ui.error(f"refusing workspace state dir: {e}")
+        raise typer.Exit(1) from e
     using_legacy_root_state = not (proper_state_dir / "state.json").is_file()
     state_dir = ws_dir if using_legacy_root_state else proper_state_dir
 
@@ -173,85 +205,29 @@ def _load_workspace_state(workspace_id: str) -> dict:
     else:
         runtime_type = "bwrap"
 
-    # R3 (2026-10-17): a workspace provisioned before state.json moved out of
-    # the (sandbox-writable) workspace root must be MIGRATED, not silently
-    # read in place — reading the in-root copy and carrying on would defeat
-    # finding #1's fix for every workspace that predates it: a sandboxed
-    # process could still have rewritten that copy to affect THIS connect.
-    #
-    # W3 (Round 5 audit, 2026-10-17 -- investigated, NOT fixed, documented as a real
-    # structural limitation rather than guessed at): this migration MOVES src -> dest
-    # as-is below, including sandbox.sb's actual profile text and state.json's own
-    # content -- if a jailed/compromised process already tampered with either while
-    # sitting in the writable workspace root (before this migration ever runs), this
-    # just launders the tampered bytes into the newly-trusted proper_state_dir, and
-    # every call site that reads state_dir afterward (this function's own re-read
-    # below, seatbelt.py's exec()/status()) trusts it unconditionally from then on.
-    #
-    # The fix the audit suggests -- regenerate the profile/state fresh from the
-    # original project/template spec instead of moving untrusted bytes -- turns out not
-    # to be safely implementable from what's available here:
-    #   - build_sbpl_profile() reads spec.folders, spec.ssh_key_paths,
-    #     spec.git_store_paths, and spec.bind_mounts, none of which state.json
-    #     persists (seatbelt.py's provision() only ever wrote project/intent/app/
-    #     root_path/env_snapshot/worktree_paths/reference_paths).
-    #   - worktree_paths/reference_paths ARE in state.json, but pulling from them
-    #     doesn't help either -- they live in the SAME untrusted, attacker-writable
-    #     file being migrated. A tampered state.json could add bogus reference_paths
-    #     entries naming arbitrary host paths, and "regenerating" a profile from
-    #     that list would just grant read access to whatever the attacker named --
-    #     a different elevation (arbitrary host-path disclosure), not the fix.
-    # A genuinely safe regeneration needs the full original WorkspaceSpec
-    # re-resolved from the project YAML + verified-on-disk paths, independent of
-    # anything in the pre-migration file -- the same ingredients a fresh
-    # dispatch.py::provision_local() call assembles, but without re-cloning/
-    # re-materializing worktrees that already exist on disk for THIS workspace.
-    # That's a materially larger rewrite of this migration path than a mechanical
-    # "move" -> "rebuild" swap, and risks silently producing a wrong or weaker
-    # profile for every existing local workspace if done hastily. Left as an open,
-    # tracked gap rather than an unsafe guess.
-    # docker's state intentionally stays in-root — a docker container has no
-    # host-filesystem write access to it the way seatbelt/nsjail/bwrap do.
+    # A workspace provisioned before state moved out of the (sandbox-writable)
+    # root has only an untrusted in-root state.json/sandbox.sb. Neither can be
+    # validated or regenerated from trusted inputs (the profile is built from
+    # the full WorkspaceSpec, which state.json does not persist), so refuse
+    # rather than promote possibly tampered bytes into the trusted state dir.
+    # Docker's state stays in-root: a container has no host write access to it.
     if using_legacy_root_state and runtime_type != "docker":
-        import shutil as _shutil
-
-        from warren_common.fileperms import restrict_to_owner
-
-        proper_state_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            restrict_to_owner(proper_state_dir, directory=True)
-        except PermissionError:
-            pass
-        migrated_names = ["state.json"]
-        if runtime_type == "seatbelt":
-            migrated_names.append("sandbox.sb")
-        for name in migrated_names:
-            src = ws_dir / name
-            if not src.is_file():
-                continue
-            dest = proper_state_dir / name
-            _shutil.move(str(src), str(dest))
-            try:
-                restrict_to_owner(dest)
-            except PermissionError:
-                pass
         log.warning(
-            "workspace_state_migrated_from_root",
+            "workspace_legacy_root_state_refused",
             workspace_id=ws_dir.name,
             runtime_type=runtime_type,
-            dest=str(proper_state_dir),
         )
-        ui.warn(
-            f"migrated {runtime_type} workspace state out of the writable "
-            "workspace root (one-time)"
+        ui.error(
+            f"workspace {ws_dir.name} was created by an older warren that kept its "
+            "sandbox state inside the writable workspace root, so it can't be "
+            f"trusted. Recreate it: `warren destroy {ws_dir.name}`, then start a "
+            "new workspace from the same template."
         )
-        state_dir = proper_state_dir
-        state_path = state_dir / "state.json"
-        payload = json.loads(state_path.read_text())
+        raise typer.Exit(1)
 
     state: dict = {
         **payload,
-        "workspace_id": payload.get("workspace_id", ws_dir.name),
+        "workspace_id": ws_dir.name,
         "runtime_type": runtime_type,
         "app": payload.get("app", "bash"),
         "root_path": payload.get("root_path", str(ws_dir)),

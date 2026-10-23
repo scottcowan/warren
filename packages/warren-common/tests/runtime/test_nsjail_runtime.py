@@ -452,3 +452,66 @@ def test_reference_clones_mounted_read_only():
     )
     mounts = [m for m in NsjailConfig.from_spec(spec).mounts if m.src == "/refs/repo"]
     assert len(mounts) == 1 and mounts[0].rw is False
+
+
+def _bb3_state(tmp_path: Path) -> dict:
+    return {
+        "workspace_id": "ws-1", "root_path": str(tmp_path / "ws-1"),
+        "bind_mounts": [], "ssh_key_paths": [], "ssh_agent_sock": None,
+    }
+
+
+def test_write_cfg_refuses_symlinked_state_dir(tmp_path: Path):
+    import json
+
+    from warren_common.errors import WorkspaceNeedsRecreate
+    from warren_common.runtime.nsjail import write_nsjail_cfg
+
+    real = tmp_path / "elsewhere"
+    real.mkdir(mode=0o700)
+    (real / "state.json").write_text(json.dumps(_bb3_state(tmp_path)))
+    (tmp_path / "state").mkdir()
+    link = tmp_path / "state" / "ws-1"
+    link.symlink_to(real)
+    with pytest.raises(WorkspaceNeedsRecreate):
+        write_nsjail_cfg(link, "ws-1")
+    assert not (real / "nsjail.cfg").exists()
+
+
+def test_write_cfg_refuses_world_writable_state_dir_and_symlinked_state(tmp_path: Path):
+    import json
+    import os
+
+    from warren_common.errors import WorkspaceNeedsRecreate
+    from warren_common.runtime.nsjail import write_nsjail_cfg
+
+    state_dir = tmp_path / "state" / "ws-1"
+    state_dir.mkdir(parents=True)
+    os.chmod(state_dir, 0o777)
+    (state_dir / "state.json").write_text(json.dumps(_bb3_state(tmp_path)))
+    with pytest.raises(WorkspaceNeedsRecreate):
+        write_nsjail_cfg(state_dir, "ws-1")
+
+    os.chmod(state_dir, 0o700)
+    planted = tmp_path / "planted.json"
+    (state_dir / "state.json").rename(planted)
+    (state_dir / "state.json").symlink_to(planted)
+    with pytest.raises(WorkspaceNeedsRecreate):
+        write_nsjail_cfg(state_dir, "ws-1")
+
+
+def test_write_cfg_replaces_tampered_cfg_symlink_without_following(tmp_path: Path):
+    import json
+
+    from warren_common.runtime.nsjail import write_nsjail_cfg
+
+    state_dir = tmp_path / "state" / "ws-1"
+    state_dir.mkdir(parents=True, mode=0o700)
+    (state_dir / "state.json").write_text(json.dumps(_bb3_state(tmp_path)))
+    target = tmp_path / "target.txt"
+    target.write_text("untouched")
+    (state_dir / "nsjail.cfg").symlink_to(target)
+
+    cfg = write_nsjail_cfg(state_dir, "ws-1")
+    assert not cfg.is_symlink()
+    assert target.read_text() == "untouched"

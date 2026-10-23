@@ -690,15 +690,13 @@ def test_connect_via_execvp_bash_regenerates_banner_on_every_connect(tmp_path, m
 
 @pytest.mark.parametrize("mount", ["../escape", "/abs/escape", "a/../../escape"])
 def test_link_into_workspace_rejects_escaping_mount(tmp_path: Path, mount):
-    from warren_common.paths import PathEscapeError
-
     from warren_cli.dispatch import _link_into_workspace
 
     ws = tmp_path / "ws"
     ws.mkdir()
     src = tmp_path / "src"
     src.mkdir()
-    with pytest.raises(PathEscapeError):
+    with pytest.raises(ValueError):
         _link_into_workspace(ws, mount, src)
     assert not (tmp_path / "escape").exists()
 
