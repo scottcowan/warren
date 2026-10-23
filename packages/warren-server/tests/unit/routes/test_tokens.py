@@ -225,3 +225,19 @@ async def test_mint_own_token_records_created_by_token_id(
     fetched = await auth_store.get_token(token_id)
     assert fetched is not None
     assert fetched.created_by_token_id is None
+
+
+async def test_concurrent_mints_never_exceed_cap(app: FastAPI, auth_store: AuthStore, alice: User):
+    """Finding 11: count-then-insert let concurrent mints overshoot max_tokens_per_user."""
+    import asyncio
+
+    import httpx
+
+    app.state.settings.max_tokens_per_user = 3
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        responses = await asyncio.gather(*(ac.post("/tokens") for _ in range(12)))
+    codes = [r.status_code for r in responses]
+    assert codes.count(201) == 3
+    assert codes.count(429) == 9
+    assert await auth_store.count_active_tokens_for_user(alice.user_id) == 3

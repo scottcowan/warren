@@ -1287,3 +1287,33 @@ def test_provision_response_returns_only_app_from_spec_json(env_defaults, auth_h
             resp = client.post("/workspaces", json={"project": "demo", "template": "observe"})
     assert resp.status_code == 202
     _assert_no_spec_leak(resp.json())
+
+
+def test_concurrent_provisions_never_exceed_per_user_cap(env_defaults, monkeypatch, auth_headers):
+    """Finding 11: list-then-insert let concurrent POST /workspaces all pass the cap check."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    monkeypatch.setenv("WARREN_MAX_WORKSPACES_PER_USER", "2")
+    fake_registry = _make_fake_registry()
+
+    def _wrap_real_store(**kwargs):
+        fake_registry.store = kwargs["store"]
+        return fake_registry
+
+    with (
+        patch("warren.app.WorkspaceRegistry", side_effect=_wrap_real_store),
+        patch("warren.app.PodmanRuntime"),
+    ):
+        with TestClient(app, headers=auth_headers) as client:
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                responses = list(
+                    pool.map(
+                        lambda _: client.post("/workspaces", json={"project": "demo", "template": "observe"}),
+                        range(6),
+                    )
+                )
+            rows = client.portal.call(fake_registry.store.list_non_terminal)
+    codes = [r.status_code for r in responses]
+    assert codes.count(202) == 2
+    assert codes.count(503) == 4
+    assert len(rows) == 2
