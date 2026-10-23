@@ -272,7 +272,7 @@ mode = "local"   # local | server
 type = "auto"    # auto | docker | bwrap | seatbelt | nsjail — local sandboxing only
 
 [remotes.node2]
-url = "http://node2:8420"
+url = "https://node2:8420"   # server must opt in: WARREN_HOST + TLS (see packages/warren-server/README.md)
 
 [remotes.prod]
 runtime_type = "ecs"      # no direct URL — reached via an SSM port-forward instead
