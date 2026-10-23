@@ -31,10 +31,12 @@ import structlog
 
 from warren_common.errors import ProvisionError, RuntimeUnreachable
 from warren_common.runtime.base import (
+    SIDECAR_TOKEN_ENV,
     ContainerRuntime,
     RuntimeConfig,
     WorkspaceHandle,
     WorkspaceSpec,
+    new_sidecar_token,
 )
 
 log = structlog.get_logger(__name__)
@@ -131,6 +133,7 @@ class DockerRuntime:
         worktree_paths_val = ":".join(
             container_path for _, container_path in spec.worktree_paths
         )
+        sidecar_token = spec.sidecar_token or new_sidecar_token()
         env = {
             **spec.env,
             "WARREN_WORKSPACE_ID": spec.workspace_id,
@@ -142,11 +145,19 @@ class DockerRuntime:
             # connect, same as the local workspace zshrc already gets from spec.env.
             "WARREN_PROJECT": spec.project,
             "WARREN_TEMPLATE": spec.intent,
+            SIDECAR_TOKEN_ENV: sidecar_token,
         }
 
         name = f"warren-{spec.workspace_id[:8]}"
 
+        # Finding 9: the default `bridge` network lets every container on the host
+        # reach every other; workspaces join a dedicated bridge with inter-container
+        # communication disabled instead. Outbound NAT and published ports are
+        # unaffected; docker_networks below remain an explicit, per-template opt-in.
+        isolated = await _ensure_isolated_network(client)
+
         run_kwargs: dict[str, Any] = dict(
+            network=isolated.name,
             detach=True,
             init=True,
             remove=False,
@@ -191,6 +202,7 @@ class DockerRuntime:
                 "worktree_paths": [list(p) for p in spec.worktree_paths],
                 "reference_paths": [list(p) for p in spec.reference_paths],
                 "docker_networks": list(spec.docker_networks),
+                "sidecar_token": sidecar_token,
                 "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "status": "provisioned",
             }
@@ -210,6 +222,7 @@ class DockerRuntime:
             runtime_id=container.id,
             root_path=str(workspace_dir),
             sidecar_url="",
+            sidecar_token=sidecar_token,
         )
 
     async def start(self, handle: WorkspaceHandle) -> None:
@@ -349,6 +362,42 @@ def _build_mounts(spec: WorkspaceSpec) -> list[Any]:
             )
         )
     return mounts
+
+
+ISOLATED_NETWORK = "warren-isolated"
+_ICC_OPTION = "com.docker.network.bridge.enable_icc"
+
+
+async def _ensure_isolated_network(client: Any) -> Any:
+    """Get or create the workspaces' bridge with ICC off; fail closed if it has ICC on."""
+    import docker.errors
+
+    try:
+        network = await asyncio.to_thread(client.networks.get, ISOLATED_NETWORK)
+    except docker.errors.NotFound:
+        try:
+            return await asyncio.to_thread(
+                client.networks.create,
+                ISOLATED_NETWORK,
+                driver="bridge",
+                options={_ICC_OPTION: "false"},
+                labels={"warren.network": "isolated"},
+            )
+        except docker.errors.APIError as api_exc:
+            status = getattr(api_exc, "status_code", None) or 0
+            if not (status == 409 or "409" in str(api_exc)):
+                raise ProvisionError(f"docker API error creating network: {api_exc}") from api_exc
+            network = await asyncio.to_thread(client.networks.get, ISOLATED_NETWORK)
+    except docker.errors.APIError as exc:
+        raise ProvisionError(f"docker API error reading network: {exc}") from exc
+    attrs = network.attrs if isinstance(network.attrs, dict) else {}
+    options = attrs.get("Options") or {}
+    if str(options.get(_ICC_OPTION, "")).lower() != "false":
+        raise ProvisionError(
+            f"docker network {ISOLATED_NETWORK!r} exists without {_ICC_OPTION}=false; "
+            "remove it so warren can recreate it isolated"
+        )
+    return network
 
 
 async def _resolve_or_create_network(client: Any, net_name: str) -> Any:

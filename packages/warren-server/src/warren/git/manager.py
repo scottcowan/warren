@@ -52,6 +52,7 @@ from git.exc import InvalidGitRepositoryError, NoSuchPathError
 from warren_common.errors import ProvisionError
 from warren_common.safe_git import (
     SafeGitError,
+    SafeGitTimeout,
     read_repo_config,
     run_git,
     safe_git_env,
@@ -79,6 +80,9 @@ log = structlog.get_logger(__name__)
 # minutes on exactly this. A bounded timeout converts that hang into a
 # GitError, which registry.py's per-folder loop already catches and skips.
 _CLONE_TIMEOUT_S = 30.0
+# Same bound per git invocation of a pull (fetch, merge, ...); the git process
+# is killed on expiry, surfacing as GitPullError.
+_PULL_TIMEOUT_S = _CLONE_TIMEOUT_S
 
 # Matches an embedded installation-token credential in a GitHub App clone URL
 # (`https://x-access-token:<token>@host/...`) so it can be stripped before any
@@ -594,6 +598,10 @@ class GitManager:
 
         try:
             sha = await asyncio.to_thread(self._pull_sync, path, token)
+        except SafeGitTimeout as e:
+            raise GitPullError(
+                f"pull of {_sanitize(log_id)!r} timed out after {_PULL_TIMEOUT_S}s"
+            ) from e
         except (GitCommandError, InvalidGitRepositoryError, NoSuchPathError, SafeGitError) as e:
             raise GitPullError(_sanitize(str(e))) from e
         except OSError as e:
@@ -635,15 +643,16 @@ class GitManager:
             fetch_env = {**_GIT_ALLOW_PROTOCOL_ENV, **shadow.env()}
             if token is not None:
                 fetch_env.update(stack.enter_context(_askpass_env(token)))
-            run_git("fetch", "origin", extra_env=fetch_env, isolated=True)
-            target_branch = run_git(
-                "symbolic-ref", "--short", "HEAD", extra_env=shadow.env(), isolated=True
-            ).strip()
-            run_git(
-                "merge", "--ff-only", f"origin/{target_branch}",
-                extra_env=shadow.env(), isolated=True,
-            )
-            return run_git("rev-parse", "HEAD", extra_env=shadow.env(), isolated=True).strip()
+
+            def git(*args: str, env: dict[str, str] | None = None) -> str:
+                return run_git(
+                    *args, extra_env=env or shadow.env(), isolated=True, timeout=_PULL_TIMEOUT_S
+                )
+
+            git("fetch", "origin", env=fetch_env)
+            target_branch = git("symbolic-ref", "--short", "HEAD").strip()
+            git("merge", "--ff-only", f"origin/{target_branch}")
+            return git("rev-parse", "HEAD").strip()
 
     async def list_turn_refs(self, path: Path, prefix: str) -> list[dict]:
         """HIST-09: refs under `prefix` in the clone at `path`."""

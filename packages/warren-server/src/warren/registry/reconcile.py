@@ -144,3 +144,9 @@ async def reconcile_from_disk(
             sidecar_url="",
         )
         await runtime.destroy(handle)
+
+    # Finding 9: per-workspace networks (podman) outlive a provision that failed
+    # before destroy() could run; drop any whose workspace row is gone.
+    prune = getattr(runtime, "prune_workspace_networks", None)
+    if prune is not None:
+        await prune(server_id, known_ws_ids)

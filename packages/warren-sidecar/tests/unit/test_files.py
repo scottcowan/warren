@@ -93,29 +93,136 @@ def test_file_get_absolute_path_never_escapes_root(env_defaults, auth_headers, m
     assert response.status_code == 404
 
 
-def test_resolve_under_root_rejects_dotdot_traversal(tmp_path):
-    from fastapi import HTTPException
+def test_request_parts_rejects_dotdot_traversal():
+    from warren_sidecar.files import PathDenied, request_parts
 
-    from warren_sidecar.routes.files import _resolve_under_root
-
-    with pytest.raises(HTTPException) as ei:
-        _resolve_under_root("../etc/passwd", tmp_path)
-    assert ei.value.status_code == 400
+    for bad in ("../etc/passwd", "a/../../etc", "./x", ""):
+        with pytest.raises(PathDenied):
+            request_parts(bad)
 
 
-def test_resolve_under_root_joins_absolute_path_onto_root(tmp_path):
+def test_request_parts_joins_absolute_path_onto_root():
     """An absolute request path is joined onto root (audit #47), never served as-is."""
-    from warren_sidecar.routes.files import _resolve_under_root
+    from warren_sidecar.files import request_parts
 
-    resolved = _resolve_under_root("/proc/1/environ", tmp_path)
-    assert resolved == (tmp_path / "proc/1/environ").resolve()
+    assert request_parts("/proc/1/environ") == ("proc", "1", "environ")
+    assert request_parts("hello.txt") == ("hello.txt",)
 
 
-def test_resolve_under_root_treats_requests_as_relative_to_root(tmp_path):
-    """A caller-supplied path is always joined onto root, never trusted as an
-    absolute filesystem path — including when it happens to start with
-    root's own path components."""
-    from warren_sidecar.routes.files import _resolve_under_root
+def test_dotdot_request_is_rejected(env_defaults, auth_headers, monkeypatch, tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    (tmp_path / "outside.txt").write_text("TOPSECRET")
+    monkeypatch.setenv("WARREN_WORKTREE_PATHS", str(root))
+    with TestClient(app) as client:
+        response = client.get("/files/sub/%2E%2E/%2E%2E/outside.txt", headers=auth_headers)
+    assert response.status_code in (400, 404)
+    assert "TOPSECRET" not in response.text
 
-    resolved = _resolve_under_root("hello.txt", tmp_path)
-    assert resolved == (tmp_path / "hello.txt").resolve()
+
+@pytest.mark.parametrize(
+    "rel",
+    [".env", "config/.env.local", ".git/config", "node_modules/pkg/index.js", "hidden.secret", "build/out.txt"],
+)
+def test_excluded_file_is_not_readable_directly(env_defaults, auth_headers, monkeypatch, tmp_path, rel):
+    (tmp_path / ".gitignore").write_text("*.secret\nbuild/\n")
+    target = tmp_path / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("TOPSECRET")
+    monkeypatch.setenv("WARREN_WORKTREE_PATHS", str(tmp_path))
+    with TestClient(app) as client:
+        listed = [e["path"] for e in client.get("/files", headers=auth_headers).json()]
+        response = client.get(f"/files/{rel}", headers=auth_headers)
+    assert rel not in listed
+    assert response.status_code == 404
+    assert "TOPSECRET" not in response.text
+
+
+def _escape_layout(tmp_path):
+    root = tmp_path / "root"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (outside / "secret.txt").write_text("TOPSECRET")
+    (outside / "nested").mkdir()
+    (outside / "nested" / "deep.txt").write_text("TOPSECRET")
+    (root / "ok.txt").write_text("fine")
+    (root / "link.txt").symlink_to(outside / "secret.txt")
+    (root / "linkdir").symlink_to(outside, target_is_directory=True)
+    return root
+
+
+def test_file_symlink_escaping_root_is_refused(env_defaults, auth_headers, monkeypatch, tmp_path):
+    root = _escape_layout(tmp_path)
+    monkeypatch.setenv("WARREN_WORKTREE_PATHS", str(root))
+    with TestClient(app) as client:
+        response = client.get("/files/link.txt", headers=auth_headers)
+    assert response.status_code == 400
+    assert "TOPSECRET" not in response.text
+
+
+def test_directory_symlink_escaping_root_is_refused(env_defaults, auth_headers, monkeypatch, tmp_path):
+    root = _escape_layout(tmp_path)
+    monkeypatch.setenv("WARREN_WORKTREE_PATHS", str(root))
+    with TestClient(app) as client:
+        response = client.get("/files/linkdir/secret.txt", headers=auth_headers)
+        nested = client.get("/files/linkdir/nested/deep.txt", headers=auth_headers)
+    assert response.status_code == 400
+    assert nested.status_code == 400
+    assert "TOPSECRET" not in response.text + nested.text
+
+
+def test_symlink_inside_root_is_also_not_followed(env_defaults, auth_headers, monkeypatch, tmp_path):
+    root = _escape_layout(tmp_path)
+    (root / "alias.txt").symlink_to(root / "ok.txt")
+    monkeypatch.setenv("WARREN_WORKTREE_PATHS", str(root))
+    with TestClient(app) as client:
+        assert client.get("/files/ok.txt", headers=auth_headers).text == "fine"
+        assert client.get("/files/alias.txt", headers=auth_headers).status_code == 400
+
+
+def test_component_swapped_for_symlink_after_listing_is_refused(
+    env_defaults, auth_headers, monkeypatch, tmp_path
+):
+    """The race: a directory that was real when listed is a symlink when read."""
+    root = _escape_layout(tmp_path)
+    (root / "sub").mkdir()
+    (root / "sub" / "secret.txt").write_text("fine")
+    monkeypatch.setenv("WARREN_WORKTREE_PATHS", str(root))
+    with TestClient(app) as client:
+        assert "sub/secret.txt" in {e["path"] for e in client.get("/files", headers=auth_headers).json()}
+        (root / "sub" / "secret.txt").unlink()
+        (root / "sub").rmdir()
+        (root / "sub").symlink_to(tmp_path / "outside", target_is_directory=True)
+        response = client.get("/files/sub/secret.txt", headers=auth_headers)
+    assert response.status_code == 400
+    assert "TOPSECRET" not in response.text
+
+
+def test_walker_does_not_descend_symlinked_dirs(tmp_path):
+    from warren_sidecar.files import walk_tree
+
+    root = _escape_layout(tmp_path)
+    (root / "real").mkdir()
+    (root / "real" / "a.txt").write_text("a")
+    paths = {e["path"] for e in walk_tree(root)}
+    assert paths == {"ok.txt", "real", "real/a.txt"}
+
+
+def test_walker_does_not_follow_symlink_loop(tmp_path):
+    from warren_sidecar.files import walk_tree
+
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d" / "loop").symlink_to(tmp_path, target_is_directory=True)
+    assert {e["path"] for e in walk_tree(tmp_path)} == {"d"}
+
+
+def test_gitignore_symlink_is_not_read(tmp_path):
+    from warren_sidecar.files import walk_tree
+
+    (tmp_path / "outside").write_text("*.txt\n")
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / ".gitignore").symlink_to(tmp_path / "outside")
+    (root / "keep.txt").write_text("x")
+    assert "keep.txt" in {e["path"] for e in walk_tree(root)}

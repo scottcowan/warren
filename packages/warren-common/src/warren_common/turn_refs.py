@@ -21,7 +21,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .safe_git import SafeGitError, own_objects_dir, run_git, shadow_git_dir
+from .safe_git import SafeGitError, linked_objects, run_git, shadow_git_dir
 
 TURN_NAMESPACE = "refs/git-turn"
 FORMAT_REF = f"{TURN_NAMESPACE}/format"
@@ -171,12 +171,15 @@ def apply_snapshot(
     Returns the new branch tip.
     """
     # The one alternate host git is given is warren's choice, never the repo's:
-    # the source store gets the same checks as the destination's own
-    # (plain dir, no symlinks, no alternates of its own).
-    source = own_objects_dir(snapshot.objects.parent)
-    if source != snapshot.objects:
+    # the source store gets the same checks as the destination's own (plain
+    # dir, no symlinks, no alternates of its own) and is linked into a
+    # warren-owned dir, so host git never resolves a path inside it.
+    if snapshot.objects != snapshot.objects.parent / "objects":
         raise SafeGitError(f"{snapshot.objects} is not a repo's own objects dir")
-    with shadow_git_dir(git_dir, shadow_root, [], work_tree=work_tree) as shadow:
+    with (
+        linked_objects(snapshot.objects.parent, shadow_root) as source,
+        shadow_git_dir(git_dir, shadow_root, [], work_tree=work_tree) as shadow,
+    ):
         env = {**shadow.env(), **_IDENT_ENV, "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(source)}
 
         def git(*args: str) -> str:

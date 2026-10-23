@@ -19,23 +19,24 @@ import pytest
 from podman.errors import APIError, BuildError, ImageNotFound, NotFound
 
 from warren.images.build_spec import BuildSpec
-from warren.network.egress import EgressUnavailable
+from warren.runtime import podman as podman_runtime
 from warren_common.errors import ImageUnavailable, RuntimeUnreachable
 from warren_common.runtime.base import WorkspaceHandle, WorkspaceSpec
 from warren.runtime.podman import PodmanRuntime, run_preflight  # RED until Plan 03
 
 
-@pytest.fixture(autouse=True)
-def _no_real_bridge_ensure():
-    """Default every test in this module to a no-op ensure_bridge_network.
+_real_ensure_workspace_network = podman_runtime._ensure_workspace_network
 
-    Pre-04-02 tests provision() through this module without any awareness of
-    the shared egress bridge (D-04); without this autouse fixture they would
-    shell out to a real, unavailable `podman` binary. Tests that need to
-    assert on the bridge behavior itself re-patch the same target explicitly
-    (nested patches revert to this default on exit).
+
+@pytest.fixture(autouse=True)
+def _no_real_network_ensure():
+    """Default every test in this module to a no-op _ensure_workspace_network.
+
+    The mocked client's networks.get returns a MagicMock that is never an
+    isolated network, so provision() tests that don't care about networking
+    would otherwise fail closed. Network tests re-patch or call the real helper.
     """
-    with patch("warren.runtime.podman.ensure_bridge_network"):
+    with patch("warren.runtime.podman._ensure_workspace_network"):
         yield
 
 
@@ -512,38 +513,62 @@ async def test_destroy_put_archive_failure_does_not_block_remove():
         container.remove.assert_called_once_with(force=True)
 
 
-# --- 04-02 Task 1: shared egress bridge attachment (LIFE-02, D-04/D-05) ---
+# --- Finding 9: per-workspace isolated bridge networks (LIFE-02 egress counting) ---
+
+
+def _isolated_net(server_id: str = "srv-1", isolate: str = "true") -> MagicMock:
+    return MagicMock(
+        attrs={
+            "options": {"isolate": isolate},
+            "labels": {"warren.server_instance": server_id},
+        }
+    )
 
 
 @pytest.mark.asyncio
-async def test_provision_attaches_shared_bridge_network():
+async def test_provision_attaches_its_own_workspace_network():
     with (
         patch("warren.runtime.podman.PodmanClient") as ClientCls,
-        patch("warren.runtime.podman.ensure_bridge_network") as ensure_mock,
+        patch("warren.runtime.podman._ensure_workspace_network") as ensure_mock,
     ):
         client = ClientCls.return_value
         client.containers.create.return_value = MagicMock(id="ctr-abc")
         runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
         await runtime.provision(_spec())
         _, kwargs = client.containers.create.call_args
-        assert kwargs["networks"] == {"warren-egress": {}}
-        ensure_mock.assert_called_once_with("warren-egress")
+        assert kwargs["networks"] == {"warren-egress-ws-1": {}}
+        ensure_mock.assert_called_once_with(
+            client,
+            "warren-egress-ws-1",
+            {
+                "warren.workspace_id": "ws-1",
+                "warren.server_instance": "srv-1",
+                "warren.network": "workspace",
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_two_workspaces_never_share_a_network():
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.create.return_value = MagicMock(id="ctr-abc")
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        await runtime.provision(_spec())
+        other = _spec()
+        other.workspace_id = "ws-2"
+        await runtime.provision(other)
+        first, second = (c.kwargs["networks"] for c in client.containers.create.call_args_list)
+        assert first.keys().isdisjoint(second.keys())
 
 
 @pytest.mark.asyncio
 async def test_provision_sets_network_mode_bridge_alongside_networks():
     """Regression guard (live node2 finding, 2026-09-19): podman-py only
     populates the create payload's `netns` field when `network_mode` is
-    explicitly passed. Omitting it leaves the server-side default netns mode
-    in place, and the real Podman REST API rejects a `networks` dict against
-    any non-bridge netns with "networks and static ip/mac address can only
-    be used with Bridge mode networking" -- a failure this test's mocked
-    client cannot itself catch, but the kwarg presence can.
-    """
-    with (
-        patch("warren.runtime.podman.PodmanClient") as ClientCls,
-        patch("warren.runtime.podman.ensure_bridge_network"),
-    ):
+    explicitly passed; the Podman REST API rejects a `networks` dict against
+    any non-bridge netns."""
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
         client = ClientCls.return_value
         client.containers.create.return_value = MagicMock(id="ctr-abc")
         runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
@@ -553,28 +578,13 @@ async def test_provision_sets_network_mode_bridge_alongside_networks():
 
 
 @pytest.mark.asyncio
-async def test_provision_ensures_bridge_only_once():
+async def test_network_ensure_failure_blocks_container_create():
     with (
         patch("warren.runtime.podman.PodmanClient") as ClientCls,
-        patch("warren.runtime.podman.ensure_bridge_network") as ensure_mock,
+        patch("warren.runtime.podman._ensure_workspace_network") as ensure_mock,
     ):
+        ensure_mock.side_effect = RuntimeUnreachable("not isolated")
         client = ClientCls.return_value
-        client.containers.create.return_value = MagicMock(id="ctr-abc")
-        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
-        await runtime.provision(_spec())
-        await runtime.provision(_spec())
-        ensure_mock.assert_called_once_with("warren-egress")
-
-
-@pytest.mark.asyncio
-async def test_bridge_ensure_failure_raises_runtime_unreachable():
-    with (
-        patch("warren.runtime.podman.PodmanClient") as ClientCls,
-        patch("warren.runtime.podman.ensure_bridge_network") as ensure_mock,
-    ):
-        ensure_mock.side_effect = EgressUnavailable("no bridge for you")
-        client = ClientCls.return_value
-        client.containers.create.return_value = MagicMock(id="ctr-abc")
         runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
         with pytest.raises(RuntimeUnreachable):
             await runtime.provision(_spec())
@@ -582,10 +592,21 @@ async def test_bridge_ensure_failure_raises_runtime_unreachable():
 
 
 @pytest.mark.asyncio
+async def test_container_create_failure_removes_workspace_network():
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.create.side_effect = APIError("boom")
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        with pytest.raises(RuntimeUnreachable):
+            await runtime.provision(_spec())
+        client.networks.remove.assert_called_once_with("warren-egress-ws-1")
+
+
+@pytest.mark.asyncio
 async def test_empty_bridge_name_skips_network_kwarg():
     with (
         patch("warren.runtime.podman.PodmanClient") as ClientCls,
-        patch("warren.runtime.podman.ensure_bridge_network") as ensure_mock,
+        patch("warren.runtime.podman._ensure_workspace_network") as ensure_mock,
     ):
         client = ClientCls.return_value
         client.containers.create.return_value = MagicMock(id="ctr-abc")
@@ -596,6 +617,116 @@ async def test_empty_bridge_name_skips_network_kwarg():
         _, kwargs = client.containers.create.call_args
         assert "networks" not in kwargs
         ensure_mock.assert_not_called()
+        await runtime.destroy(WorkspaceHandle(workspace_id="ws-1", runtime_id="ctr-abc", root_path=""))
+        client.networks.remove.assert_not_called()
+
+
+def test_ensure_workspace_network_creates_isolated_bridge():
+    client = MagicMock()
+    client.networks.get.side_effect = NotFound("missing")
+    labels = {"warren.server_instance": "srv-1", "warren.workspace_id": "ws-1"}
+    _real_ensure_workspace_network(client, "warren-egress-ws-1", labels)
+    client.networks.create.assert_called_once_with(
+        "warren-egress-ws-1", driver="bridge", labels=labels, options={"isolate": "true"}
+    )
+
+
+@pytest.mark.parametrize("isolate", ["true", "strict"])
+def test_ensure_workspace_network_adopts_existing_isolated_network(isolate):
+    client = MagicMock()
+    client.networks.get.return_value = _isolated_net(isolate=isolate)
+    _real_ensure_workspace_network(client, "n", {"warren.server_instance": "srv-1"})
+    client.networks.create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "existing",
+    [
+        MagicMock(attrs={"options": {}, "labels": {"warren.server_instance": "srv-1"}}),
+        _isolated_net(isolate="false"),
+        _isolated_net(server_id="someone-else"),
+    ],
+)
+def test_ensure_workspace_network_fails_closed_on_foreign_or_open_network(existing):
+    client = MagicMock()
+    client.networks.get.return_value = existing
+    with pytest.raises(RuntimeUnreachable, match="not an isolated"):
+        _real_ensure_workspace_network(client, "n", {"warren.server_instance": "srv-1"})
+
+
+def test_ensure_workspace_network_create_race_rechecks_winner():
+    client = MagicMock()
+    client.networks.get.side_effect = [NotFound("missing"), _isolated_net()]
+    client.networks.create.side_effect = APIError("network name n already exists")
+    _real_ensure_workspace_network(client, "n", {"warren.server_instance": "srv-1"})
+
+
+def test_ensure_workspace_network_api_error_is_runtime_unreachable():
+    client = MagicMock()
+    client.networks.get.side_effect = NotFound("missing")
+    client.networks.create.side_effect = APIError("netavark: boom")
+    with pytest.raises(RuntimeUnreachable):
+        _real_ensure_workspace_network(client, "n", {"warren.server_instance": "srv-1"})
+
+
+@pytest.mark.asyncio
+async def test_destroy_removes_workspace_network_after_container():
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        order = MagicMock()
+        container = MagicMock(id="ctr-abc")
+        container.remove.side_effect = lambda **_: order.container_removed()
+        client.containers.get.return_value = container
+        client.networks.remove.side_effect = lambda name: order.network_removed(name)
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        await runtime.destroy(WorkspaceHandle(workspace_id="ws-1", runtime_id="ctr-abc", root_path=""))
+        assert [c[0] for c in order.mock_calls] == ["container_removed", "network_removed"]
+        order.network_removed.assert_called_once_with("warren-egress-ws-1")
+
+
+@pytest.mark.asyncio
+async def test_destroy_without_container_still_removes_network():
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.get.side_effect = NotFound("gone")
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        await runtime.destroy(WorkspaceHandle(workspace_id="ws-1", runtime_id="ctr-abc", root_path=""))
+        await runtime.destroy(WorkspaceHandle(workspace_id="ws-1", runtime_id="", root_path=""))
+        assert client.networks.remove.call_count == 2
+        client.containers.get.assert_called_once_with("ctr-abc")
+
+
+@pytest.mark.asyncio
+async def test_destroy_network_remove_failure_is_not_fatal():
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.get.return_value = MagicMock(id="ctr-abc")
+        client.networks.remove.side_effect = APIError("network in use")
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        await runtime.destroy(WorkspaceHandle(workspace_id="ws-1", runtime_id="ctr-abc", root_path=""))
+
+
+@pytest.mark.asyncio
+async def test_prune_workspace_networks_removes_only_this_servers_orphans():
+    def net(name, labels):
+        n = MagicMock(attrs={"labels": labels})
+        n.name = name
+        return n
+
+    ws = {"warren.network": "workspace", "warren.server_instance": "srv-1"}
+    networks = [
+        net("keep", {**ws, "warren.workspace_id": "ws-live"}),
+        net("orphan", {**ws, "warren.workspace_id": "ws-gone"}),
+        net("other-server", {**ws, "warren.server_instance": "srv-2", "warren.workspace_id": "x"}),
+        net("not-ours", {"warren.workspace_id": "ws-gone"}),
+        net("podman", {}),
+    ]
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.networks.list.return_value = networks
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        await runtime.prune_workspace_networks("srv-1", {"ws-live"})
+        client.networks.remove.assert_called_once_with("orphan")
 
 
 # --- 04-04 Task 1: PodmanRuntime.build_image (LIFE-04, D-09) ---
@@ -793,3 +924,34 @@ async def test_provision_points_harness_config_at_workspace_dir():
         assert env["OPENCODE_CONFIG_DIR"] == "/var/lib/warren/harness/opencode/config"
         assert env["OPENCODE_DB"] == "/var/lib/warren/harness/opencode/data/opencode.db"
         assert "CLAUDE_CONFIG_DIR" not in env
+
+
+@pytest.mark.asyncio
+async def test_provision_passes_spec_sidecar_token_over_a_same_named_secret():
+    """Audit finding 12: the sidecar gets the registry's per-workspace token."""
+    spec = _spec()
+    spec.sidecar_token = "tok-from-registry"
+    spec.env = {"WARREN_SIDECAR_TOKEN": "attacker-chosen"}
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.create.return_value = MagicMock(id="ctr-abc")
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        handle = await runtime.provision(spec)
+        _, kwargs = client.containers.create.call_args
+    assert kwargs["environment"]["WARREN_SIDECAR_TOKEN"] == "tok-from-registry"
+    assert handle.sidecar_token == "tok-from-registry"
+    assert "tok-from-registry" not in repr(spec) + repr(handle)
+
+
+@pytest.mark.asyncio
+async def test_provision_mints_a_sidecar_token_when_spec_has_none():
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.create.return_value = MagicMock(id="ctr-abc")
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        first = await runtime.provision(_spec())
+        token = client.containers.create.call_args.kwargs["environment"]["WARREN_SIDECAR_TOKEN"]
+        second = await runtime.provision(_spec())
+    assert len(token) >= 32
+    assert first.sidecar_token == token
+    assert second.sidecar_token != token

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import ipaddress
 import socket
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # Audit 2026-10-16 P2 #44: both secret_key and bootstrap_token are used as raw key
@@ -281,8 +282,8 @@ class WarrenSettings(BaseSettings):
     # hard failure, since containerized deployments predate this shim.
     egress_shim_socket: Path | None = None
 
-    # Egress monitoring bridge (LIFE-02, D-04/D-05): a shared Podman bridge network,
-    # required because the rootless pasta default has no host-readable veth byte counters
+    # Egress monitoring bridge (LIFE-02, D-04/D-05): name PREFIX of each workspace's own
+    # isolated Podman bridge network (`<prefix>-<workspace_id>`, Finding 9), required because the rootless pasta default has no host-readable veth byte counters
     # (04-RESEARCH.md Pitfall 1). MONITORING ONLY — per D-05 the allowlist is "everything",
     # no egress is ever blocked by this field. ROADMAP.md Phase 4 Success Criterion #2's
     # "no outbound network access unless explicitly allowlisted" is explicitly NOT
@@ -416,3 +417,49 @@ class WarrenSettings(BaseSettings):
 
             return json.loads(stripped)
         return v
+
+
+class BindSettings(BaseSettings):
+    """Where `python -m warren` listens (finding 14). Separate from WarrenSettings so the
+    listener can be validated before the app (and its required secrets) loads.
+
+    Loopback by default: bearer tokens and SSH private keys cross this socket. ECS reaches
+    it over an SSM port-forward, which lands on the task's own loopback. Anything else
+    (a container published with `-p`, a LAN host) must set WARREN_HOST, and a non-loopback
+    bind without WARREN_TLS_CERTFILE/WARREN_TLS_KEYFILE is refused unless
+    WARREN_ALLOW_INSECURE_HTTP=1 acknowledges the cleartext transport.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="WARREN_", frozen=True, extra="ignore")
+
+    host: str = "127.0.0.1"
+    port: int = 8420
+    tls_certfile: Path | None = None
+    tls_keyfile: Path | None = None
+    allow_insecure_http: bool = False
+
+    @property
+    def is_loopback(self) -> bool:
+        if self.host == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(self.host).is_loopback
+        except ValueError:
+            return False
+
+    @property
+    def tls_enabled(self) -> bool:
+        return self.tls_certfile is not None and self.tls_keyfile is not None
+
+    @model_validator(mode="after")
+    def _check_transport(self) -> BindSettings:
+        if (self.tls_certfile is None) != (self.tls_keyfile is None):
+            raise ValueError("WARREN_TLS_CERTFILE and WARREN_TLS_KEYFILE must be set together")
+        if not self.is_loopback and not self.tls_enabled and not self.allow_insecure_http:
+            raise ValueError(
+                f"refusing to serve cleartext HTTP on non-loopback WARREN_HOST={self.host!r}: "
+                "bearer tokens and SSH keys would cross the network unencrypted. Set "
+                "WARREN_TLS_CERTFILE/WARREN_TLS_KEYFILE, or WARREN_ALLOW_INSECURE_HTTP=1 if "
+                "the port is only reachable through a trusted hop (e.g. `-p 127.0.0.1:8420:8420`)"
+            )
+        return self

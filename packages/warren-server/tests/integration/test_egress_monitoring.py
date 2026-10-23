@@ -2,7 +2,7 @@
 
 Proves the same properties `scripts/verify_phase4_host_support.py` checks on a bare
 node2 host, but through the real code path: `PodmanRuntime.provision()` attaches the
-container to the shared `warren-egress` bridge, and
+container to its own per-workspace `warren-egress-<id>` bridge, and
 `warren.network.egress.read_container_egress_bytes` reads its cumulative tx_bytes
 counter via host-side veth sysfs.
 
@@ -45,12 +45,12 @@ async def test_provisioned_container_egress_bytes_readable_and_non_decreasing(
 
     handle = await runtime.provision(spec)
     try:
-        # (c) the container's inspect output lists the shared bridge network.
+        # (c) the container is attached to its own per-workspace bridge only.
         container = await asyncio.to_thread(
             runtime._client.containers.get, handle.runtime_id
         )
         networks = (container.attrs.get("NetworkSettings") or {}).get("Networks") or {}
-        assert "warren-egress" in networks
+        assert list(networks) == [f"warren-egress-{spec.workspace_id}"]
 
         # (a) a first read returns an int without raising.
         first = read_container_egress_bytes(handle.runtime_id)

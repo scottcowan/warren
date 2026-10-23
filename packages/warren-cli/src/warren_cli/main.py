@@ -1173,23 +1173,21 @@ def workspaces_destroy(
         safe_git_argv,
     )
     git_env = object_scrubbed_environ()
+    from warren_common.paths import PathEscapeError, workspace_child  # noqa: PLC0415
+
     workspaces_root = Path.home() / ".warren" / "workspaces"
-    ws_dir = workspaces_root / workspace_id
-    if not ws_dir.exists():
-        # Try short-ID match
-        matches = [d for d in workspaces_root.iterdir() if d.is_dir() and d.name.startswith(workspace_id)]
-        if len(matches) == 1:
-            ws_dir = matches[0]
-        elif len(matches) > 1:
-            ui.error(f"Ambiguous short ID '{workspace_id}' matches {len(matches)} workspaces. Use more characters.")
-            raise typer.Exit(1)
-        else:
-            ui.error(f"Workspace '{workspace_id}' not found.")
-            raise typer.Exit(1)
+    if not workspaces_root.is_dir():
+        ui.error(f"Workspace '{workspace_id}' not found.")
+        raise typer.Exit(1)
+    ws_dir = workspaces_local.resolve_local_workspace_dir(workspaces_root, workspace_id)
 
     # seatbelt/bwrap keep state.json outside root_path (audit finding #1) —
     # check there first, falling back to the workspace root for nsjail/docker.
-    state_dir = Path.home() / ".warren" / "state" / ws_dir.name
+    try:
+        state_dir = workspace_child(Path.home() / ".warren" / "state", ws_dir.name)
+    except PathEscapeError as e:
+        ui.error(f"refusing workspace state dir: {e}")
+        raise typer.Exit(1) from e
     state_file = state_dir / "state.json"
     if not state_file.exists():
         state_file = ws_dir / "state.json"
@@ -1283,10 +1281,16 @@ def workspaces_destroy(
         except Exception:
             pass  # best-effort; deletion proceeds regardless
 
+    try:
+        workspace_child(workspaces_root, ws_dir.name)
+        workspace_child(state_dir.parent, state_dir.name)
+    except PathEscapeError as e:
+        ui.error(f"refusing to delete: {e}")
+        raise typer.Exit(1) from e
     shutil.rmtree(ws_dir)
     # Clean up the out-of-tree sandbox state dir too (finding #1) — it holds
     # env_snapshot secret values (T-05b-19) and must not be left orphaned.
-    if state_dir.exists():
+    if state_dir.is_dir():
         shutil.rmtree(state_dir)
     ui.ok(f"Workspace {workspace_id[:8]}... destroyed.")
 

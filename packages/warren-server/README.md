@@ -42,7 +42,7 @@ export WARREN_BOOTSTRAP_TOKEN="$(python3 -c 'import secrets; print(secrets.token
 uv run --package warren-server python -m warren
 ```
 
-The server binds `0.0.0.0:8420`. On first boot (empty `users` table), `WARREN_BOOTSTRAP_TOKEN`
+The server binds `127.0.0.1:8420` (loopback only; see [Listening address](#listening-address)). On first boot (empty `users` table), `WARREN_BOOTSTRAP_TOKEN`
 mints the first admin user — use it as a bearer token to create further users and tokens via
 the admin API, then unset it (re-triggering bootstrap is a no-op once an admin exists).
 
@@ -52,6 +52,30 @@ curl -H "Authorization: Bearer $WARREN_BOOTSTRAP_TOKEN" http://localhost:8420/wo
 ```
 
 Every route except `/_status` and `/healthz` requires a bearer token.
+
+### Listening address
+
+Bearer tokens and SSH private keys cross the API socket, so the default is loopback.
+
+| Env | Default | |
+|---|---|---|
+| `WARREN_HOST` | `127.0.0.1` | Address to bind. Anything non-loopback is an explicit opt-in. |
+| `WARREN_PORT` | `8420` | |
+| `WARREN_TLS_CERTFILE` / `WARREN_TLS_KEYFILE` | unset | Serve HTTPS. Set both or neither. |
+| `WARREN_ALLOW_INSECURE_HTTP` | `0` | Required to serve plain HTTP on a non-loopback `WARREN_HOST`; logs `insecure_http_listener` at startup. |
+
+With a non-loopback `WARREN_HOST` and neither TLS nor `WARREN_ALLOW_INSECURE_HTTP=1`, the
+server exits with an error. Typical setups:
+
+- **Local, or an SSH tunnel** (`runtime_type = "ssh"` remotes): leave the defaults.
+- **ECS Fargate**: leave the defaults. The CLI reaches the control plane through an SSM
+  port-forward (`AWS-StartPortForwardingSession`), which connects to the task's own loopback.
+- **Server image under podman/docker with `-p`**: published ports arrive on the container's
+  interface, not its loopback, so set `WARREN_HOST=0.0.0.0` plus TLS, or keep the publish
+  loopback-only and acknowledge cleartext:
+  `-p 127.0.0.1:8420:8420 -e WARREN_HOST=0.0.0.0 -e WARREN_ALLOW_INSECURE_HTTP=1`.
+- **Clients connecting over the network** (`url = "https://node2:8420"`): set `WARREN_HOST`
+  and TLS.
 
 ## API surface
 

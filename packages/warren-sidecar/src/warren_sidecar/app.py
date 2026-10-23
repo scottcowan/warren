@@ -10,6 +10,7 @@ import structlog
 from fastapi import FastAPI
 
 from warren_sidecar.agent_state import OscRecorder
+from warren_sidecar.auth import SidecarTokenMiddleware
 from warren_sidecar.config import SidecarSettings
 from warren_sidecar.events import EventBuffer
 from warren_sidecar.supervisor import WorkspaceAppSupervisor
@@ -24,6 +25,8 @@ async def lifespan(app: FastAPI):
     osc = OscRecorder(f"{settings.harness_root.rstrip('/')}/.session")
     supervisor = WorkspaceAppSupervisor(event_buffer=event_buffer, on_output=osc.feed)
 
+    if not settings.sidecar_token:
+        log.warning("sidecar_token_unset", detail="every request except /healthz is refused")
     app.state.settings = settings
     app.state.event_buffer = event_buffer
     app.state.supervisor = supervisor
@@ -51,6 +54,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="warren-sidecar", version="0.1.0", lifespan=lifespan)
+app.add_middleware(SidecarTokenMiddleware)
 
 from warren_sidecar.routes import healthz as healthz_routes  # noqa: E402
 app.include_router(healthz_routes.router)

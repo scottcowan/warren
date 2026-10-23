@@ -164,14 +164,16 @@ def test_apply_snapshot_refuses_source_or_dest_with_alternates(ab, tmp_path: Pat
 
 
 def test_alternates_planted_mid_run_blocks_write_back(tmp_path: Path):
-    a, _ = _repo(tmp_path / "a", "one\n")
+    a, a_sha = _repo(tmp_path / "a", "one\n")
     b, b_sha = _repo(tmp_path / "b", "secret-of-b\n")
     with pytest.raises(SafeGitError, match="alternates"):
         with shadow_git_dir(a / ".git", tmp_path / "shadow", []) as sh:
             info = a / ".git" / "objects" / "info"
             info.mkdir(exist_ok=True)
             (info / "alternates").write_text(f"{b / '.git' / 'objects'}\n")
-            run_git("update-ref", "refs/heads/stolen", b_sha, extra_env=sh.env(), isolated=True)
+            with pytest.raises(SafeGitError):
+                run_git("cat-file", "-e", b_sha, extra_env=sh.env(), isolated=True)
+            run_git("update-ref", "refs/heads/stolen", a_sha, extra_env=sh.env(), isolated=True)
     assert not (a / ".git" / "refs" / "heads" / "stolen").exists()
 
 

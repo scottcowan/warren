@@ -10,7 +10,7 @@ import re
 import uuid
 import weakref
 from collections.abc import AsyncIterator
-from typing import Literal
+from typing import Literal, NoReturn
 
 import structlog
 from fastapi import APIRouter, HTTPException, Query, Request, Response
@@ -27,6 +27,7 @@ from warren.images.build_spec import BuildPathError, resolve_build_spec
 from warren.images.resolve import template_image
 from warren.ratelimit import SlidingWindowRateLimiter
 from warren.registry.models import OperationReceipt, ProvisionedWorkspaceView, WorkspaceView
+from warren.registry.store import CapacityExhausted
 from warren.registry.registry import (
     ROOT_REPO,
     BranchSource,
@@ -276,40 +277,16 @@ async def _provision_workspace(
     registry = request.app.state.registry
     settings = request.app.state.settings
 
-    # Issue #9: max_workspaces was declared in config but never enforced anywhere.
-    # Counts non-terminal rows only (provisioning/running/stopping/unknown) — a
-    # stopped/failed/destroyed workspace doesn't occupy live capacity. Read-then-
-    # insert has the same acknowledged race allocate_ssh_port()'s docstring
-    # already documents for this codebase (mitigated by aiosqlite's WAL +
-    # busy_timeout, not a new locking primitive) — same accepted tradeoff,
-    # applied consistently rather than inventing a different one here.
+    # Issue #9/#11: server-wide and per-owner caps on non-terminal rows (provisioning/
+    # running/stopping/unknown). This early check only fails fast before image
+    # resolution/builds; the cap itself is enforced atomically by the insert below.
     if settings is not None and resume_id is None:
         active = await registry.store.list_non_terminal()
         if len(active) >= settings.max_workspaces:
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "error": "capacity_exhausted",
-                    "detail": f"max_workspaces ({settings.max_workspaces}) reached",
-                },
-            )
-
-        # Issue #11: the check above is server-wide and doesn't stop one owner from
-        # exhausting it for everyone. This is a per-owner cap on top of it, checked
-        # against the same non-terminal rows (same accepted read-then-insert race as
-        # above, applied consistently rather than inventing a different tradeoff here).
+            _raise_capacity_exhausted(CapacityExhausted("server", settings.max_workspaces))
         owned_active = [w for w in active if w.owner_id == user.user_id]
         if len(owned_active) >= settings.max_workspaces_per_user:
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "error": "capacity_exhausted",
-                    "detail": (
-                        f"max_workspaces_per_user ({settings.max_workspaces_per_user}) "
-                        "reached for this user"
-                    ),
-                },
-            )
+            _raise_capacity_exhausted(CapacityExhausted("owner", settings.max_workspaces_per_user))
 
     workspace_id = resume_id or str(uuid.uuid4())
     scoped_to = current_workspace_scope(request) if resume_id is None else None
@@ -473,6 +450,7 @@ async def _provision_workspace(
         ws_token.token_id
     ):
         _deny_scoped_provision(request, scoped_to)
+    created_operation = False
     if operation is not None and resume_id is None:
         principal, request_hash = operation
         if not await request.app.state.operation_store.create(
@@ -483,19 +461,27 @@ async def _provision_workspace(
             workspace_id=workspace_id,
         ):
             raise HTTPException(status_code=409, detail={"error": "operation_in_progress"})
+        created_operation = True
     if resume_id is None or await registry.store.get(workspace_id) is None:
-        await registry.store.insert(
-            workspace_id=workspace_id,
-            project=body.project,
-            intent=body.template,
-            image=image,
-            root_path="",
-            server_instance=registry.server_id,
-            status="provisioning",
-            owner_id=user.user_id,
-            idle_ttl_seconds=idle_ttl_seconds,
-            spec_json=serialize_spec_extra(spec),
-        )
+        try:
+            await registry.store.insert(
+                workspace_id=workspace_id,
+                project=body.project,
+                intent=body.template,
+                image=image,
+                root_path="",
+                server_instance=registry.server_id,
+                status="provisioning",
+                owner_id=user.user_id,
+                idle_ttl_seconds=idle_ttl_seconds,
+                spec_json=serialize_spec_extra(spec),
+                max_total=settings.max_workspaces if settings is not None else None,
+                max_per_owner=settings.max_workspaces_per_user if settings is not None else None,
+            )
+        except CapacityExhausted as exc:
+            if created_operation:
+                await request.app.state.operation_store.delete(operation[0], body.operation_id)
+            _raise_capacity_exhausted(exc)
     else:
         await registry.store.update_status(workspace_id, "provisioning")
 
@@ -545,6 +531,14 @@ async def _provision_workspace(
         )
 
     return WorkspaceView.from_workspace(ws)
+
+
+def _raise_capacity_exhausted(exc: CapacityExhausted) -> NoReturn:
+    if exc.scope == "server":
+        detail = f"max_workspaces ({exc.limit}) reached"
+    else:
+        detail = f"max_workspaces_per_user ({exc.limit}) reached for this user"
+    raise HTTPException(status_code=503, detail={"error": "capacity_exhausted", "detail": detail})
 
 
 def _deny_scoped_provision(request: Request, workspace_id: str) -> None:

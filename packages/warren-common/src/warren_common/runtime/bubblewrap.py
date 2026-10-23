@@ -41,7 +41,7 @@ from warren_common.runtime.sandbox_env import (
     base_host_env,
     check_no_secret_service_mounts,
     host_mount_sources,
-    state_root,
+    workspace_state_dir,
     write_secret_env_file,
 )
 
@@ -57,7 +57,7 @@ def _state_dir_for(workspace_id: str) -> Path:
     state.json stored there is a state.json the sandboxed process could
     rewrite, choosing its own argv on the next `warren connect`.
     """
-    return state_root() / workspace_id
+    return workspace_state_dir(workspace_id)
 
 # Optional system paths — may be absent on some distros (Pitfall 3: /lib64 is
 # missing on Debian arm64). Mounted via --ro-bind-try so provision does not

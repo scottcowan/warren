@@ -216,7 +216,6 @@ async def test_ensure_reference_clones_then_fetches(tmp_path: Path, seed_repo):
 @pytest.mark.parametrize("subdir", ["../victim", "/abs/victim", "a/../../victim"])
 async def test_add_worktree_rejects_escaping_subdir(tmp_path: Path, seed_repo, subdir):
     from warren_common.git import GitManager
-    from warren_common.paths import PathEscapeError
 
     projects_dir = tmp_path / "projects"
     projects_dir.mkdir()
@@ -227,7 +226,7 @@ async def test_add_worktree_rejects_escaping_subdir(tmp_path: Path, seed_repo, s
     victim.mkdir()
     (victim / "keep.txt").write_text("keep")
 
-    with pytest.raises(PathEscapeError):
+    with pytest.raises(ValueError):
         await GitManager.add_worktree(
             bare, workspace_root, "main",
             workspace_id="aabbccdd-1234-5678-abcd-ef0123456789", intent="develop",
@@ -346,3 +345,43 @@ async def test_add_worktree_start_point_pins_commit(tmp_path: Path, seed_repo):
         intent="develop", start_point=first,
     )
     assert _run("git", "-C", str(target), "rev-parse", "HEAD").strip() == first
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subdir", ["../victim", "/abs/victim", "a/../../victim", "", "."])
+async def test_remove_worktree_rejects_escaping_subdir(tmp_path: Path, seed_repo, subdir):
+    from warren_common.git import GitManager
+
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    bare = await GitManager.ensure_bare(_project("demo", seed_repo), projects_dir)
+    workspace_root = tmp_path / "ws"
+    workspace_root.mkdir()
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("keep")
+
+    with pytest.raises(ValueError):
+        await GitManager.remove_worktree(bare, workspace_root, "main", subdir=subdir)
+    assert (victim / "keep.txt").read_text() == "keep"
+    assert workspace_root.is_dir()
+
+
+@pytest.mark.asyncio
+async def test_remove_worktree_refuses_symlink_under_symlinked_parent(tmp_path: Path, seed_repo):
+    from warren_common.git import GitManager
+    from warren_common.paths import PathEscapeError
+
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir()
+    bare = await GitManager.ensure_bare(_project("demo", seed_repo), projects_dir)
+    workspace_root = tmp_path / "ws"
+    workspace_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "repo").symlink_to(tmp_path / "anything")
+    (workspace_root / "code").symlink_to(outside)
+
+    with pytest.raises(PathEscapeError):
+        await GitManager.remove_worktree(bare, workspace_root, "main", subdir="code/repo")
+    assert (outside / "repo").is_symlink()
