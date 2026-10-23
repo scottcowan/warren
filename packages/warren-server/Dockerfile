@@ -26,6 +26,24 @@ COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --package warren-server --locked --no-editable --no-dev
 
+# session-manager-plugin: ECSRuntime.exec_stream runs `aws ecs execute-command`-style
+# sessions through it. Pinned version, each arch's .deb verified against its sha256
+# before it reaches the final image.
+FROM python:3.11-slim@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce AS session-manager-plugin
+ARG TARGETARCH
+ARG SESSION_MANAGER_PLUGIN_VERSION=1.2.896.0
+ARG SESSION_MANAGER_PLUGIN_SHA256_AMD64=53f51fcc67314a4bf85888a38a3967cd41f8d0f28a60a9469a63acf935ba713e
+ARG SESSION_MANAGER_PLUGIN_SHA256_ARM64=914eeca87b18b55356c58be197080f73742b3ca60d3823f0a45670dc9056aa9c
+RUN set -eu; \
+    case "$TARGETARCH" in \
+      amd64) dir=ubuntu_64bit; sha="$SESSION_MANAGER_PLUGIN_SHA256_AMD64" ;; \
+      arm64) dir=ubuntu_arm64; sha="$SESSION_MANAGER_PLUGIN_SHA256_ARM64" ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    python -c 'import sys, urllib.request; urllib.request.urlretrieve(sys.argv[1], "/session-manager-plugin.deb")' \
+      "https://s3.amazonaws.com/session-manager-downloads/plugin/${SESSION_MANAGER_PLUGIN_VERSION}/${dir}/session-manager-plugin.deb"; \
+    echo "$sha  /session-manager-plugin.deb" | sha256sum -c -
+
 FROM python:3.11-slim@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce
 # 3.11-slim as of 2026-10-17
 # No `podman` CLI: workspace networks are managed through the API socket
@@ -47,6 +65,8 @@ FROM python:3.11-slim@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e57
 # shell out to on a real deployment until now.
 RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client \
     && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=bind,from=session-manager-plugin,source=/session-manager-plugin.deb,target=/tmp/session-manager-plugin.deb \
+    dpkg -i /tmp/session-manager-plugin.deb && session-manager-plugin --version
 COPY --from=builder /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
 RUN useradd -u 1000 -m warren

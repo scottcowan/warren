@@ -19,6 +19,45 @@ locals {
   efs_arn             = var.create_efs ? aws_efs_file_system.warren[0].arn : ""
   efs_id              = var.create_efs ? aws_efs_file_system.warren[0].id : ""
   control_plane_image = var.control_plane_image_uri != "" ? var.control_plane_image_uri : var.image_uri
+  server_id           = "warren-server-control-plane-${var.env_suffix}"
+  # Key for the per-workspace SSM SecureString mirror (WARREN_KMS_KEY_ID): a key created
+  # here, else var.ssm_kms_key_arn, else var.kms_key_id. Empty = alias/aws/ssm.
+  ssm_kms_key_arn = (
+    var.create_ssm_kms_key ? aws_kms_key.ssm[0].arn :
+    var.ssm_kms_key_arn != "" ? var.ssm_kms_key_arn : var.kms_key_id
+  )
+  # The execution role decrypts workspace secrets and the control plane's own secret-key.
+  exec_decrypt_keys         = distinct(compact([local.ssm_kms_key_arn, var.kms_key_id]))
+  ssm_secret_parameter_arns = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/${var.ecs_resource_prefix}/${local.server_id}/*"
+}
+
+# Optional customer-managed key for the workspace-secret SSM mirror. The key policy only
+# delegates to IAM; the control-plane task role gets kms:Encrypt and the task execution
+# role kms:Decrypt, both only via SSM.
+resource "aws_kms_key" "ssm" {
+  count               = var.create_ssm_kms_key ? 1 : 0
+  description         = "warren ${var.env_suffix}: workspace secrets mirrored to SSM"
+  enable_key_rotation = true
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "EnableIAMPolicies"
+      Effect    = "Allow"
+      Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
+      Action    = "kms:*"
+      Resource  = "*"
+    }]
+  })
+
+  tags = {
+    warren = "true"
+  }
+}
+
+resource "aws_kms_alias" "ssm" {
+  count         = var.create_ssm_kms_key ? 1 : 0
+  name          = "alias/warren-ssm-${var.env_suffix}"
+  target_key_id = aws_kms_key.ssm[0].key_id
 }
 
 # ---------------------------------------------------------------------------
@@ -899,27 +938,12 @@ data "aws_iam_policy_document" "task_role_policy" {
     resources = [aws_iam_role.task_exec_role.arn, aws_iam_role.workspace_task_role.arn]
   }
 
-  statement {
-    sid    = "SSMSecrets"
-    effect = "Allow"
-    actions = [
-      # GetParametersByPath, matching the actual call (ecs.py's _fetch_ssm_parameter_names uses
-      # ssm.get_parameters_by_path with WithDecryption=false) — this role only needs parameter
-      # NAMES to build secrets ARNs for the task definition; values are resolved later by the
-      # exec role, never by this process (fixes issue #4: secrets exposed through RunTask
-      # container overrides). DescribeParameters/GetParameters (the previous grant here) is not
-      # the action this call actually requires.
-      "ssm:GetParametersByPath",
-    ]
-    # Path-scoped to var.ecs_resource_prefix (not a hardcoded "warren/" literal) so this
-    # stays in sync with whatever WARREN_ECS_RESOURCE_PREFIX the control-plane task is
-    # actually running with (finding #15/#17) — a mismatch here would silently deny every
-    # SSM lookup even though the path looks right to a casual reader.
-    resources = ["arn:aws:ssm:*:*:parameter/${var.ecs_resource_prefix}/*"]
-  }
+  # No SSM read action here at all: ssm:GetParametersByPath can't be restricted to
+  # WithDecryption=false in IAM, so holding it would let this role decrypt every workspace
+  # secret. ecs.py builds secret ARNs from warren's own store instead.
 
   # finding #17: secrets/ssm_store.py mirrors every `PUT`/`DELETE /secrets` call into SSM
-  # Parameter Store at /{resource_prefix}/{server_id}/{owner_id}/{name} (see _param_path) —
+  # Parameter Store at /{resource_prefix}/{server_id}/{owner_id}/{name} (see runtime/ecs.py ssm_parameter_name) —
   # nothing previously granted this role ssm:PutParameter/DeleteParameter, so since the
   # fix making a failed mirror a 502 (issue #9), every secret write/delete call fails on
   # ECS. Scoped with var.ecs_resource_prefix (not a hardcoded "/warren/*") so this grant
@@ -927,7 +951,7 @@ data "aws_iam_policy_document" "task_role_policy" {
   # with — a mismatch here would otherwise deny every call even though the app-level path
   # looks identical to a casual reader.
   # R19: narrowed from "/${prefix}/*" to "/${prefix}/${server_id}/*" — ssm_store.py's
-  # _param_path shapes every write this grant is actually for as
+  # ssm_parameter_name shapes every write this grant is actually for as
   # /{resource_prefix}/{server_id}/{owner_id}/{name}, where {server_id} is always THIS
   # control plane's own WARREN_SERVER_ID (self.server_id in ecs.py — every secret this
   # process writes or deletes is necessarily under its own server_id segment, never
@@ -945,25 +969,30 @@ data "aws_iam_policy_document" "task_role_policy" {
       "ssm:PutParameter",
       "ssm:DeleteParameter",
     ]
-    resources = ["arn:aws:ssm:*:*:parameter/${var.ecs_resource_prefix}/warren-server-control-plane-${var.env_suffix}/*"]
+    resources = [local.ssm_secret_parameter_arns]
   }
 
-  # finding #17: only needed when the SSM parameters are encrypted with a customer-managed
-  # KMS key (WarrenSettings.kms_key_id / var.kms_key_id) rather than the AWS-managed
-  # alias/aws/ssm key, which needs no explicit grant. Mirrors this file's existing
-  # `dynamic "statement"` pattern for conditional grants (the EFS statements above), gated
-  # on var.kms_key_id being non-empty instead of var.create_efs.
+  # A customer-managed key for the SSM mirror needs kms:Encrypt only: PutParameter of a
+  # Standard-tier SecureString (ssm_store.py always sets Tier=Standard) encrypts with
+  # kms:Encrypt, and this role never decrypts. Bound to SSM and to this server's own
+  # parameters through SSM's PARAMETER_ARN encryption context. alias/aws/ssm needs no grant.
   dynamic "statement" {
-    for_each = var.kms_key_id != "" ? [1] : []
+    for_each = local.ssm_kms_key_arn != "" ? [1] : []
     content {
-      sid    = "SSMSecretsKMS"
-      effect = "Allow"
-      actions = [
-        "kms:Encrypt",
-        "kms:Decrypt",
-        "kms:GenerateDataKey",
-      ]
-      resources = [var.kms_key_id]
+      sid       = "SSMSecretsKMSEncrypt"
+      effect    = "Allow"
+      actions   = ["kms:Encrypt"]
+      resources = [local.ssm_kms_key_arn]
+      condition {
+        test     = "StringEquals"
+        variable = "kms:ViaService"
+        values   = ["ssm.${var.aws_region}.amazonaws.com"]
+      }
+      condition {
+        test     = "StringLike"
+        variable = "kms:EncryptionContext:PARAMETER_ARN"
+        values   = [local.ssm_secret_parameter_arns]
+      }
     }
   }
 
@@ -1009,6 +1038,19 @@ data "aws_iam_policy_document" "task_role_policy" {
       "logs:PutLogEvents",
     ]
     resources = ["${aws_cloudwatch_log_group.ecs_exec.arn}:*", aws_cloudwatch_log_group.ecs_exec.arn]
+  }
+
+  # ECS Exec into this task with an encrypted session/log key, same as the workspace task
+  # role's ECSExecLogKMS. Not an SSM read: this role holds no ssm:GetParameter*, so it can
+  # never obtain a SecureString's ciphertext to decrypt, even if it shares this key.
+  dynamic "statement" {
+    for_each = var.kms_key_id != "" ? [1] : []
+    content {
+      sid       = "ECSExecLogKMS"
+      effect    = "Allow"
+      actions   = ["kms:Decrypt", "kms:GenerateDataKey"]
+      resources = [var.kms_key_id]
+    }
   }
 
   # EFS — workspace persistence (D-08). Only meaningful when create_efs = true; HCL has no
@@ -1187,7 +1229,7 @@ data "aws_iam_policy_document" "workspace_task_role_policy" {
   # orchestrator (this repo's warren-server, running as task_role above) resolves which SSM
   # parameters to reference per task by verifying the calling operator's real AWS identity
   # (warren/auth/aws_identity.py — a presigned sts:GetCallerIdentity URL, never raw
-  # credentials) and scoping its ListParametersByPath lookup to that identity's own path
+  # credentials) and scoping its SSM secret paths to that identity's own path
   # segment under /warren/*. No new IAM permissions were needed for this — it's additive
   # path structure under the wildcard resources already granted above and on task_exec_role.
   dynamic "statement" {
@@ -1287,12 +1329,17 @@ data "aws_iam_policy_document" "exec_log_policy" {
   # SSMSecretsKMS statement on task_role_policy above. The default AWS-managed SSM key
   # (used when var.kms_key_id is empty) needs no explicit grant here.
   dynamic "statement" {
-    for_each = var.kms_key_id != "" ? [1] : []
+    for_each = length(local.exec_decrypt_keys) > 0 ? [1] : []
     content {
       sid       = "SSMSecretsResolveKMS"
       effect    = "Allow"
       actions   = ["kms:Decrypt"]
-      resources = [var.kms_key_id]
+      resources = local.exec_decrypt_keys
+      condition {
+        test     = "StringEquals"
+        variable = "kms:ViaService"
+        values   = ["ssm.${var.aws_region}.amazonaws.com"]
+      }
     }
   }
 }
@@ -1526,7 +1573,7 @@ resource "aws_ecs_task_definition" "warren_server" {
       # previously left dormant here). Empty string when create_efs = false,
       # which keeps ECSRuntime(volume=None) — ephemeral task storage only.
       environment = [
-        { name = "WARREN_SERVER_ID", value = "warren-server-control-plane-${var.env_suffix}" },
+        { name = "WARREN_SERVER_ID", value = local.server_id },
         { name = "WARREN_RUNTIME_TYPE", value = "ecs" },
         { name = "WARREN_ECS_CLUSTER", value = aws_ecs_cluster.warren.name },
         { name = "WARREN_ECS_SUBNET_IDS", value = join(",", local.subnet_ids) },
@@ -1562,7 +1609,7 @@ resource "aws_ecs_task_definition" "warren_server" {
         # a mismatch here would deny every SSM lookup the app makes even though the IAM
         # policy looks correctly scoped to a casual reader.
         { name = "WARREN_ECS_RESOURCE_PREFIX", value = var.ecs_resource_prefix },
-        { name = "WARREN_KMS_KEY_ID", value = var.kms_key_id },
+        { name = "WARREN_KMS_KEY_ID", value = local.ssm_kms_key_arn },
       ]
 
       logConfiguration = {

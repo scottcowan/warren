@@ -132,7 +132,9 @@ class WarrenSettings(BaseSettings):
     # groups, and tags (ecs.py). Default "warren" matches every existing
     # deployment; override only when a deployment's own infra naming convention
     # doesn't use "warren" anywhere (see issue #2).
-    ecs_resource_prefix: str = "warren"
+    # Always the leading "<prefix>-" of every task-definition family this server
+    # registers, so it must be non-empty and family-safe (letters, digits, -, _).
+    ecs_resource_prefix: str = Field(default="warren", pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
     # NoDecode: pydantic-settings v2 otherwise JSON-decodes list[str] env vars in
     # EnvSettingsSource before pydantic validators ever run, raising SettingsError on the
     # bare comma-separated format Terraform's outputs.tf actually emits. NoDecode hands the
@@ -212,11 +214,10 @@ class WarrenSettings(BaseSettings):
     # pinned in the image. An ssh host not listed in either is refused.
     ecs_git_known_hosts: str = ""
 
-    # Customer-managed KMS key for the SSM SecureString mirror warren.secrets writes on
-    # ECS (routes/secrets.py) -- empty means SSM's own default `alias/aws/ssm` key.
-    # Supplying a CMK here lets the operator scope its key policy to exactly the ECS
-    # task execution role, independent of (and tighter than) whatever IAM principals
-    # already have ssm:GetParameter in the account.
+    # WARREN_KMS_KEY_ID: customer-managed KMS key (ID, ARN or alias) for every SSM
+    # SecureString PutParameter the secret mirror makes on ECS -- empty means SSM's
+    # default `alias/aws/ssm` key. With a CMK the control plane needs only
+    # kms:Encrypt on it and the task execution role kms:Decrypt (resources/ecs/README.md).
     kms_key_id: str = ""
 
     # EFS workspace persistence — only consulted when runtime_type == "ecs" and efs_id is non-empty

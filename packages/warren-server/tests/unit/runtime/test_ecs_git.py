@@ -98,11 +98,9 @@ def test_workspace_branch_matches_local_layout():
 
 
 def _ssm_with(*names):
-    m = _mock_ssm()
-    m.get_parameters_by_path.return_value = {
-        "Parameters": [{"Name": f"/warren/test-server/test-user/{n}"} for n in names]
-    }
-    return m
+    # Secret ARNs come from the spec's declared names, never an SSM listing;
+    # `names` only documents which secrets the test's owner has.
+    return _mock_ssm()
 
 
 def test_provision_adds_git_init_container_and_splits_secrets():
@@ -174,9 +172,6 @@ def test_task_definition_cache_never_shares_one_owners_secrets_with_another():
         "taskDefinition": {"taskDefinitionArn": f"arn:td:{ecs.register_task_definition.call_count}"}
     }
     ssm = _mock_ssm()
-    ssm.get_parameters_by_path.side_effect = lambda Path, **kw: {
-        "Parameters": [{"Name": f"{Path}{n}"} for n in ("GITHUB_PAT", "ANTHROPIC_API_KEY")]
-    }
     rt = _make_runtime(ecs, ssm)
     names = ["GITHUB_PAT", "ANTHROPIC_API_KEY"]
 

@@ -654,14 +654,13 @@ if ! aws iam get-role --role-name "$TASK_ROLE_NAME" > /dev/null 2>&1; then
   # warren_stack.py's WarrenTaskPolicy (findings #17/#20/#21 — this script had drifted
   # from both since PR #3).
   #
-  # R23: SSMSecrets below previously also granted ssm:GetParameters (plural — reads
-  # parameter VALUES by full ARN/name) alongside GetParametersByPath. ecs.py's
-  # _fetch_ssm_parameter_names calls ssm.get_parameters_by_path with
-  # WithDecryption=false — this role only ever needs parameter NAMES to build secrets
-  # ARNs for a task definition; GetParameters belongs on the EXECUTION role instead
-  # (Step 4 below), which is what ECS actually uses to resolve a `secrets` block
-  # entry's value at container start, and which this script never granted it at all —
-  # every workspace secret injection would have hit AccessDenied.
+  # This role holds no SSM read action at all (no GetParameter*/GetParametersByPath):
+  # GetParametersByPath can't be limited to WithDecryption=false in IAM, so it would let
+  # the control plane decrypt every workspace secret. ecs.py builds secret ARNs from
+  # warren's own store; only the EXECUTION role (Step 4 below) reads values, via
+  # ssm:GetParameters, when ECS resolves a `secrets` entry at container start.
+  # SSMSecretsWrite covers /warren/*; narrow it to /warren/<WARREN_SERVER_ID>/* once
+  # you've chosen the control plane's server id (resources/ecs/README.md).
   #
   # R17/S13/X2: DeregisterTaskDefinition takes no ecs:cluster condition key -- an
   # ArnEquals condition on a key an action doesn't support evaluates to FALSE, not
@@ -777,14 +776,6 @@ if ! aws iam get-role --role-name "$TASK_ROLE_NAME" > /dev/null 2>&1; then
         "arn:aws:iam::${ACCOUNT_ID}:role/${EXEC_ROLE_NAME}",
         "arn:aws:iam::${ACCOUNT_ID}:role/${WORKSPACE_ROLE_NAME}"
       ]
-    },
-    {
-      "Sid": "SSMSecrets",
-      "Effect": "Allow",
-      "Action": [
-        "ssm:GetParametersByPath"
-      ],
-      "Resource": "arn:aws:ssm:*:*:parameter/warren/*"
     },
     {
       "Sid": "SSMSecretsWrite",

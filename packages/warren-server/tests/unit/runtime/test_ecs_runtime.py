@@ -82,7 +82,6 @@ def _mock_ecs() -> MagicMock:
 
 def _mock_ssm() -> MagicMock:
     m = MagicMock(name="ssm_client")
-    m.get_parameters_by_path.return_value = {"Parameters": []}
     return m
 
 
@@ -352,9 +351,6 @@ def test_secrets_declared_as_arn_refs_never_as_plaintext_overrides():
 
     mock_ecs = _mock_ecs()
     mock_ssm = _mock_ssm()
-    mock_ssm.get_parameters_by_path.return_value = {
-        "Parameters": [{"Name": "/warren/test-server/test-user/api-key"}]
-    }
     rt = _make_runtime(mock_ecs, mock_ssm)
 
     spec = _spec()
@@ -986,13 +982,18 @@ def test_resource_prefix_defaults_to_warren():
     mock_ecs = _mock_ecs()
     mock_ssm = _mock_ssm()
     rt = _make_runtime(mock_ecs, mock_ssm)
+    spec = _spec()
+    spec.secret_names = ["K"]
 
-    asyncio.run(rt.provision(_spec()))
+    asyncio.run(rt.provision(spec))
 
-    ssm_call = mock_ssm.get_parameters_by_path.call_args
-    assert ssm_call.kwargs["Path"] == "/warren/test-server/test-user/"
+    assert mock_ssm.method_calls == []
 
     register_kwargs = mock_ecs.register_task_definition.call_args.kwargs
+    assert register_kwargs["family"] == "warren-test-warren-base-latest"
+    assert register_kwargs["containerDefinitions"][0]["secrets"][0]["valueFrom"].endswith(
+        ":parameter/warren/test-server/test-user/K"
+    )
     log_opts = register_kwargs["containerDefinitions"][0]["logConfiguration"]["options"]
     assert log_opts["awslogs-group"] == "/warren/test-server"
     tag_keys = {t["key"] for t in register_kwargs["tags"]}
@@ -1073,17 +1074,21 @@ def test_resource_prefix_override_replaces_warren_everywhere(monkeypatch: pytest
     rt._logs = _mock_logs()
     rt._sts = _mock_sts()
     rt._preflight_ok = True
+    spec = _spec()
+    spec.secret_names = ["K"]
 
-    asyncio.run(rt.provision(_spec()))
+    asyncio.run(rt.provision(spec))
 
-    ssm_call = mock_ssm.get_parameters_by_path.call_args
-    assert ssm_call.kwargs["Path"] == "/control-plane/test-server/test-user/"
+    assert mock_ssm.method_calls == []
 
     register_kwargs = mock_ecs.register_task_definition.call_args.kwargs
     # finding #15: the task-definition family must carry the resource prefix too, not
     # just tags/log groups/SSM paths — otherwise a deployment can never scope
     # ecs:RunTask/RegisterTaskDefinition IAM to its own task-definition/<prefix>-* families.
     assert register_kwargs["family"] == "control-plane-test-warren-base-latest"
+    assert register_kwargs["containerDefinitions"][0]["secrets"][0]["valueFrom"].endswith(
+        ":parameter/control-plane/test-server/test-user/K"
+    )
     log_opts = register_kwargs["containerDefinitions"][0]["logConfiguration"]["options"]
     assert log_opts["awslogs-group"] == "/control-plane/test-server"
     tag_keys = {t["key"] for t in register_kwargs["tags"]}
@@ -1109,8 +1114,7 @@ def test_ssm_client_reused_across_calls_not_recreated_per_call(monkeypatch: "pyt
     fresh boto3.Session (and therefore a fresh SSM client) per call. _ensure_clients
     already guards client construction behind `if self._ecs is None`, so this proves
     that guard actually prevents repeat boto3.Session() calls across both the public
-    ssm_client() accessor (used by routes/secrets.py) and the internal path
-    (_fetch_ssm_parameter_names, invoked by provision())."""
+    ssm_client() accessor (used by the secret mirror) and the internal path."""
     import boto3
 
     from warren.runtime.ecs import ECSRuntime
@@ -1511,3 +1515,53 @@ def test_operation_client_token_changes_with_launch_payload():
         asyncio.run(rt.provision(spec))
         tokens.append(mock_ecs.run_task.call_args.kwargs["clientToken"])
     assert tokens[0] != tokens[1]
+
+
+def test_provision_takes_secret_names_from_the_mirror_never_from_ssm():
+    """Least privilege: secret ARNs come from warren's own store (SsmMirror), and
+    provisioning makes no SSM call at all -- the control plane holds no SSM read."""
+    mock_ecs = _mock_ecs()
+    mock_ssm = _mock_ssm()
+    rt = _make_runtime(mock_ecs, mock_ssm)
+    mirror = MagicMock()
+    mirror.mirrored_names = AsyncMock(return_value=["A"])
+    rt.secret_mirror = mirror
+    spec = _spec()
+    spec.secret_names = ["A", "NOT_SET"]
+
+    asyncio.run(rt.provision(spec))
+
+    mirror.mirrored_names.assert_awaited_once_with("test-user", ["A", "NOT_SET"])
+    secrets = mock_ecs.register_task_definition.call_args.kwargs["containerDefinitions"][0]["secrets"]
+    assert [s["name"] for s in secrets] == ["A"]
+    assert mock_ssm.method_calls == []
+
+
+def test_provision_fails_closed_while_a_declared_secret_is_unmirrored():
+    from warren_common.errors import ProvisionError
+
+    mock_ecs = _mock_ecs()
+    rt = _make_runtime(mock_ecs, _mock_ssm())
+    rt.secret_mirror = MagicMock()
+    rt.secret_mirror.mirrored_names = AsyncMock(side_effect=ProvisionError("not yet mirrored: A"))
+    spec = _spec()
+    spec.secret_names = ["A"]
+
+    with pytest.raises(ProvisionError):
+        asyncio.run(rt.provision(spec))
+    mock_ecs.register_task_definition.assert_not_called()
+    mock_ecs.run_task.assert_not_called()
+
+
+def test_provision_without_owner_gets_no_secret_arns():
+    mock_ecs = _mock_ecs()
+    rt = _make_runtime(mock_ecs, _mock_ssm())
+    spec = _spec()
+    spec.owner_id = ""
+    spec.secret_names = ["A"]
+
+    asyncio.run(rt.provision(spec))
+
+    assert "secrets" not in mock_ecs.register_task_definition.call_args.kwargs["containerDefinitions"][0] or (
+        mock_ecs.register_task_definition.call_args.kwargs["containerDefinitions"][0]["secrets"] == []
+    )

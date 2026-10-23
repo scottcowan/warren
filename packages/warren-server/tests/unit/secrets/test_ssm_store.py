@@ -27,6 +27,7 @@ async def test_put_secret_writes_securestring_with_owner_scoped_path():
     assert kwargs["Value"] == "sk-abc"
     assert kwargs["Type"] == "SecureString"
     assert kwargs["Overwrite"] is True
+    assert kwargs["Tier"] == "Standard"  # Encrypt-only KMS use, whatever the account default tier
     assert "KeyId" not in kwargs
 
 
@@ -53,29 +54,6 @@ async def test_delete_secret_returns_false_when_not_found():
     assert found is False
 
 
-async def test_list_secrets_for_owner_returns_leaf_names():
-    ssm = _mock_ssm()
-    ssm.get_parameters_by_path.return_value = {
-        "Parameters": [
-            {"Name": "/warren/server-1/user-1/API_KEY"},
-            {"Name": "/warren/server-1/user-1/ROOT_TOKEN"},
-        ]
-    }
-    rows = await ssm_store.list_secrets_for_owner(ssm, "warren", "server-1", "user-1")
-    assert {"name": "API_KEY"} in rows
-    assert {"name": "ROOT_TOKEN"} in rows
-
-    call_kwargs = ssm.get_parameters_by_path.call_args.kwargs
-    assert call_kwargs["Path"] == "/warren/server-1/user-1/"
-    assert call_kwargs["WithDecryption"] is False
-
-
-def _mirrored(ssm: MagicMock, names: list[str]) -> None:
-    ssm.get_parameters_by_path.return_value = {
-        "Parameters": [{"Name": f"/warren/server-1/{n}"} for n in names]
-    }
-
-
 async def _local_db(sqlite_path, secrets):
     from warren.registry.store import open_db
     from warren.secrets import store as local_store
@@ -88,26 +66,97 @@ async def _local_db(sqlite_path, secrets):
     return db, cipher
 
 
-async def test_reconcile_mirror_deletes_orphans_and_restores_missing(sqlite_path):
-    # Audit #13: crash after the SSM write but before the local write (orphan
-    # "bob/GHOST"), and after an SSM delete but before the local delete
-    # ("alice/KEPT" missing from SSM).
-    db, cipher = await _local_db(
-        sqlite_path, [("alice", "KEPT", "v-kept"), ("alice", "BOTH", "v-both")]
-    )
-    try:
-        ssm = _mock_ssm()
-        _mirrored(ssm, ["alice/BOTH", "bob/GHOST"])
-        result = await ssm_store.reconcile_mirror(ssm, db, cipher, "warren", "server-1")
-    finally:
-        await db.close()
+@pytest.fixture
+async def mirror_env(sqlite_path):
+    db, cipher = await _local_db(sqlite_path, [])
+    ssm = _mock_ssm()
+    mirror = ssm_store.SsmMirror(db, cipher, lambda: ssm, "warren", "server-1", kms_key_id="alias/k")
+    yield mirror, db, cipher, ssm
+    await db.close()
 
-    assert result == {"deleted": 1, "restored": 1}
-    assert ssm.get_parameters_by_path.call_args.kwargs["Path"] == "/warren/server-1/"
-    ssm.delete_parameter.assert_called_once_with(Name="/warren/server-1/bob/GHOST")
-    put = ssm.put_parameter.call_args.kwargs
-    assert ssm.put_parameter.call_count == 1
-    assert (put["Name"], put["Value"]) == ("/warren/server-1/alice/KEPT", "v-kept")
+
+async def _outbox(db):
+    async with db.execute("SELECT owner_id, name, op, attempts FROM ssm_outbox") as cur:
+        return await cur.fetchall()
+
+
+async def test_apply_pushes_and_clears_outbox(mirror_env):
+    from warren.secrets import store as local_store
+
+    mirror, db, cipher, ssm = mirror_env
+    ok = await mirror.apply("alice", "A", "put", lambda: local_store.set_secret(db, cipher, "alice", "A", "v"))
+    assert ok is True
+    kwargs = ssm.put_parameter.call_args.kwargs
+    assert (kwargs["Name"], kwargs["Value"], kwargs["KeyId"]) == ("/warren/server-1/alice/A", "v", "alias/k")
+    assert await _outbox(db) == []
+
+
+async def test_failed_push_stays_pending_without_plaintext_and_retries(mirror_env):
+    from warren.secrets import store as local_store
+
+    mirror, db, cipher, ssm = mirror_env
+    ssm.put_parameter.side_effect = RuntimeError("down")
+    ok = await mirror.apply("alice", "A", "put", lambda: local_store.set_secret(db, cipher, "alice", "A", "sk-1"))
+    assert ok is False
+    assert await _outbox(db) == [("alice", "A", "put", 1)]
+    async with db.execute("SELECT * FROM ssm_outbox") as cur:
+        assert "sk-1" not in repr(await cur.fetchall())
+
+    # A crash/restart loses nothing: a fresh mirror on the same DB converges it.
+    ssm.put_parameter.side_effect = None
+    fresh = ssm_store.SsmMirror(db, cipher, lambda: ssm, "warren", "server-1")
+    assert await fresh.flush() == []
+    assert ssm.put_parameter.call_args.kwargs["Value"] == "sk-1"
+    assert await _outbox(db) == []
+
+
+async def test_retry_syncs_from_current_local_state(mirror_env):
+    # A row recorded before a local write that never landed re-syncs SSM to the local
+    # state at retry time: no local row -> DeleteParameter, never a stale put.
+    mirror, db, _, ssm = mirror_env
+    await mirror._record("alice", "GONE", "put")
+    assert await mirror.flush() == []
+    ssm.put_parameter.assert_not_called()
+    ssm.delete_parameter.assert_called_once_with(Name="/warren/server-1/alice/GONE")
+
+
+async def test_mirrored_names_filters_to_declared_and_existing(mirror_env):
+    from warren.secrets import store as local_store
+
+    mirror, db, cipher, _ = mirror_env
+    for owner, name in [("alice", "A"), ("alice", "EXTRA"), ("bob", "B")]:
+        await mirror.apply(owner, name, "put", lambda o=owner, n=name: local_store.set_secret(db, cipher, o, n, "v"))
+    assert await mirror.mirrored_names("alice", ["A", "B", "MISSING"]) == ["A"]
+    assert await mirror.mirrored_names("bob", ["A", "B"]) == ["B"]
+    assert await mirror.mirrored_names("", ["A"]) == []
+    assert await mirror.mirrored_names("alice", []) == []
+
+
+async def test_mirrored_names_flushes_then_refuses_still_pending(mirror_env):
+    from warren.secrets import store as local_store
+    from warren_common.errors import ProvisionError
+
+    mirror, db, cipher, ssm = mirror_env
+    ssm.put_parameter.side_effect = RuntimeError("down")
+    await mirror.apply("alice", "A", "put", lambda: local_store.set_secret(db, cipher, "alice", "A", "v"))
+    with pytest.raises(ProvisionError, match="A"):
+        await mirror.mirrored_names("alice", ["A"])
+    # An unrelated pending name doesn't block a workspace that doesn't declare it.
+    assert await mirror.mirrored_names("alice", ["OTHER"]) == []
+
+    ssm.put_parameter.side_effect = None
+    assert await mirror.mirrored_names("alice", ["A"]) == ["A"]
+
+
+async def test_mirror_never_reads_ssm(mirror_env):
+    from warren.secrets import store as local_store
+
+    mirror, db, cipher, ssm = mirror_env
+    await mirror.apply("alice", "A", "put", lambda: local_store.set_secret(db, cipher, "alice", "A", "v"))
+    await mirror.apply("alice", "A", "delete", lambda: local_store.delete_secret(db, "alice", "A"))
+    await mirror.mirrored_names("alice", ["A"])
+    await mirror.flush()
+    assert {name for name, _, _ in ssm.method_calls} == {"put_parameter", "delete_parameter"}
 
 
 @pytest.mark.parametrize(
@@ -115,31 +164,19 @@ async def test_reconcile_mirror_deletes_orphans_and_restores_missing(sqlite_path
     [("", "server-1"), ("warren", ""), ("  ", "server-1"), ("warren", " "),
      ("warren/x", "server-1"), ("warren", "a/b"), ("warren", "/"), ("warren", " server-1")],
 )
-async def test_reconcile_mirror_refuses_a_scope_wider_than_its_own_server(
-    sqlite_path, prefix, server_id
-):
-    db, cipher = await _local_db(sqlite_path, [("alice", "KEPT", "v")])
-    try:
-        ssm = _mock_ssm()
-        _mirrored(ssm, ["secret-key", "alice/OTHER"])
-        result = await ssm_store.reconcile_mirror(ssm, db, cipher, prefix, server_id)
-    finally:
-        await db.close()
-
-    assert result == {"deleted": 0, "restored": 0}
-    ssm.get_parameters_by_path.assert_not_called()
-    ssm.delete_parameter.assert_not_called()
-    ssm.put_parameter.assert_not_called()
-
-
-async def test_reconcile_mirror_never_wipes_mirror_when_local_store_is_empty(sqlite_path):
+async def test_mirror_refuses_a_scope_wider_than_its_own_server(sqlite_path, prefix, server_id):
     db, cipher = await _local_db(sqlite_path, [])
     try:
-        ssm = _mock_ssm()
-        _mirrored(ssm, ["alice/A", "bob/B"])
-        result = await ssm_store.reconcile_mirror(ssm, db, cipher, "warren", "server-1")
+        with pytest.raises(ValueError):
+            ssm_store.SsmMirror(db, cipher, _mock_ssm, prefix, server_id)
     finally:
         await db.close()
 
-    assert result == {"deleted": 0, "restored": 0}
-    ssm.delete_parameter.assert_not_called()
+
+async def test_apply_refuses_unsafe_owner_segment(mirror_env):
+    mirror, _, _, ssm = mirror_env
+    with pytest.raises(ValueError):
+        await mirror.apply("../x", "A", "put", lambda: None)
+    with pytest.raises(ValueError):
+        await mirror.apply("", "A", "put", lambda: None)
+    ssm.put_parameter.assert_not_called()

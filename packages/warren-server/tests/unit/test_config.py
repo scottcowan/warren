@@ -30,6 +30,30 @@ def test_ecs_settings(monkeypatch):
     assert settings.ecs_memory == "1024"
 
 
+@pytest.mark.parametrize("prefix", ["", " ", "a/b", "-x", "x y", "x" * 33, "a.b"])
+def test_ecs_resource_prefix_must_be_a_non_empty_family_prefix(monkeypatch, prefix):
+    # It is the leading "<prefix>-" of every workspace task-definition family and the
+    # first SSM path segment, so IAM can scope task-definition/<prefix>-*.
+    from pydantic import ValidationError
+
+    from warren.config import WarrenSettings
+
+    monkeypatch.setenv("WARREN_SECRET_KEY", "x" * 32)
+    monkeypatch.setenv("WARREN_ECS_RESOURCE_PREFIX", prefix)
+    with pytest.raises(ValidationError):
+        WarrenSettings()
+
+
+def test_ecs_resource_prefix_accepts_family_safe_values(monkeypatch):
+    from warren.config import WarrenSettings
+    from warren.runtime.ecs import _slug
+
+    monkeypatch.setenv("WARREN_SECRET_KEY", "x" * 32)
+    monkeypatch.setenv("WARREN_ECS_RESOURCE_PREFIX", "acme_wr-1")
+    settings = WarrenSettings()
+    assert _slug("ghcr.io/org/img:1.2", settings.ecs_resource_prefix) == "acme_wr-1-org-img-1-2"
+
+
 def test_allowed_docker_networks_defaults_empty(monkeypatch):
     """R24: unset means NO networks pass the allow-list -- fail closed, not
     'everything allowed', matching github_app_allowed_repos' posture."""

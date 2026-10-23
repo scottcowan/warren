@@ -82,7 +82,7 @@ variable "env_suffix" {
   default     = "prod"
 }
 
-# finding #17: secrets/ssm_store.py's _param_path shapes every SSM parameter path as
+# finding #17: runtime/ecs.py's ssm_parameter_name shapes every SSM parameter path as
 # /{resource_prefix}/{server_id}/{owner_id}/{name} — this variable must match whatever
 # WARREN_ECS_RESOURCE_PREFIX (WarrenSettings.ecs_resource_prefix, default "warren") the
 # control-plane task is actually running with, so the IAM resource ARN below stays in
@@ -100,6 +100,22 @@ variable "ecs_resource_prefix" {
 # which needs no explicit KMS grant on this role at all.
 variable "kms_key_id" {
   description = "KMS key ID or ARN used to encrypt SSM SecureString parameters (WarrenSettings.kms_key_id). Empty (default) means the AWS-managed SSM key, which needs no explicit grant here."
+  type        = string
+  default     = ""
+}
+
+# KMS key for the per-workspace secrets warren-server mirrors to SSM (WARREN_KMS_KEY_ID).
+# create_ssm_kms_key makes a dedicated rotating key; otherwise ssm_kms_key_arn, falling back
+# to kms_key_id. A dedicated key keeps the control plane at kms:Encrypt only: kms_key_id
+# also encrypts ECS Exec logs and the control plane's own secret-key parameter.
+variable "create_ssm_kms_key" {
+  description = "Create a customer-managed KMS key for the workspace-secret SSM mirror."
+  type        = bool
+  default     = false
+}
+
+variable "ssm_kms_key_arn" {
+  description = "Existing KMS key ARN for the workspace-secret SSM mirror. Empty falls back to kms_key_id. Ignored when create_ssm_kms_key is true."
   type        = string
   default     = ""
 }

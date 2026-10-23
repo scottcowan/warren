@@ -1,0 +1,44 @@
+name: warren-server image smoke test
+# Build-only validation of the control-plane image on both published platforms, so a
+# Dockerfile change (e.g. a pinned session-manager-plugin checksum) is checked before a
+# release tag. Publishing stays in warren-server-image.yml.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - packages/warren-server/Dockerfile
+      - .github/workflows/warren-server-image-smoke.yml
+  push:
+    branches: [main]
+    paths:
+      - packages/warren-server/Dockerfile
+      - .github/workflows/warren-server-image-smoke.yml
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: packages/warren-server/Dockerfile
+          platforms: ${{ matrix.platform }}
+          push: false
+          load: true
+          tags: warren-server:smoke
+          cache-from: type=gha,scope=warren-server-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=warren-server-${{ matrix.platform }}
+      - name: Required binaries run on ${{ matrix.platform }}
+        run: |
+          for cmd in "session-manager-plugin --version" "git --version" "ssh -V"; do
+            docker run --rm --platform "${{ matrix.platform }}" --entrypoint sh warren-server:smoke -c "$cmd"
+          done
