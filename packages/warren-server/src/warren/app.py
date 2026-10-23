@@ -107,6 +107,7 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
             socket_path=settings.podman_socket,
             server_id=settings.server_id,
             egress_bridge_name=settings.egress_bridge_name,
+            ssh_publish_host=settings.ssh_publish_host,
         )
 
     if not os.environ.get("WARREN_DRY_RUN_SKIP_PREFLIGHT"):
