@@ -924,3 +924,34 @@ async def test_provision_points_harness_config_at_workspace_dir():
         assert env["OPENCODE_CONFIG_DIR"] == "/var/lib/warren/harness/opencode/config"
         assert env["OPENCODE_DB"] == "/var/lib/warren/harness/opencode/data/opencode.db"
         assert "CLAUDE_CONFIG_DIR" not in env
+
+
+@pytest.mark.asyncio
+async def test_provision_passes_spec_sidecar_token_over_a_same_named_secret():
+    """Audit finding 12: the sidecar gets the registry's per-workspace token."""
+    spec = _spec()
+    spec.sidecar_token = "tok-from-registry"
+    spec.env = {"WARREN_SIDECAR_TOKEN": "attacker-chosen"}
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.create.return_value = MagicMock(id="ctr-abc")
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        handle = await runtime.provision(spec)
+        _, kwargs = client.containers.create.call_args
+    assert kwargs["environment"]["WARREN_SIDECAR_TOKEN"] == "tok-from-registry"
+    assert handle.sidecar_token == "tok-from-registry"
+    assert "tok-from-registry" not in repr(spec) + repr(handle)
+
+
+@pytest.mark.asyncio
+async def test_provision_mints_a_sidecar_token_when_spec_has_none():
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.create.return_value = MagicMock(id="ctr-abc")
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        first = await runtime.provision(_spec())
+        token = client.containers.create.call_args.kwargs["environment"]["WARREN_SIDECAR_TOKEN"]
+        second = await runtime.provision(_spec())
+    assert len(token) >= 32
+    assert first.sidecar_token == token
+    assert second.sidecar_token != token

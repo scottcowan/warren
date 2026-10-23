@@ -34,6 +34,8 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         # snapshotted at provision time so ensure_running can reprovision a
         # lost/reaped container faithfully instead of as a bare shell.
         "spec_json": "TEXT",
+        # Audit finding 12: the workspace's sidecar token, Fernet-encrypted (LocalCipher).
+        "sidecar_token_enc": "BLOB",
     },
     "users": {
         # Issue #11: nullable-timestamp "disabled" flag, matching the existing
@@ -327,6 +329,19 @@ class WorkspaceStore:
         await self._db.execute(
             "UPDATE workspaces SET ssh_port = ?, updated_at = ? WHERE workspace_id = ?",
             (port, _utcnow_iso(), workspace_id),
+        )
+
+    async def get_sidecar_token_enc(self, workspace_id: str) -> bytes | None:
+        async with self._db.execute(
+            "SELECT sidecar_token_enc FROM workspaces WHERE workspace_id = ?", (workspace_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row and row[0] else None
+
+    async def set_sidecar_token_enc(self, workspace_id: str, token_enc: bytes) -> None:
+        await self._db.execute(
+            "UPDATE workspaces SET sidecar_token_enc = ?, updated_at = ? WHERE workspace_id = ?",
+            (token_enc, _utcnow_iso(), workspace_id),
         )
 
     async def list_non_terminal(self) -> list[Workspace]:

@@ -65,3 +65,11 @@ def test_preflight_fail_missing_workspace_id():
     result = _run_entrypoint({})
     assert result.returncode != 0
     assert "workspace_failed" in result.stdout
+
+
+def test_sidecar_socket_is_restricted_to_its_owner():
+    """Audit finding 12: uvicorn's uds bind leaves the socket 0o666."""
+    result = _run_entrypoint({"WARREN_WORKSPACE_ID": "ws-test", "WARREN_SIDECAR_TOKEN": "t"})
+    ready = [json.loads(line) for line in result.stdout.splitlines() if '"sidecar_ready"' in line]
+    assert ready
+    assert os.stat(ready[0]["socket"]).st_mode & 0o777 == 0o600

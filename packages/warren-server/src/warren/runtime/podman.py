@@ -26,7 +26,13 @@ from warren_common.agent_launch import SPEC_ENV as AGENT_SPEC_ENV
 from warren_common.harness_shell import seed_env, server_env, shell_first, workspace_shell
 from warren_common.models import template_env_for
 from warren_common.seed_prompt import app_command_with_seed
-from warren_common.runtime.base import ExecExit, WorkspaceHandle, WorkspaceSpec
+from warren_common.runtime.base import (
+    SIDECAR_TOKEN_ENV,
+    ExecExit,
+    WorkspaceHandle,
+    WorkspaceSpec,
+    new_sidecar_token,
+)
 
 if TYPE_CHECKING:
     from warren.registry.events import WorkspaceEventBuffer
@@ -179,6 +185,7 @@ class PodmanRuntime:
         worktree_paths_val = ":".join(
             container_path for _, container_path in spec.worktree_paths
         )
+        sidecar_token = spec.sidecar_token or new_sidecar_token()
         env = {
             **template_env_for(spec.template_env, exclude=spec.env),
             **spec.env,
@@ -198,6 +205,7 @@ class PodmanRuntime:
             # connect, same as the local workspace zshrc already gets from spec.env.
             "WARREN_PROJECT": spec.project,
             "WARREN_TEMPLATE": spec.intent,
+            SIDECAR_TOKEN_ENV: sidecar_token,
         }
         if spec.model_access == "bedrock" and not (
             "AWS_ACCESS_KEY_ID" in env or "AWS_CONTAINER_CREDENTIALS_FULL_URI" in env
@@ -317,6 +325,7 @@ class PodmanRuntime:
             root_path=spec.root_path,
             sidecar_url="",
             sidecar_socket_path="/tmp/warren-sidecar.sock",  # D-12: fixed path
+            sidecar_token=sidecar_token,
         )
 
     async def start(self, handle: WorkspaceHandle) -> None:
