@@ -278,8 +278,8 @@ class WarrenSettings(BaseSettings):
     # hard failure, since containerized deployments predate this shim.
     egress_shim_socket: Path | None = None
 
-    # Egress monitoring bridge (LIFE-02, D-04/D-05): a shared Podman bridge network,
-    # required because the rootless pasta default has no host-readable veth byte counters
+    # Egress monitoring bridge (LIFE-02, D-04/D-05): name PREFIX of each workspace's own
+    # isolated Podman bridge network (`<prefix>-<workspace_id>`, Finding 9), required because the rootless pasta default has no host-readable veth byte counters
     # (04-RESEARCH.md Pitfall 1). MONITORING ONLY — per D-05 the allowlist is "everything",
     # no egress is ever blocked by this field. ROADMAP.md Phase 4 Success Criterion #2's
     # "no outbound network access unless explicitly allowlisted" is explicitly NOT
