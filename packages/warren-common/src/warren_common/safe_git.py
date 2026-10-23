@@ -25,7 +25,9 @@ from __future__ import annotations
 import contextlib
 import functools
 import os
+import re
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -74,6 +76,10 @@ _ISOLATED_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
 
 class SafeGitError(RuntimeError):
     """A hardened git run failed, or a repo isn't safe to operate on."""
+
+
+class SafeGitTimeout(SafeGitError):
+    """A hardened git run exceeded its timeout and was killed."""
 
 
 def _trusted_cache_key() -> tuple[str | None, ...]:
@@ -159,20 +165,40 @@ def run_git(
 ) -> str:
     """Run hardened `git <args>` from `/`; return stdout or raise SafeGitError.
 
-    `extra_env` (e.g. ShadowGitDir.env(), GIT_ASKPASS) is applied last.
+    `extra_env` (e.g. ShadowGitDir.env(), GIT_ASKPASS) is applied last. On
+    `timeout` git's whole process group (ssh, remote helpers) is killed.
     """
     full_env = safe_git_env(os.environ, isolated=isolated)
     full_env.update(extra_env or {})
     try:
-        proc = subprocess.run(
-            ["git", *args], capture_output=True, cwd="/", env=full_env, timeout=timeout,
+        proc = subprocess.Popen(
+            ["git", *args], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, cwd="/", env=full_env, start_new_session=True,
         )
     except (OSError, subprocess.SubprocessError) as e:
         raise SafeGitError(f"git {args[:2]} failed: {e}") from e
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        _kill_group(proc)
+        raise SafeGitTimeout(f"git {list(args[:2])} timed out after {timeout}s") from e
+    except BaseException:
+        _kill_group(proc)
+        raise
     if proc.returncode != 0:
-        tail = proc.stderr.decode(errors="replace")[:512]
+        tail = stderr.decode(errors="replace")[:512]
         raise SafeGitError(f"git {list(args[:2])} failed rc={proc.returncode}: {tail}")
-    return proc.stdout.decode(errors="replace")
+    return stdout.decode(errors="replace")
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    killpg = getattr(os, "killpg", None)
+    with contextlib.suppress(OSError):
+        if killpg is not None:
+            killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    proc.communicate()
 
 
 def _require_dir(path: Path) -> None:
@@ -341,6 +367,130 @@ def own_objects_dir(git_dir: Path) -> Path:
     return objects
 
 
+def _require_same(path: Path, fd: int) -> None:
+    """`path` still resolves (no symlink at its end) to the directory open as `fd`."""
+    try:
+        st = os.lstat(path)
+    except OSError as e:
+        raise SafeGitError(f"{path} disappeared while git ran") from e
+    held = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode) or (st.st_dev, st.st_ino) != (held.st_dev, held.st_ino):
+        raise SafeGitError(f"{path} was replaced while git ran")
+
+
+_LOOSE_DIR = re.compile(r"^[0-9a-f]{2}$")
+
+
+def _object_subdirs(objects_fd: int) -> list[str]:
+    names = []
+    with os.scandir(objects_fd) as entries:
+        for entry in entries:
+            if entry.is_symlink():
+                raise SafeGitError(f"objects dir contains a symlink: {entry.name}")
+            if entry.is_dir(follow_symlinks=False) and (
+                entry.name == "pack" or _LOOSE_DIR.match(entry.name)
+            ):
+                names.append(entry.name)
+    return names
+
+
+def _copy_at(src_dir_fd: int, name: str, dst: Path) -> None:
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=src_dir_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise SafeGitError(f"object file {name} is not a regular file")
+        with os.fdopen(os.dup(fd), "rb") as src, open(dst, "xb") as out:
+            shutil.copyfileobj(src, out)
+    finally:
+        os.close(fd)
+
+
+def _link_objects(objects_fd: int, dst: Path) -> set[str]:
+    """Hard-link (copy where linking isn't allowed) the repo's own loose objects
+    and packs into warren-owned `dst`, never following a symlink, so host git
+    never resolves a path inside the workspace-writable object store."""
+    linked: set[str] = set()
+    for sub in _object_subdirs(objects_fd):
+        sub_fd = os.open(sub, _NOFOLLOW_DIR, dir_fd=objects_fd)
+        try:
+            (dst / sub).mkdir()
+            with os.scandir(sub_fd) as entries:
+                files = []
+                for entry in entries:
+                    if entry.is_symlink():
+                        raise SafeGitError(f"objects/{sub} contains a symlink: {entry.name}")
+                    if entry.is_file(follow_symlinks=False):
+                        files.append(entry.name)
+            for name in files:
+                target = dst / sub / name
+                try:
+                    os.link(name, target, src_dir_fd=sub_fd, follow_symlinks=False)
+                except OSError:
+                    _copy_at(sub_fd, name, target)
+                else:
+                    if not stat.S_ISREG(os.lstat(target).st_mode):
+                        raise SafeGitError(f"objects/{sub}/{name} is not a regular file")
+                linked.add(os.path.join(sub, name))
+        finally:
+            os.close(sub_fd)
+    return linked
+
+
+def _publish_objects(src: Path, objects_fd: int, linked: set[str]) -> None:
+    """Copy objects git created in `src` back into the repo through `objects_fd`."""
+    new = []
+    for sub in os.listdir(src):
+        if sub != "pack" and not _LOOSE_DIR.match(sub):
+            continue
+        for name in os.listdir(src / sub):
+            rel = os.path.join(sub, name)
+            if rel not in linked and not name.startswith("tmp_") and (src / rel).is_file():
+                new.append(rel)
+    # A pack becomes visible through its .idx, so that lands last.
+    new.sort(key=lambda rel: (rel.endswith(".idx"), rel))
+    for rel in new:
+        fd, name = _open_parent(objects_fd, rel, create=True)
+        try:
+            try:
+                os.link(src / rel, name, dst_dir_fd=fd)
+            except FileExistsError:
+                continue
+            except OSError:
+                tmp = f".{name}.warren-tmp"
+                wfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o444, dir_fd=fd)
+                try:
+                    with open(src / rel, "rb") as f:
+                        while chunk := f.read(1 << 20):
+                            os.write(wfd, chunk)
+                finally:
+                    os.close(wfd)
+                os.replace(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
+        finally:
+            os.close(fd)
+
+
+@contextlib.contextmanager
+def linked_objects(git_dir: Path, shadow_root: Path) -> Iterator[Path]:
+    """A warren-owned objects dir holding `git_dir`'s own objects, for use as a
+    deliberate alternate: git never resolves a path inside `git_dir`."""
+    own_objects_dir(git_dir)
+    shadow_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = Path(tempfile.mkdtemp(prefix="objects-", dir=shadow_root))
+    try:
+        root_fd = os.open(git_dir, _NOFOLLOW_DIR)
+        try:
+            objects_fd = os.open("objects", _NOFOLLOW_DIR, dir_fd=root_fd)
+            try:
+                _link_objects(objects_fd, tmp)
+            finally:
+                os.close(objects_fd)
+        finally:
+            os.close(root_fd)
+        yield tmp
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 class ShadowGitDir:
     """A warren-owned GIT_DIR standing in for a workspace-writable one."""
 
@@ -352,7 +502,7 @@ class ShadowGitDir:
     def env(self) -> dict[str, str]:
         # GIT_ALTERNATE_OBJECT_DIRECTORIES is blanked so an inherited value can't
         # widen object lookup; a caller that deliberately borrows a vetted store
-        # (own_objects_dir) sets it after this.
+        # (linked_objects) sets it after this.
         env = {
             "GIT_DIR": str(self.path),
             "GIT_OBJECT_DIRECTORY": str(self.objects),
@@ -374,8 +524,10 @@ def shadow_git_dir(
     """Yield a ShadowGitDir whose config is exactly `config` (plus core
     format keys), with HEAD/refs/index copied in from `real_git_dir` and copied
     back on clean exit. `shadow_root` must be outside every sandbox's write
-    scope. Objects are used in place (GIT_OBJECT_DIRECTORY): they're data. Only
-    the repo's own objects dir is used; a repo with alternates is refused.
+    scope. The repo's own objects are linked into the shadow through a
+    no-follow fd (a repo with alternates is refused), so git never resolves a
+    path inside the workspace's object store; objects git creates are copied
+    back through that same fd before any ref is.
     """
     objects = own_objects_dir(real_git_dir)
     fmt = read_repo_config(real_git_dir, "extensions.objectformat")
@@ -385,8 +537,17 @@ def shadow_git_dir(
 
     shadow_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     shadow = Path(tempfile.mkdtemp(prefix="shadow-", dir=shadow_root))
-    root_fd = os.open(real_git_dir, _NOFOLLOW_DIR)
-    try:
+    with contextlib.ExitStack() as fds:
+        fds.callback(shutil.rmtree, shadow, ignore_errors=True)
+        root_fd = os.open(real_git_dir, _NOFOLLOW_DIR)
+        fds.callback(os.close, root_fd)
+        _require_same(real_git_dir, root_fd)
+        objects_fd = os.open("objects", _NOFOLLOW_DIR, dir_fd=root_fd)
+        fds.callback(os.close, objects_fd)
+        tree_fd = None
+        if work_tree is not None:
+            tree_fd = os.open(work_tree, _NOFOLLOW_DIR)
+            fds.callback(os.close, tree_fd)
         before = _read_tree(root_fd)
         if "HEAD" not in before:
             raise SafeGitError(f"{real_git_dir} has no readable HEAD")
@@ -396,6 +557,7 @@ def shadow_git_dir(
             dst.write_bytes(data)
         (shadow / "refs" / "heads").mkdir(parents=True, exist_ok=True)
         (shadow / "objects").mkdir()
+        linked = _link_objects(objects_fd, shadow / "objects")
         cfg = str(shadow / "config")
         base = [
             ("core.repositoryformatversion", "1" if fmt else "0"),
@@ -408,13 +570,14 @@ def shadow_git_dir(
             base.append(("extensions.objectformat", fmt))
         for key, value in base + list(config):
             run_git("config", "--file", cfg, "--add", key, value, isolated=True)
-        yield ShadowGitDir(shadow, objects, work_tree)
-        # Alternates planted while git ran: don't publish refs it produced.
+        yield ShadowGitDir(shadow, shadow / "objects", work_tree)
+        # Alternates planted or the repo swapped while git ran: publish nothing.
         require_no_alternates(objects)
+        _require_same(real_git_dir, root_fd)
+        if tree_fd is not None:
+            _require_same(work_tree, tree_fd)
+        _publish_objects(shadow / "objects", objects_fd, linked)
         _write_back(root_fd, before, _read_tree_path(shadow))
-    finally:
-        os.close(root_fd)
-        shutil.rmtree(shadow, ignore_errors=True)
 
 
 @contextlib.contextmanager
@@ -447,6 +610,7 @@ def readonly_shadow_git_dir(
 
     shadow_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     shadow = Path(tempfile.mkdtemp(prefix="shadow-ro-", dir=shadow_root))
+    objects_fd = os.open(objects, _NOFOLLOW_DIR)
     try:
         for rel, data in tree.items():
             dst = shadow / rel
@@ -467,7 +631,11 @@ def readonly_shadow_git_dir(
         for key, value in base:
             run_git("config", "--file", cfg, "--add", key, value, isolated=True)
         yield ShadowGitDir(shadow, objects, work_tree)
+        # Objects are read in place here; a store swapped while git ran voids the result.
+        _require_same(objects, objects_fd)
+        own_objects_dir(common)
     finally:
+        os.close(objects_fd)
         shutil.rmtree(shadow, ignore_errors=True)
 
 

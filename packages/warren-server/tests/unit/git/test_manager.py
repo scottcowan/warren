@@ -11,8 +11,10 @@ file on disk rather than mocking git internals.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -21,6 +23,7 @@ from urllib.parse import urlsplit, urlunsplit
 import pytest
 from git import GitCommandError, Repo
 
+import warren.git.manager as manager_module
 from warren.git.manager import (
     GitError,
     GitManager,
@@ -601,3 +604,55 @@ async def test_clone_with_ref_checkout_ignores_planted_attributes(
     path = await GitManager(worktree_root).clone("ws-ref", _file_url(source_repo), ref=first)
     assert Repo(path).head.commit.hexsha == first
     assert not planted[0].exists()
+
+
+def _has_object(git_dir: Path, sha: str, objects: Path | None = None) -> bool:
+    env = {**os.environ, "GIT_OBJECT_DIRECTORY": str(objects)} if objects else None
+    return subprocess.run(
+        ["git", f"--git-dir={git_dir}", "cat-file", "-e", sha], capture_output=True, env=env
+    ).returncode == 0
+
+
+async def test_pull_objects_swapped_mid_fetch_never_touch_other_store(
+    worktree_root, source_repo, monkeypatch
+):
+    """A workspace swapping `.git/objects` for a symlink to another
+    workspace's store while host git runs can't redirect git's reads or
+    writes there: git only ever sees warren's linked copy."""
+    mgr = GitManager(worktree_root)
+    a = await mgr.clone("ws-a", _file_url(source_repo))
+    b = await mgr.clone("ws-b", _file_url(source_repo))
+    new_sha = _advance_upstream(source_repo)
+    moved = a / ".git" / "objects-moved"
+    real_run_git = manager_module.run_git
+
+    def swap_then_run(*args, **kwargs):
+        if args[0] == "fetch" and not moved.exists():
+            os.rename(a / ".git" / "objects", moved)
+            (a / ".git" / "objects").symlink_to(b / ".git" / "objects")
+        return real_run_git(*args, **kwargs)
+
+    monkeypatch.setattr(manager_module, "run_git", swap_then_run)
+
+    assert await mgr.pull("ws-a") == new_sha
+    assert not _has_object(b / ".git", new_sha)
+    assert _has_object(a / ".git", new_sha, objects=moved)
+
+
+async def test_pull_timeout_kills_git_and_raises_git_pull_error(
+    worktree_root, source_repo, monkeypatch
+):
+    mgr = GitManager(worktree_root)
+    path = await mgr.clone("ws-slow", _file_url(source_repo))
+    subprocess.run(
+        ["git", "config", "--file", str(path / ".git" / "config"),
+         "remote.origin.url", "ssh://example.invalid/org/repo.git"],
+        check=True,
+    )
+    monkeypatch.setenv("GIT_SSH_COMMAND", "sleep 30; true")
+    monkeypatch.setattr(manager_module, "_PULL_TIMEOUT_S", 0.5)
+
+    started = time.monotonic()
+    with pytest.raises(GitPullError, match=r"timed out after 0\.5s"):
+        await mgr.pull("ws-slow")
+    assert time.monotonic() - started < 10
