@@ -71,6 +71,9 @@ jobs:
       - name: Release script tests
         run: python3 -m unittest discover -s scripts/tests -p 'test_release.py' -v
 
+      - name: Release inputs cover every Dockerfile COPY
+        run: python3 scripts/release.py check
+
       - name: Tracked files
         run: python3 scripts/check_public_hygiene.py
 

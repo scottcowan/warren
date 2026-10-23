@@ -105,6 +105,7 @@ jobs:
     needs: tag
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     steps:
@@ -134,6 +135,9 @@ jobs:
           else
             gh pr create --base main --head release/next --title "$(cat "$RUNNER_TEMP/title")" --body-file "$RUNNER_TEMP/body"
           fi
+          # Pushes made with GITHUB_TOKEN don't fire pull_request, but
+          # workflow_dispatch does, and its checks land on the PR's head commit.
+          gh workflow run public-hygiene.yml --ref release/next
 
       - name: Close a stale release PR
         if: steps.prepare.outputs.pending == 'false'

@@ -17,6 +17,11 @@ Usage:
                                                      # bump releases.json, prepend CHANGELOG.md
     scripts/release.py released --before REV         # {"name": "tag"} for versions changed since REV
     scripts/release.py notes NAME                    # CHANGELOG.md section for NAME's version
+    scripts/release.py check                         # every Dockerfile COPY/ADD source is in paths
+
+``check`` keeps ``paths`` honest: each image's ``dockerfile`` and every local
+COPY/ADD source (relative to ``context``) must be covered. A whole-context
+``COPY .`` can't be checked, so warren-server's paths are kept by hand.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
 import re
 import subprocess
 import sys
@@ -39,6 +45,8 @@ PATCH, MINOR, MAJOR = 0, 1, 2
 _SUBJECT_RE = re.compile(r"^(?P<type>[A-Za-z]+)(?:\([^)]*\))?(?P<bang>!)?:")
 _BREAKING_RE = re.compile(r"^BREAKING[ -]CHANGE:", re.MULTILINE)
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+_COPY_RE = re.compile(r"^(?:COPY|ADD)\s+(.*)$", re.IGNORECASE)
+_FLAG_RE = re.compile(r"^--(\S+)\s*")
 
 
 class ReleaseError(Exception):
@@ -199,6 +207,38 @@ def notes(root: Path, name: str) -> str:
     return "\n".join(out).strip() + "\n"
 
 
+def dockerfile_sources(text: str) -> list[str]:
+    sources = []
+    for line in re.sub(r"\\\n", " ", text).splitlines():
+        m = _COPY_RE.match(line.strip())
+        if not m:
+            continue
+        rest, flags = m.group(1).strip(), []
+        while (f := _FLAG_RE.match(rest)):
+            flags.append(f.group(1))
+            rest = rest[f.end():]
+        if any(flag.startswith("from=") for flag in flags):
+            continue
+        args = json.loads(rest) if rest.startswith("[") else rest.split()
+        sources += [s for s in args[:-1] if "://" not in s]
+    return sources
+
+
+def uncovered(root: Path, component: dict) -> list[str]:
+    exclude = component.get("exclude", [])
+    text = (root / component["dockerfile"]).read_text()
+    candidates = [component["dockerfile"]]
+    candidates += [os.path.normpath(os.path.join(component["context"], s)) for s in dockerfile_sources(text)]
+    missing = []
+    for src in candidates:
+        if src == ".":
+            continue
+        covered = any(src == p or (p.endswith("/") and f"{src}/".startswith(p)) for p in component["paths"])
+        if not covered or _matches(src, exclude):
+            missing.append(src)
+    return missing
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -210,6 +250,7 @@ def main(argv: list[str] | None = None) -> int:
     rel.add_argument("--before", required=True)
     note = sub.add_parser("notes")
     note.add_argument("name")
+    sub.add_parser("check")
     args = parser.parse_args(argv)
 
     try:
@@ -225,6 +266,15 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(released(REPO_ROOT, args.before)))
         elif args.cmd == "notes":
             sys.stdout.write(notes(REPO_ROOT, args.name))
+        elif args.cmd == "check":
+            failed = False
+            for name, component in load_config(REPO_ROOT)["components"].items():
+                for src in uncovered(REPO_ROOT, component):
+                    print(f"{name}: {src} is a build input but not in its paths in {CONFIG}", file=sys.stderr)
+                    failed = True
+            if failed:
+                return 1
+            print("release: every image's build inputs are in its paths")
     except (ReleaseError, subprocess.CalledProcessError) as e:
         print(f"release: {e}", file=sys.stderr)
         return 1
