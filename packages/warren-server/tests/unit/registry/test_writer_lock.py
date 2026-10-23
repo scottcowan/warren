@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import threading
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -41,6 +43,44 @@ def test_writer_lock_is_exclusive_across_processes(tmp_path):
     finally:
         lock.release()
     assert probe.returncode == 3, probe.stderr
+
+
+def test_zero_wait_fails_fast(tmp_path):
+    db_file = tmp_path / "warren.db"
+    holder = acquire_writer_lock(db_file)
+    try:
+        start = time.monotonic()
+        with pytest.raises(WriterLockHeld):
+            acquire_writer_lock(db_file, wait_s=0)
+        assert time.monotonic() - start < 0.5
+    finally:
+        holder.release()
+
+
+def test_wait_times_out_with_writer_lock_held(tmp_path):
+    db_file = tmp_path / "warren.db"
+    holder = acquire_writer_lock(db_file)
+    try:
+        start = time.monotonic()
+        with pytest.raises(WriterLockHeld):
+            acquire_writer_lock(db_file, wait_s=0.8)
+        assert 0.7 <= time.monotonic() - start < 3
+    finally:
+        holder.release()
+
+
+def test_wait_acquires_once_the_holder_releases(tmp_path):
+    db_file = tmp_path / "warren.db"
+    holder = acquire_writer_lock(db_file)
+    releaser = threading.Timer(0.6, holder.release)
+    releaser.start()
+    try:
+        start = time.monotonic()
+        lock = acquire_writer_lock(db_file, wait_s=10)
+        assert 0.5 <= time.monotonic() - start < 5
+        lock.release()
+    finally:
+        releaser.join()
 
 
 def test_release_is_idempotent(tmp_path):
@@ -100,6 +140,7 @@ async def test_second_server_on_same_data_dir_refuses_to_start(monkeypatch, tmp_
     monkeypatch.setenv("WARREN_PODMAN_SOCKET", str(tmp_path / "podman.sock"))
     monkeypatch.setenv("WARREN_SERVER_ID", "test-server")
     monkeypatch.setenv("WARREN_REAPER_ENABLED", "0")
+    monkeypatch.setenv("WARREN_WRITER_LOCK_WAIT_S", "0")
     registry = MagicMock()
     registry.reconcile_from_disk = AsyncMock()
 

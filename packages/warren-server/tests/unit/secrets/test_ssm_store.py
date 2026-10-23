@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from warren.secrets import ssm_store
 
 
@@ -106,6 +108,28 @@ async def test_reconcile_mirror_deletes_orphans_and_restores_missing(sqlite_path
     put = ssm.put_parameter.call_args.kwargs
     assert ssm.put_parameter.call_count == 1
     assert (put["Name"], put["Value"]) == ("/warren/server-1/alice/KEPT", "v-kept")
+
+
+@pytest.mark.parametrize(
+    ("prefix", "server_id"),
+    [("", "server-1"), ("warren", ""), ("  ", "server-1"), ("warren", " "),
+     ("warren/x", "server-1"), ("warren", "a/b"), ("warren", "/"), ("warren", " server-1")],
+)
+async def test_reconcile_mirror_refuses_a_scope_wider_than_its_own_server(
+    sqlite_path, prefix, server_id
+):
+    db, cipher = await _local_db(sqlite_path, [("alice", "KEPT", "v")])
+    try:
+        ssm = _mock_ssm()
+        _mirrored(ssm, ["secret-key", "alice/OTHER"])
+        result = await ssm_store.reconcile_mirror(ssm, db, cipher, prefix, server_id)
+    finally:
+        await db.close()
+
+    assert result == {"deleted": 0, "restored": 0}
+    ssm.get_parameters_by_path.assert_not_called()
+    ssm.delete_parameter.assert_not_called()
+    ssm.put_parameter.assert_not_called()
 
 
 async def test_reconcile_mirror_never_wipes_mirror_when_local_store_is_empty(sqlite_path):

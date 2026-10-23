@@ -3,8 +3,8 @@
 Startup order:
     1. WarrenSettings()
     2. run runtime.preflight() — ECS: await runtime.preflight(); else: run_preflight(podman_socket)
-    3. acquire_writer_lock + open_db(db_path(settings)) -- fails fast if another
-       server process already owns the database (audit #10)
+    3. acquire_writer_lock + open_db(db_path(settings)) -- waits up to
+       writer_lock_wait_s, then fails, if another server process owns the database (audit #10)
     4. Construct AuthStore(db) + ensure_bootstrap_admin(auth_store, settings) (D-03/D-04) —
        before reconcile so a reconcile timeout can never leave the server admin-less
     5. Construct runtime (ECSRuntime | DockerRuntime | PodmanRuntime) + WorkspaceStore + WorkspaceRegistry
@@ -72,7 +72,9 @@ async def _reconcile_ssm_mirror(runtime, db, settings: WarrenSettings) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = WarrenSettings()
-    writer_lock = acquire_writer_lock(db_path(settings))
+    writer_lock = await asyncio.to_thread(
+        acquire_writer_lock, db_path(settings), settings.writer_lock_wait_s
+    )
     try:
         async with _lifespan(app, settings):
             yield

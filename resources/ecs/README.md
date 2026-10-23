@@ -169,8 +169,11 @@ EFS, so exactly one control-plane process may have it open (audit #10):
   The default 100/200 rolling update briefly runs the old and new task together.
   Expect a short outage on every deploy.
 - warren-server takes an exclusive lock on `warren.db.lock` next to the database at
-  startup and exits if it's already held. If the previous task died without releasing
-  it, the lock clears when its NFS lease expires, and ECS's restart picks up from there.
+  startup. If another process holds it, the new task retries for up to
+  `WARREN_WRITER_LOCK_WAIT_S` (default 120s; `0` fails fast) and only then exits. The
+  wait covers a just-stopped task whose NFSv4 lock lingers until its lease expires.
+  Without it, the new task would exit at startup, and those exits count toward the
+  deployment circuit breaker.
 - `WARREN_SQLITE_JOURNAL_MODE=auto` (the default) uses `DELETE` journaling when the data
   dir is on NFS/EFS, because WAL's shared-memory index isn't safe on network
   filesystems. Use `wal`/`delete` to override.

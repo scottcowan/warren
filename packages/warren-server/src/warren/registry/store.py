@@ -7,11 +7,15 @@ import os
 import socket
 import sqlite3
 import stat
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import aiosqlite
+import structlog
 from warren.registry.models import Workspace, WorkspaceStatus
+
+log = structlog.get_logger(__name__)
 
 _SCHEMA_SQL = (Path(__file__).parent / "schema.sql").read_text()
 
@@ -132,23 +136,36 @@ class WriterLock:
             self._fd = None
 
 
-def acquire_writer_lock(db_file: str | Path) -> WriterLock:
-    """Take the single-writer lock for `db_file`, or raise WriterLockHeld at once."""
+def acquire_writer_lock(db_file: str | Path, wait_s: float = 0.0) -> WriterLock:
+    """Take the single-writer lock for `db_file`, retrying with backoff for up to
+    `wait_s` seconds (0 = fail fast), then raise WriterLockHeld. Waiting matters on
+    Fargate + EFS: a just-stopped task's NFSv4 lock lingers until its lease expires,
+    and a task that exits at startup counts toward the deployment circuit breaker.
+    Blocking -- call from a thread inside the event loop."""
     import fcntl
 
     lock_path = Path(f"{db_file}.lock")
     if not lock_path.parent.exists():
         lock_path.parent.mkdir(parents=True)
         os.chmod(lock_path.parent, stat.S_IRWXU)  # 0700, same as open_db
-    fd =os.open(lock_path, os.O_RDWR | os.O_CREAT, stat.S_IRUSR | stat.S_IWUSR)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
-        os.close(fd)
-        raise WriterLockHeld(
-            f"{lock_path} is held by another warren-server process; refusing to open "
-            f"{db_file} as a second writer"
-        ) from exc
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, stat.S_IRUSR | stat.S_IWUSR)
+    deadline = time.monotonic() + max(wait_s, 0.0)
+    delay = 0.25
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                os.close(fd)
+                raise WriterLockHeld(
+                    f"{lock_path} is held by another warren-server process; refusing to "
+                    f"open {db_file} as a second writer"
+                ) from exc
+            log.warning("writer_lock_waiting", lock_path=str(lock_path), remaining_s=round(remaining, 1))
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 5.0)
     os.ftruncate(fd, 0)
     os.write(fd, f"{os.getpid()} {socket.gethostname()}\n".encode())
     return WriterLock(lock_path, fd)

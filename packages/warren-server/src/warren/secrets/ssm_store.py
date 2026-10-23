@@ -115,6 +115,17 @@ async def reconcile_mirror(
     cannot do; it heals on the next write of that secret."""
     from warren.secrets import store as local_store
 
+    for part in (resource_prefix, server_id):
+        if not part or not part.strip() or "/" in part or part != part.strip():
+            # An empty or slash-bearing segment would widen the listing (and the
+            # orphan delete) beyond this server's own /{prefix}/{server_id}/ subtree.
+            log.error(
+                "secret_ssm_reconcile_refused_unsafe_scope",
+                resource_prefix=resource_prefix,
+                server_id=server_id,
+            )
+            return {"deleted": 0, "restored": 0}
+
     root = f"/{resource_prefix}/{server_id}/"
     mirrored = set(await asyncio.to_thread(_fetch_ssm_parameter_names, ssm, root))
     local = {
