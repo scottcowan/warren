@@ -13,7 +13,8 @@ CREATE TABLE IF NOT EXISTS workspaces (
     ssh_port         INTEGER,
     owner_id         TEXT,
     idle_ttl_seconds REAL,
-    spec_json        TEXT
+    spec_json        TEXT,
+    sidecar_token_enc BLOB
 );
 
 CREATE INDEX IF NOT EXISTS idx_workspaces_status ON workspaces(status);

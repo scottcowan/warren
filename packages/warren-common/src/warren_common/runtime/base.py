@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Literal, Protocol, runtime_checkable
 
 # Re-export ProvisionError from warren.errors for convenience.
 from warren_common.errors import ProvisionError as ProvisionError  # noqa: F401
 from warren_common.models import AwsConfig, CustomHarness, FolderSpec, ScopeConfig
+
+# Audit finding 12: the shared secret every sidecar request (bar /healthz) must carry.
+SIDECAR_TOKEN_ENV = "WARREN_SIDECAR_TOKEN"
+
+
+def new_sidecar_token() -> str:
+    return secrets.token_urlsafe(32)
 
 
 @dataclass
@@ -55,6 +63,9 @@ class WorkspaceSpec:
     mode: str = "interactive"
     # AG2b/AM3: a `kind: agent` workspace's supervisor launch spec (warren_common.agent_launch); None for user workspaces.
     agent: dict | None = None
+    # Audit finding 12: this workspace's sidecar token; the registry mints and stores it
+    # (encrypted), a runtime mints one when it is unset. Never persisted in spec_json.
+    sidecar_token: str = field(default="", repr=False)
 
 
 def harness_state(spec: WorkspaceSpec) -> dict:
@@ -84,6 +95,7 @@ class WorkspaceHandle:
     root_path: str
     sidecar_url: str = ""               # http://... for file/exec/events API (empty for ECS/Fargate)
     sidecar_socket_path: str = ""       # AF_UNIX socket path inside container (D-12)
+    sidecar_token: str = field(default="", repr=False)  # sent as X-Warren-Sidecar-Token
     state_dir: str = ""                 # where this runtime's own sandbox.sb/state.json live, when that
                                          # MUST live outside root_path (audit finding #1: root_path is
                                          # writable from inside the sandbox, so a sandboxed process could
