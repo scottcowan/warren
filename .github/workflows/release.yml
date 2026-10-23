@@ -135,9 +135,31 @@ jobs:
           else
             gh pr create --base main --head release/next --title "$(cat "$RUNNER_TEMP/title")" --body-file "$RUNNER_TEMP/body"
           fi
-          # Pushes made with GITHUB_TOKEN don't fire pull_request, but
-          # workflow_dispatch does, and its checks land on the PR's head commit.
-          gh workflow run public-hygiene.yml --ref release/next
+
+      # GitHub holds pull_request runs for this bot-authored PR as
+      # "action required". Approve the ones for the commit just pushed so the
+      # PR shows its checks; if the token can't, approve them on the PR.
+      - name: Approve the release PR's checks
+        if: steps.prepare.outputs.pending == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          for _ in $(seq 1 12); do
+            ids=$(gh run list --branch release/next --event pull_request --json databaseId,headSha,conclusion \
+              --jq ".[] | select(.headSha == \"$sha\" and .conclusion == \"action_required\") | .databaseId")
+            [ -n "$ids" ] && break
+            sleep 10
+          done
+          if [ -z "$ids" ]; then
+            echo "::notice::No held checks found for $sha"
+            exit 0
+          fi
+          for id in $ids; do
+            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$id/approve" \
+              || echo "::warning::Could not approve run $id; approve the release PR's checks by hand"
+          done
 
       - name: Close a stale release PR
         if: steps.prepare.outputs.pending == 'false'
