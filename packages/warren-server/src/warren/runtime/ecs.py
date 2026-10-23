@@ -110,6 +110,10 @@ class ECSRuntime:
         # AI3: get/put/delete of the per-workspace launch identity; app.py wires the
         # SQLite-backed LaunchAttemptStore so it survives a server restart.
         self.launch_store: Any = launch_store or _MemoryLaunchStore()
+        # warren.secrets.ssm_store.SsmMirror, wired by app.py: the authoritative list
+        # of which declared secret names an owner has mirrored. Unset (tests), every
+        # declared name gets an ARN.
+        self.secret_mirror: Any = None
         self._settings = settings
         # Allow direct cpu/memory kwargs to override settings (used in tests
         # and when calling without a full WarrenSettings object).
@@ -214,10 +218,8 @@ class ECSRuntime:
     def ssm_client(self) -> Any:
         """Return the lazily-constructed boto3 SSM client.
 
-        Public accessor for routes/secrets.py's write path (PutParameter/
-        DeleteParameter) so it reuses this runtime's one boto3 session/client
-        instead of opening a second — same client this class's own read path
-        (`_fetch_ssm_parameter_names`) already uses.
+        Used only by the secret mirror's writes (PutParameter/DeleteParameter); this
+        runtime never reads SSM itself.
         """
         _, ssm = self._ensure_clients()
         return ssm
@@ -272,22 +274,19 @@ class ECSRuntime:
         # Validate before any AWS call (T-07-02).
         self._validate_cpu_memory(resolved_cpu, resolved_memory)
 
-        ecs, ssm = self._ensure_clients()
+        ecs, _ = self._ensure_clients()
 
-        # Fetch SSM parameter NAMES (not decrypted values — fixes: secrets exposed through
-        # RunTask container overrides, T-07-01/D-07 was violated by the old plaintext-value
-        # approach) — scoped to this workspace's OWNER only
-        # (/{resource_prefix}/{server_id}/{owner_id}/), never another user's secrets —
-        # mirrors warren.secrets.store's per-owner isolation (routes/secrets.py).
-        ssm_path = f"/{self._resource_prefix}/{self.server_id}/{getattr(spec, 'owner_id', '')}/"
-        all_param_names = await asyncio.to_thread(_fetch_ssm_parameter_names, ssm, ssm_path)
-
-        # Filter by name: spec.secret_names is the resolved template's declared
-        # `secrets` list (ProjectConfig.secrets) -- an explicit allow-list, not a
-        # permission tier (tiers removed 2026-10-13; see store.py's docstring).
-        filtered_param_names = _filter_secrets_by_name(
-            all_param_names, getattr(spec, "secret_names", [])
-        )
+        # Secret NAMES come from warren's own store, never from listing SSM: the
+        # control plane holds no SSM read permission at all (GetParametersByPath can't
+        # be limited to WithDecryption=false in IAM). spec.secret_names is the
+        # resolved template's declared allow-list; only names this workspace's OWNER
+        # actually has, already mirrored, get an ARN.
+        owner_id = getattr(spec, "owner_id", "") or ""
+        declared = list(getattr(spec, "secret_names", []) or [])
+        if self.secret_mirror is not None:
+            names = await self.secret_mirror.mirrored_names(owner_id, declared)
+        else:
+            names = declared if owner_id else []
 
         region = getattr(self._settings, "aws_region", "us-east-1") or "us-east-1"
         account_id = await self._ensure_account_id()
@@ -296,10 +295,13 @@ class ECSRuntime:
         # RunTask's request/response, DescribeTasks, or CloudTrail as plaintext.
         secret_defs = [
             {
-                "name": key,
-                "valueFrom": f"arn:aws:ssm:{region}:{account_id}:parameter{full_name}",
+                "name": name,
+                "valueFrom": (
+                    f"arn:aws:ssm:{region}:{account_id}:parameter"
+                    f"{ssm_parameter_name(self._resource_prefix, self.server_id, owner_id, name)}"
+                ),
             }
-            for key, full_name in filtered_param_names.items()
+            for name in names
         ]
 
         family = _slug(spec.image, self._resource_prefix)
@@ -900,59 +902,11 @@ class ECSRuntime:
 # Module-level helpers
 # ---------------------------------------------------------------------------
 
-def _fetch_ssm_parameter_names(ssm: Any, path: str) -> dict[str, str]:
-    """Fetch the NAMES (not values) of every SSM parameter under ``path`` (synchronous).
-
-    Deliberately does NOT decrypt/return parameter values (fixes: secrets exposed
-    through RunTask container overrides — decrypted plaintext ending up in
-    DescribeTasks/CloudTrail). Values are resolved by the ECS agent itself at
-    container start, via the task definition's `secrets` block referencing each
-    parameter's ARN — this function only needs enough to build those ARNs.
-
-    Must be called inside asyncio.to_thread — SSM client is synchronous.
-    Handles pagination via NextToken loop (RESEARCH.md Pattern 4).
-
-    Returns: {stripped_key: full_parameter_name} — full_parameter_name is the
-    original "/warren/{server_id}/{tier}/{name}" path, needed to build the ARN.
-    """
-    params: dict[str, str] = {}
-    kwargs: dict[str, Any] = {
-        "Path": path,
-        "Recursive": True,
-        # False: we only need parameter Names to build ARNs — never decrypt values here
-        # (fixes issue #4: no plaintext secret should ever pass through this process).
-        "WithDecryption": False,
-        "MaxResults": 10,
-    }
-    while True:
-        resp = ssm.get_parameters_by_path(**kwargs)
-        for p in resp.get("Parameters", []):
-            full_name = p["Name"]
-            stripped = full_name
-            if stripped.startswith(path):
-                stripped = stripped[len(path):]
-            stripped = stripped.lstrip("/")
-            params[stripped] = full_name
-        next_token = resp.get("NextToken")
-        if not next_token:
-            break
-        kwargs["NextToken"] = next_token
-    return params
-
-
-def _filter_secrets_by_name(
-    secrets: dict[str, str], allowed_names: list[str]
-) -> dict[str, str]:
-    """Filter the owner's SSM secrets dict down to exactly `allowed_names`.
-
-    Path convention: /{resource_prefix}/{server_id}/{owner_id}/{name} -- no
-    permission-tier segment (removed 2026-10-13), so keys here are already
-    plain leaf names; this is a simple by-name allow-list, not a tier filter.
-    `allowed_names` is the resolved template's declared `secrets` list, so a
-    template that declares no secrets gets none, not "everything owner has."
-    """
-    allowed = set(allowed_names)
-    return {name: value for name, value in secrets.items() if name in allowed}
+def ssm_parameter_name(resource_prefix: str, server_id: str, owner_id: str, name: str) -> str:
+    """The SSM parameter a secret is mirrored to: /{prefix}/{server_id}/{owner_id}/{name}.
+    Shared by the mirror's writes (secrets/ssm_store.py) and the task-definition
+    `secrets` ARNs built here, so both always agree."""
+    return f"/{resource_prefix}/{server_id}/{owner_id}/{name}"
 
 
 def _slug(image: str, resource_prefix: str = "warren") -> str:

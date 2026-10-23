@@ -126,6 +126,24 @@ def test_rotate_server_posts_new_value(tmp_path: Path):
     assert json.loads(route.calls.last.request.content) == {"value": "s3cret"}
 
 
+def test_rotate_server_mirror_pending_is_saved_with_a_warning(tmp_path: Path):
+    import httpx
+    import respx
+
+    with respx.mock(base_url="http://r1.local:8420") as m:
+        m.post("/secrets/FOO/rotate").mock(
+            return_value=httpx.Response(202, json={"status": "mirror_pending"})
+        )
+        result = runner.invoke(
+            app,
+            ["secrets", "rotate", "FOO", "--server", "r1", "--config", str(_remote_config(tmp_path))],
+            input="s3cret\ns3cret\n",
+        )
+    assert result.exit_code == 0, result.output
+    assert "rotated" in result.output
+    assert "SSM mirror" in result.output
+
+
 def test_rotate_server_reencrypt_only_sends_no_value(tmp_path: Path):
     import httpx
     import respx

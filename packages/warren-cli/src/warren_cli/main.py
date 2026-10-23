@@ -1705,11 +1705,13 @@ def secrets_rotate(
     if resp.status_code == 404:
         ui.error(f"Secret '{name}' not found on {server}.")
         raise typer.Exit(1)
-    if resp.status_code != 204:
+    if resp.status_code not in (202, 204):
         ui.error(f"warren-server returned HTTP {resp.status_code}")
         raise typer.Exit(1)
     verb = "re-encrypted" if reencrypt_only else "rotated"
     ui.ok(f"Secret '{name}' {verb} on {server}.")
+    if resp.status_code == 202:
+        ui.warn("The server's SSM mirror hasn't caught up yet; it retries automatically.")
 
 
 # ---------------------------------------------------------------------------
@@ -2056,8 +2058,10 @@ def project_sync(
                             "/secrets",
                             json={"name": secret_name, "value": local_values[secret_name]},
                         )
-                        if r.status_code == 204:
+                        if r.status_code in (202, 204):
                             pushed += 1
+                            if r.status_code == 202:
+                                ui.warn(f"secret '{secret_name}': saved; the server's SSM mirror retries automatically")
                         else:
                             ui.error(f"secret '{secret_name}': push failed — HTTP {r.status_code} {r.text}")
                 return pushed

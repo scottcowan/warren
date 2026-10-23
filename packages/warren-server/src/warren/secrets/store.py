@@ -98,11 +98,16 @@ async def list_secrets(db: aiosqlite.Connection, owner_id: str) -> list[dict[str
     return [{"name": row[0], "created_at": row[1], "updated_at": row[2]} for row in rows]
 
 
-async def list_all_secret_keys(db: aiosqlite.Connection) -> list[tuple[str, str]]:
-    """Every (owner_id, name) across all owners -- SSM mirror reconciliation
-    only, never returned to a caller."""
-    async with db.execute("SELECT owner_id, name FROM secrets") as cur:
-        return [(row[0], row[1]) for row in await cur.fetchall()]
+async def existing_names(db: aiosqlite.Connection, owner_id: str, names: list[str]) -> set[str]:
+    """Which of `names` `owner_id` has -- names only, nothing decrypted."""
+    if not names:
+        return set()
+    placeholders = ",".join("?" for _ in names)
+    async with db.execute(
+        f"SELECT name FROM secrets WHERE owner_id = ? AND name IN ({placeholders})",
+        (owner_id, *names),
+    ) as cur:
+        return {row[0] for row in await cur.fetchall()}
 
 
 async def resolve_secrets_for_names(

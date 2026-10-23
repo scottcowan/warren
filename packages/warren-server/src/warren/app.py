@@ -48,25 +48,13 @@ log = structlog.get_logger(__name__)
 _RECONCILE_TIMEOUT_S: float = 30.0
 
 
-async def _reconcile_ssm_mirror(runtime, db, settings: WarrenSettings) -> None:
-    from warren.secrets import ssm_store  # noqa: PLC0415
-    from warren.secrets.cipher import LocalCipher  # noqa: PLC0415
-
+async def _flush_ssm_outbox(mirror) -> None:
     try:
-        result = await asyncio.wait_for(
-            ssm_store.reconcile_mirror(
-                runtime.ssm_client(),
-                db,
-                LocalCipher(settings.secret_key.get_secret_value()),
-                settings.ecs_resource_prefix,
-                settings.server_id,
-                kms_key_id=getattr(settings, "kms_key_id", "") or "",
-            ),
-            timeout=_RECONCILE_TIMEOUT_S,
-        )
-        log.info("secret_ssm_mirror_reconciled", **result)
+        still = await asyncio.wait_for(mirror.flush(), timeout=_RECONCILE_TIMEOUT_S)
+        if still:
+            log.warning("secret_ssm_outbox_still_pending", count=len(still))
     except Exception:
-        log.exception("secret_ssm_mirror_reconcile_failed")
+        log.exception("secret_ssm_outbox_flush_failed")
 
 
 @asynccontextmanager
@@ -122,6 +110,20 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
     store = WorkspaceStore(db)
     if settings.runtime_type == "ecs":
         runtime.launch_store = LaunchAttemptStore(db)
+        from warren.secrets.cipher import LocalCipher  # noqa: PLC0415
+        from warren.secrets.ssm_store import SsmMirror  # noqa: PLC0415
+
+        secret_mirror = SsmMirror(
+            db,
+            LocalCipher(settings.secret_key.get_secret_value()),
+            runtime.ssm_client,
+            settings.ecs_resource_prefix,
+            settings.server_id,
+            kms_key_id=settings.kms_key_id,
+        )
+        runtime.secret_mirror = secret_mirror
+    else:
+        secret_mirror = None
     from warren.registry.events import WorkspaceEventStore
     event_store = WorkspaceEventStore()
 
@@ -171,10 +173,11 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
     except asyncio.TimeoutError:
         log.error("reconciliation timeout, starting with stale state", timeout_s=_RECONCILE_TIMEOUT_S)
 
-    if settings.runtime_type == "ecs" and not os.environ.get("WARREN_DRY_RUN_SKIP_PREFLIGHT"):
-        await _reconcile_ssm_mirror(runtime, db, settings)
+    if secret_mirror is not None:
+        await _flush_ssm_outbox(secret_mirror)
 
     app.state.db = db
+    app.state.secret_mirror = secret_mirror
     app.state.settings = settings
     app.state.runtime = runtime
     app.state.registry = registry
@@ -280,6 +283,12 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
         except Exception:
             log.exception("efs_reaper_spawn_failed")
 
+    app.state.ssm_outbox_task = None
+    if secret_mirror is not None:
+        from warren.secrets.ssm_store import run_outbox_retry  # noqa: PLC0415
+
+        app.state.ssm_outbox_task = asyncio.create_task(run_outbox_retry(secret_mirror))
+
     app.state.ecs_orphan_sweep_task = None
     sweep_interval_s = float(getattr(settings, "ecs_orphan_sweep_interval_seconds", 0) or 0)
     if settings.runtime_type == "ecs" and sweep_interval_s > 0:
@@ -305,6 +314,13 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
         async with app.state.mcp_session_manager.run():
             yield
     finally:
+        outbox_task = getattr(app.state, "ssm_outbox_task", None)
+        if outbox_task is not None:
+            outbox_task.cancel()
+            try:
+                await outbox_task
+            except asyncio.CancelledError:
+                pass
         sweep_task = getattr(app.state, "ecs_orphan_sweep_task", None)
         if sweep_task is not None:
             sweep_task.cancel()
