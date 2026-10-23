@@ -51,7 +51,6 @@ class FakeRuntime:
             workspace_id=spec.workspace_id,
             runtime_id=runtime_id,
             root_path=spec.root_path,
-            sidecar_url="",
         )
 
     async def start(self, handle: WorkspaceHandle) -> None:

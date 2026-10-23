@@ -334,7 +334,7 @@ def test_status_with_empty_runtime_id_returns_unknown_without_calling_ecs():
     mock_ecs = _mock_ecs()
     mock_ssm = _mock_ssm()
     rt = _make_runtime(mock_ecs, mock_ssm)
-    handle = WorkspaceHandle(workspace_id="ws-x", runtime_id="", root_path="", sidecar_url="")
+    handle = WorkspaceHandle(workspace_id="ws-x", runtime_id="", root_path="")
 
     status = asyncio.run(rt.status(handle))
 

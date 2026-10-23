@@ -143,7 +143,6 @@ class SeatbeltRuntime:
             workspace_id=spec.workspace_id,
             runtime_id=str(workspace_dir),
             root_path=str(workspace_dir),
-            sidecar_url="",
             state_dir=str(state_dir),
         )
 

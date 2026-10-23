@@ -129,7 +129,6 @@ async def test_status_returns_stopped_when_state_json_exists(tmp_path: Path):
         workspace_id="ws-3",
         runtime_id="",
         root_path=str(root),
-        sidecar_url="",
         state_dir=str(state_dir),
     )
     assert await rt.status(handle) == "stopped"
@@ -145,7 +144,6 @@ async def test_status_returns_unknown_when_no_state_json(tmp_path: Path):
         workspace_id="ws-missing",
         runtime_id="",
         root_path=str(tmp_path / "does-not-exist"),
-        sidecar_url="",
     )
     assert await rt.status(handle) == "unknown"
 
@@ -182,7 +180,6 @@ async def test_exec_streams_stdout(tmp_path: Path, monkeypatch):
             workspace_id="ws-4",
             runtime_id="",
             root_path=str(root),
-            sidecar_url="",
         )
         chunks = [chunk async for chunk in rt.exec(handle, ["/bin/echo", "hi"])]
 
@@ -237,7 +234,7 @@ async def test_exec_writes_secret_env_file_and_deletes_only_after_process_exits(
     ):
         rt = NsjailRuntime(server_id="test-host")
         handle = WorkspaceHandle(
-            workspace_id="ws-5", runtime_id="", root_path=str(root), sidecar_url=""
+            workspace_id="ws-5", runtime_id="", root_path=str(root)
         )
         assert not env_path.exists()  # not written before exec() runs
         [chunk async for chunk in rt.exec(handle, ["/bin/echo", "hi"])]
@@ -279,7 +276,7 @@ async def test_exec_deletes_secret_env_file_even_if_subprocess_raises(
     ):
         rt = NsjailRuntime(server_id="test-host")
         handle = WorkspaceHandle(
-            workspace_id="ws-6", runtime_id="", root_path=str(root), sidecar_url=""
+            workspace_id="ws-6", runtime_id="", root_path=str(root)
         )
         with pytest.raises(OSError):
             [chunk async for chunk in rt.exec(handle, ["/bin/echo", "hi"])]
@@ -304,7 +301,6 @@ async def test_destroy_removes_workspace_dir_and_state_dir(tmp_path: Path):
         workspace_id="ws-5",
         runtime_id="",
         root_path=str(root),
-        sidecar_url="",
         state_dir=str(state_dir),
     )
     await rt.destroy(handle)

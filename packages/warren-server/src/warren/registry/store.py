@@ -107,8 +107,8 @@ async def _scrub_legacy_plaintext_env(db: aiosqlite.Connection) -> None:
 async def _drop_stored_sidecar_tokens(db: aiosqlite.Connection) -> None:
     """Audit finding 12 follow-up: an earlier release stored every workspace's
     sidecar token (Fernet-encrypted) in `workspaces.sidecar_token_enc`, including
-    destroyed rows', for a server->sidecar call that never existed. Tokens now live
-    only in each container's env, so drop the column -- or, on an SQLite too old for
+    destroyed rows', for a server->sidecar call that never existed. The sidecar no
+    longer takes a token at all, so drop the column -- or, on an SQLite too old for
     DROP COLUMN, null it -- with secure_delete so the freed pages are zeroed.
     """
     async with db.execute("PRAGMA table_info(workspaces)") as cur:

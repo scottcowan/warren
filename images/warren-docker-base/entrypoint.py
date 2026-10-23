@@ -3,27 +3,21 @@
 
 Design notes:
 - Must NOT call os.execvp (Pitfall 8): entrypoint stays alive as PID 1 and blocks
-  waiting for the workspace app; the sidecar continues as a daemon thread.
+  waiting for the workspace app; the sidecar's agent-state recorder runs as a
+  daemon thread beside it.
 - emit() is the only stdout writer; uses json.dumps (no raw interpolation) and
   flush=True to ensure Podman buffers do not hold events (Pitfall 4 / T-04-04-02).
-- Stale AF_UNIX socket removed before starting uvicorn (Pitfall 2 / T-04-04-03).
 - Sidecar import wrapped in try/except: if warren_sidecar is not installed,
   sidecar_import_error is emitted and the entrypoint exits non-zero.
-- asyncio is used only for the socket-ready poll (asyncio.sleep).  The workspace
-  app subprocess is started synchronously after asyncio.run() returns, which
-  avoids asyncio child-watcher compatibility issues on macOS Python 3.12.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import os
-import pathlib
 import re
 import shlex
 import subprocess
 import sys
-import threading
 import time
 
 _seq: int = 0
@@ -48,10 +42,10 @@ def fail(reason: str, detail: str = "") -> None:
     sys.exit(1)
 
 
-async def _preflight() -> str:
-    """Run all preflight checks, start the sidecar, emit events.
+def _preflight() -> str:
+    """Run all preflight checks, start the agent-state recorder, emit events.
 
-    Returns the workspace app command to execute after the asyncio phase.
+    Returns the workspace app command to execute.
     Exits non-zero via fail() on any preflight error.
     """
     # ── D-05: workspace identity ──────────────────────────────────────────────
@@ -79,53 +73,21 @@ async def _preflight() -> str:
     )
     emit({"type": "claude_md_ready", "found": os.path.isfile(claude_md_path)})
 
-    # ── D-06 step 3: start sidecar in daemon thread ───────────────────────────
-    SOCK = "/tmp/warren-sidecar.sock"
-    pathlib.Path(SOCK).unlink(missing_ok=True)  # remove stale socket (Pitfall 2)
-
-    def _run_sidecar() -> None:
-        """Start uvicorn serving warren_sidecar on a Unix-domain socket."""
-        try:
-            import structlog  # noqa: PLC0415
-            import uvicorn  # noqa: PLC0415
-            from warren_sidecar.app import app as sidecar_app  # noqa: PLC0415
-
-            # Route all sidecar/structlog output to stderr so that entrypoint's
-            # stdout remains clean NDJSON for Podman container.logs capture.
-            structlog.configure(
-                processors=[
-                    structlog.dev.ConsoleRenderer(),
-                ],
-                wrapper_class=structlog.BoundLogger,
-                logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
-            )
-
-            uvicorn.run(sidecar_app, uds=SOCK, log_level="warning")
-        except ImportError as e:
-            # If warren_sidecar is not installed emit workspace_failed and exit the
-            # thread (sys.exit in a thread raises SystemExit, killing only the thread).
-            emit({"type": "workspace_failed", "reason": "sidecar_import_error", "detail": str(e)})
-            sys.exit(1)
-
-    t = threading.Thread(target=_run_sidecar, daemon=True)
-    t.start()
-
-    # Wait for socket to appear — up to 2 seconds (T-04-04-03)
-    for _ in range(20):
-        if os.path.exists(SOCK):
-            break
-        await asyncio.sleep(0.1)
-    else:
-        fail("sidecar_socket_timeout", SOCK)
-
-    # Audit finding 12: uvicorn leaves its uds socket 0o666 and the sidecar runs as
-    # root. Restrict it, and keep the token (already read during the sidecar's
-    # lifespan startup, which precedes the bind) out of the workspace app's env.
-    # Nothing workspace-controlled has started yet.
-    os.chmod(SOCK, 0o600)
-    os.environ.pop("WARREN_SIDECAR_TOKEN", None)
-
-    emit({"type": "sidecar_ready", "socket": SOCK})
+    # ── D-06 step 3: agent-state recorder (sidecar) in a daemon thread ───────
+    # It tails the tmux pane for OSC 7501 state and writes osc-state.json, which
+    # the server reads host-side. It serves nothing: the orchestrator never dials it.
+    try:
+        import structlog  # noqa: PLC0415
+        from warren_sidecar.recorder import start_thread  # noqa: PLC0415
+    except ImportError as e:
+        fail("sidecar_import_error", str(e))
+    # structlog output goes to stderr so stdout stays clean NDJSON for container logs.
+    structlog.configure(
+        processors=[structlog.dev.ConsoleRenderer()],
+        wrapper_class=structlog.BoundLogger,
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
+    )
+    start_thread()
 
     # ── D-06 step 4: workspace_ready ─────────────────────────────────────────
     emit({"type": "workspace_ready", "workspace_id": workspace_id})
@@ -254,14 +216,13 @@ def start_agent_supervisor(path: str = _SUPERVISOR) -> subprocess.Popen | None:
 
 
 if __name__ == "__main__":
-    app_cmd = asyncio.run(_preflight())
+    app_cmd = _preflight()
     if os.environ.get("WARREN_SHELL_FIRST") == "1" and os.geteuid() == 0:
         write_session_env()
     start_agent_supervisor()
 
     # ── D-11: supervise workspace app (PID 1 stays alive) ────────────────────
-    # Run synchronously after asyncio.run() returns so the daemon uvicorn thread
-    # (and its own event loop) continues uninterrupted.
+    # The recorder thread (with its own event loop) keeps running beside it.
     argv = _build_argv(app_cmd)
     try:
         result = subprocess.run(argv)  # noqa: S603

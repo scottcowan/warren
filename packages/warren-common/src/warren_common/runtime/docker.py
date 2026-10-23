@@ -31,12 +31,10 @@ import structlog
 
 from warren_common.errors import ProvisionError, RuntimeUnreachable
 from warren_common.runtime.base import (
-    SIDECAR_TOKEN_ENV,
     ContainerRuntime,
     RuntimeConfig,
     WorkspaceHandle,
     WorkspaceSpec,
-    new_sidecar_token,
 )
 
 log = structlog.get_logger(__name__)
@@ -144,7 +142,6 @@ class DockerRuntime:
             # connect, same as the local workspace zshrc already gets from spec.env.
             "WARREN_PROJECT": spec.project,
             "WARREN_TEMPLATE": spec.intent,
-            SIDECAR_TOKEN_ENV: new_sidecar_token(),
         }
 
         name = f"warren-{spec.workspace_id[:8]}"
@@ -219,7 +216,6 @@ class DockerRuntime:
             workspace_id=spec.workspace_id,
             runtime_id=container.id,
             root_path=str(workspace_dir),
-            sidecar_url="",
         )
 
     async def start(self, handle: WorkspaceHandle) -> None:

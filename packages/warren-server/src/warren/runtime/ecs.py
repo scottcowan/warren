@@ -543,7 +543,7 @@ class ECSRuntime:
         if adopted_arn:
             log.info("ecs_adopted_task", workspace_id=spec.workspace_id, task_arn=adopted_arn)
             return WorkspaceHandle(
-                workspace_id=spec.workspace_id, runtime_id=adopted_arn, root_path="", sidecar_url=""
+                workspace_id=spec.workspace_id, runtime_id=adopted_arn, root_path=""
             )
 
         if attempt:
@@ -626,7 +626,6 @@ class ECSRuntime:
             workspace_id=spec.workspace_id,
             runtime_id=task_arn,
             root_path="",
-            sidecar_url="",
         )
 
     async def start(self, handle: WorkspaceHandle) -> None:

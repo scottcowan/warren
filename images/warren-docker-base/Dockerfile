@@ -64,7 +64,7 @@ WORKDIR /workspace
 # warren-docker-dev-base) that installs its own version manager (pyenv, nvm)
 # prepends its shims ahead of /usr/local/bin on PATH, which would otherwise
 # silently redirect this ENTRYPOINT to a bare interpreter with none of
-# warren-sidecar's dependencies installed (structlog, uvicorn, warren_sidecar
+# warren-sidecar's dependencies installed (structlog, warren_sidecar
 # itself) -- a real failure this image shipped with (sidecar_import_error:
 # "No module named 'structlog'" under warren-docker-dev-base, fixed 2026-10-13).
 # This process is warren's own infra, not the user's dev shell, so it must

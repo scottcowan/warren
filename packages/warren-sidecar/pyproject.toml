@@ -1,24 +1,18 @@
 [project]
 name = "warren-sidecar"
 version = "0.1.0"
-description = "In-workspace HTTP sidecar for warren workspaces"
+description = "In-workspace agent-state recorder for warren workspaces"
 license = "MIT"
 authors = [{ name = "Scott Cowan" }]
 requires-python = ">=3.11"
 dependencies = [
-  "fastapi>=0.149,<0.150",
-  "uvicorn[standard]>=0.54,<0.55",
-  "pathspec>=1.1,<2",
-  "pydantic-settings>=2.16.0,<3",
   "structlog>=24.4",
-  "aiofiles>=25.1,<26",
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest>=8",
   "pytest-asyncio>=0.24",
-  "httpx>=0.28,<0.29",
 ]
 
 [project.scripts]
@@ -34,9 +28,6 @@ packages = ["src/warren_sidecar"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-markers = [
-  "requires_podman: integration test that needs a live rootless Podman socket",
-]
 testpaths = ["tests"]
 
 [project.urls]

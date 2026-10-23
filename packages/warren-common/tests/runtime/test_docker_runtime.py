@@ -119,23 +119,6 @@ def test_provision_injects_warren_project_and_template(mock_docker_client, tmp_p
     assert env["WARREN_TEMPLATE"] == "claude"
 
 
-def test_provision_mints_sidecar_token(mock_docker_client, tmp_path):
-    """Audit finding 12: a fresh token in the container env only -- not on the
-    handle, not in state.json, never a same-named secret's value."""
-    root = str(tmp_path / "ws")
-    spec = _spec(root)
-    spec.env["WARREN_SIDECAR_TOKEN"] = "attacker-chosen"
-    _mkdirs(root, spec)
-    mock_docker_client.containers.run.return_value = MagicMock(id="cid-1234abcd")
-
-    handle = asyncio.run(_make_runtime(mock_docker_client).provision(spec))
-
-    token = mock_docker_client.containers.run.call_args.kwargs["environment"]["WARREN_SIDECAR_TOKEN"]
-    assert token != "attacker-chosen" and len(token) >= 32
-    assert token not in repr(vars(handle))
-    assert token not in (Path(root) / "state.json").read_text()
-
-
 def test_provision_uses_mount_objects(mock_docker_client, tmp_path):
     from docker.types import Mount
 
