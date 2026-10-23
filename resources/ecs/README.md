@@ -143,6 +143,41 @@ independent** persistence paths, each with its own access point on the same file
   resource out of band if it's truly no longer needed), then re-apply with
   `create_efs = false`.
 
+### EFS encryption at rest
+
+All three tools create the file system with encryption at rest explicitly enabled
+(audit #15). The key is optional: Terraform `efs_kms_key_arn`, CDK context
+`efs_kms_key_arn`, setup.sh env `WARREN_EFS_KMS_KEY_ID`; empty uses the AWS-managed
+`aws/elasticfilesystem` key. A customer-managed key's policy must let EFS use it.
+
+Encryption can't be turned on for an existing file system. If yours predates this
+(`aws efs describe-file-systems --query 'FileSystems[].[FileSystemId,Encrypted]'`),
+Terraform's `prevent_destroy` blocks the replacement plan and CDK would orphan the old
+file system (`RETAIN`) and create a new, empty one. To migrate: stop the control-plane
+service, create the new encrypted file system (or let the stack create it after
+`terraform state rm 'aws_efs_file_system.warren[0]'`), copy `/control-plane` and
+`/workspaces` across (AWS DataSync, or `rsync` from a task mounting both), then start the
+service and delete the old file system once verified.
+
+### Single control-plane writer
+
+warren-server keeps its registry, auth and secrets in SQLite under `/var/lib/warren` on
+EFS, so exactly one control-plane process may have it open (audit #10):
+
+- The control-plane service deploys stop-before-start
+  (`deployment_minimum_healthy_percent = 0`, `deployment_maximum_percent = 100`).
+  The default 100/200 rolling update briefly runs the old and new task together.
+  Expect a short outage on every deploy.
+- warren-server takes an exclusive lock on `warren.db.lock` next to the database at
+  startup. If another process holds it, the new task retries for up to
+  `WARREN_WRITER_LOCK_WAIT_S` (default 120s; `0` fails fast) and only then exits. The
+  wait covers a just-stopped task whose NFSv4 lock lingers until its lease expires.
+  Without it, the new task would exit at startup, and those exits count toward the
+  deployment circuit breaker.
+- `WARREN_SQLITE_JOURNAL_MODE=auto` (the default) uses `DELETE` journaling when the data
+  dir is on NFS/EFS, because WAL's shared-memory index isn't safe on network
+  filesystems. Use `wal`/`delete` to override.
+
 **CDK parity:** `resources/ecs/cdk/warren_stack.py` accepts the same `create_efs` (default
 `True`) and `control_plane_image_uri` parameters as Terraform, producing the identical
 resource set and the same `WARREN_EFS_ID` wiring into the control-plane task. Verified

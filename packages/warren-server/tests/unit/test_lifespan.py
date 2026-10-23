@@ -145,6 +145,7 @@ async def test_lifespan_omits_git_manager_for_ecs(env_defaults, monkeypatch):
     with (
         patch("warren.app.WorkspaceRegistry", return_value=fake_registry_instance) as reg_cls,
         patch("warren.runtime.ecs.ECSRuntime", return_value=fake_runtime),
+        patch("warren.app._reconcile_ssm_mirror", AsyncMock()) as reconcile_ssm,
     ):
         from warren.app import app, lifespan
 
@@ -152,6 +153,8 @@ async def test_lifespan_omits_git_manager_for_ecs(env_defaults, monkeypatch):
             pass
 
     assert reg_cls.call_args.kwargs["git_manager"] is None
+    reconcile_ssm.assert_awaited_once()
+    assert reconcile_ssm.await_args.args[0] is fake_runtime
 
 
 @pytest.mark.asyncio
@@ -347,6 +350,7 @@ async def test_lifespan_ecs(env_defaults, monkeypatch):
 
     with (
         patch("warren.runtime.ecs.ECSRuntime.preflight", AsyncMock()),
+        patch("warren.app._reconcile_ssm_mirror", AsyncMock()),
         patch("warren.app.WorkspaceRegistry", return_value=fake_registry),
     ):
         from warren.app import app, lifespan
@@ -368,6 +372,7 @@ async def test_lifespan_ecs_orphan_sweep_disabled_by_zero_interval(env_defaults,
 
     with (
         patch("warren.runtime.ecs.ECSRuntime.preflight", AsyncMock()),
+        patch("warren.app._reconcile_ssm_mirror", AsyncMock()),
         patch("warren.app.WorkspaceRegistry", return_value=fake_registry),
     ):
         from warren.app import app, lifespan

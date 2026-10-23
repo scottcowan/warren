@@ -3,7 +3,8 @@
 Startup order:
     1. WarrenSettings()
     2. run runtime.preflight() — ECS: await runtime.preflight(); else: run_preflight(podman_socket)
-    3. open_db(db_path(settings))
+    3. acquire_writer_lock + open_db(db_path(settings)) -- waits up to
+       writer_lock_wait_s, then fails, if another server process owns the database (audit #10)
     4. Construct AuthStore(db) + ensure_bootstrap_admin(auth_store, settings) (D-03/D-04) —
        before reconcile so a reconcile timeout can never leave the server admin-less
     5. Construct runtime (ECSRuntime | DockerRuntime | PodmanRuntime) + WorkspaceStore + WorkspaceRegistry
@@ -33,7 +34,13 @@ from warren.paths import db_path
 from warren.preflight import run_preflight
 from warren.registry.reaper import run_reaper
 from warren.registry.registry import WorkspaceRegistry
-from warren.registry.store import LaunchAttemptStore, OperationStore, WorkspaceStore, open_db
+from warren.registry.store import (
+    LaunchAttemptStore,
+    OperationStore,
+    WorkspaceStore,
+    acquire_writer_lock,
+    open_db,
+)
 from warren.runtime.podman import PodmanRuntime
 
 log = structlog.get_logger(__name__)
@@ -41,10 +48,42 @@ log = structlog.get_logger(__name__)
 _RECONCILE_TIMEOUT_S: float = 30.0
 
 
+async def _reconcile_ssm_mirror(runtime, db, settings: WarrenSettings) -> None:
+    from warren.secrets import ssm_store  # noqa: PLC0415
+    from warren.secrets.cipher import LocalCipher  # noqa: PLC0415
+
+    try:
+        result = await asyncio.wait_for(
+            ssm_store.reconcile_mirror(
+                runtime.ssm_client(),
+                db,
+                LocalCipher(settings.secret_key.get_secret_value()),
+                settings.ecs_resource_prefix,
+                settings.server_id,
+                kms_key_id=getattr(settings, "kms_key_id", "") or "",
+            ),
+            timeout=_RECONCILE_TIMEOUT_S,
+        )
+        log.info("secret_ssm_mirror_reconciled", **result)
+    except Exception:
+        log.exception("secret_ssm_mirror_reconcile_failed")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = WarrenSettings()
+    writer_lock = await asyncio.to_thread(
+        acquire_writer_lock, db_path(settings), settings.writer_lock_wait_s
+    )
+    try:
+        async with _lifespan(app, settings):
+            yield
+    finally:
+        writer_lock.release()
 
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI, settings: WarrenSettings):
     _efs_volume = None  # set below when runtime_type == "ecs" and efs_id is configured
 
     if settings.runtime_type == "ecs":
@@ -77,7 +116,7 @@ async def lifespan(app: FastAPI):
         else:
             await run_preflight(settings.podman_socket)
 
-    db = await open_db(db_path(settings))
+    db = await open_db(db_path(settings), journal_mode=settings.sqlite_journal_mode)
     auth_store = AuthStore(db)
     await ensure_bootstrap_admin(auth_store, settings)
     store = WorkspaceStore(db)
@@ -131,6 +170,9 @@ async def lifespan(app: FastAPI):
         await asyncio.wait_for(registry.reconcile_from_disk(), timeout=_RECONCILE_TIMEOUT_S)
     except asyncio.TimeoutError:
         log.error("reconciliation timeout, starting with stale state", timeout_s=_RECONCILE_TIMEOUT_S)
+
+    if settings.runtime_type == "ecs" and not os.environ.get("WARREN_DRY_RUN_SKIP_PREFLIGHT"):
+        await _reconcile_ssm_mirror(runtime, db, settings)
 
     app.state.db = db
     app.state.settings = settings

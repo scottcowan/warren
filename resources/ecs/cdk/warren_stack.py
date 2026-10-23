@@ -144,6 +144,9 @@ class WarrenECSStack(cdk.Stack):
         env_suffix: str = "prod",
         ecs_resource_prefix: str = "warren",
         kms_key_id: str = "",
+        # Audit #15: EFS is always encrypted at rest; this only picks the key (an ARN).
+        # Empty means aws/elasticfilesystem. Mirrors terraform's var.efs_kms_key_arn.
+        efs_kms_key_arn: str = "",
         aws_trusted_assumed_role_patterns: list[str] | None = None,
         # R22: previously driven by `"DISABLED" if create_vpc else "ENABLED"` below —
         # meaning any operator bringing their OWN VPC (create_vpc=False) got a PUBLIC
@@ -264,6 +267,12 @@ class WarrenECSStack(cdk.Stack):
                 file_system_name=f"warren-efs-{env_suffix}",
                 removal_policy=cdk.RemovalPolicy.RETAIN,  # operators manage FS lifecycle (D-06)
                 lifecycle_policy=efs.LifecyclePolicy.AFTER_90_DAYS,
+                encrypted=True,
+                kms_key=(
+                    kms.Key.from_key_arn(self, "WarrenEfsKmsKey", efs_kms_key_arn)
+                    if efs_kms_key_arn
+                    else None
+                ),
             )
             # Dedicated access point for the control-plane task's own state (SQLite
             # registry + auth users/tokens tables), rooted at a DIFFERENT path than
@@ -1477,6 +1486,13 @@ class WarrenECSStack(cdk.Stack):
             task_definition=control_plane_task_def.attr_task_definition_arn,
             launch_type="FARGATE",
             desired_count=1,
+            # Audit #10: stop-before-start -- the control plane is a single SQLite
+            # writer on EFS, and the default 100/200 rolling deployment briefly runs
+            # two. Mirrors terraform/main.tf.
+            deployment_configuration=ecs.CfnService.DeploymentConfigurationProperty(
+                minimum_healthy_percent=0,
+                maximum_percent=100,
+            ),
             # Required for `aws ecs execute-command` into the running service task
             # (POC-02) — previously passed as `run-task --enable-execute-command`, which
             # has no equivalent on a long-lived service other than this flag.

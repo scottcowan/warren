@@ -39,9 +39,11 @@ from warren_common.runtime.sandbox_env import (
     ENV_MOUNT_DEST as _ENV_MOUNT_DEST,
     ENV_SOURCE_SCRIPT as _ENV_SOURCE_SCRIPT,
     base_host_env,
+    check_git_stores_not_writable,
     check_no_secret_service_mounts,
     host_mount_sources,
     workspace_state_dir,
+    writable_mount_sources,
     write_secret_env_file,
 )
 
@@ -114,6 +116,7 @@ def build_bwrap_args(
 
     # AG6: union of the template's harness grants; readonly re-bound ro last.
     grants = grants_for_spec(spec, Path.home())
+    check_git_stores_not_writable(spec, writable_mount_sources(spec, list(grants.write)))
     for path in grants.read:
         args += ["--ro-bind-try", path, path]
     for path in grants.write:
