@@ -11,6 +11,14 @@ from warren.auth.models import Token, User, WorkspaceToken
 from warren.registry.store import open_db
 
 
+class TokenLimitReached(Exception):
+    """create_token refused: the user already has `max_active` live tokens."""
+
+
+class LastAdminError(Exception):
+    """disable_user refused: the target is the only enabled admin."""
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -91,22 +99,34 @@ class AuthStore:
             rows = await cur.fetchall()
         return [_row_to_user(r) for r in rows]
 
-    async def disable_user(self, user_id: str) -> bool:
+    async def disable_user(self, user_id: str, *, keep_last_admin: bool = False) -> bool:
         """Mark a user disabled (idempotent-safe: re-disabling an already-disabled user
         is a no-op that still returns True as long as the user exists).
 
         Returns False only if user_id doesn't exist. Does not itself revoke the user's
         existing tokens -- callers that want "disable implies logout" should also call
         `revoke_all_tokens_for_user` (routes/admin.py's disable route does exactly this).
+
+        `keep_last_admin` raises LastAdminError instead of disabling the only enabled
+        admin. The enabled-admin count and the update are one statement, so two
+        concurrent disables of the last two admins can't both succeed.
         """
+        cursor = await self._db.execute(
+            """
+            UPDATE users SET disabled_at = ?
+            WHERE user_id = ? AND disabled_at IS NULL
+              AND (? = 0 OR is_admin = 0
+                   OR (SELECT COUNT(*) FROM users WHERE is_admin = 1 AND disabled_at IS NULL) > 1)
+            """,
+            (_utcnow_iso(), user_id, int(keep_last_admin)),
+        )
+        if cursor.rowcount:
+            return True
         user = await self.get_user(user_id)
         if user is None:
             return False
         if user.disabled_at is None:
-            await self._db.execute(
-                "UPDATE users SET disabled_at = ? WHERE user_id = ?",
-                (_utcnow_iso(), user_id),
-            )
+            raise LastAdminError(user_id)
         return True
 
     async def enable_user(self, user_id: str) -> bool:
@@ -169,20 +189,32 @@ class AuthStore:
         hashed_token: str,
         expires_at: datetime | None = None,
         created_by_token_id: str | None = None,
+        max_active: int | None = None,
     ) -> Token:
+        """Insert a token. With `max_active`, the live-token count and the insert are one
+        statement, so concurrent mints can't overshoot the cap (TokenLimitReached)."""
         token_id = uuid.uuid4().hex
         now = _utcnow_iso()
         expires_at_iso = expires_at.isoformat() if expires_at else None
-        await self._db.execute(
+        cursor = await self._db.execute(
             """
             INSERT INTO tokens (
                 token_id, user_id, hashed_token, created_at, expires_at, revoked_at,
                 created_by_token_id
             )
-            VALUES (?, ?, ?, ?, ?, NULL, ?)
+            SELECT ?, ?, ?, ?, ?, NULL, ?
+            WHERE ? IS NULL OR (
+                SELECT COUNT(*) FROM tokens
+                WHERE user_id = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)
+            ) < ?
             """,
-            (token_id, user_id, hashed_token, now, expires_at_iso, created_by_token_id),
+            (
+                token_id, user_id, hashed_token, now, expires_at_iso, created_by_token_id,
+                max_active, user_id, now, max_active,
+            ),
         )
+        if cursor.rowcount == 0:
+            raise TokenLimitReached(user_id)
         return Token(
             token_id=token_id,
             user_id=user_id,

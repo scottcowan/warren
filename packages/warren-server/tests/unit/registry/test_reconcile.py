@@ -177,6 +177,33 @@ async def test_reconcile_orphan_destroyed(sqlite_path: str, fake_runtime: FakeRu
 
 
 @pytest.mark.asyncio
+async def test_reconcile_prunes_workspace_networks_keeping_known_rows(
+    sqlite_path: str, fake_runtime: FakeRuntime
+):
+    """Finding 9: per-workspace networks are reconciled like containers -- every
+    non-destroyed row (incl. idle-stopped) keeps its network."""
+    store = await WorkspaceStore.open(sqlite_path)
+    for ws_id, status in (("ws-live", "running"), ("ws-idle", "stopped"), ("ws-dead", "destroyed")):
+        await store.insert(
+            workspace_id=ws_id,
+            project="p",
+            intent="i",
+            image="img",
+            root_path="",
+            server_instance="test-server",
+            status=status,
+        )
+    calls = []
+
+    async def prune(server_id, keep):
+        calls.append((server_id, set(keep)))
+
+    fake_runtime.prune_workspace_networks = prune
+    await reconcile_from_disk(runtime=fake_runtime, store=store, server_id="test-server")
+    assert calls == [("test-server", {"ws-live", "ws-idle"})]
+
+
+@pytest.mark.asyncio
 async def test_reconcile_ecs(sqlite_path: str):
     """ECS reconcile branch calls describe_tasks by explicit ARN (Plan 07-01 RED stub)."""
     from warren.runtime.ecs import ECSRuntime  # noqa: F401 — triggers xfail on ImportError

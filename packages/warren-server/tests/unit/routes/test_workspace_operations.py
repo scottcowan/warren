@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.control_plane import ADMIN_TOKEN, ScriptedRuntime, server_env
+from tests.control_plane import ADMIN_TOKEN, ScriptedRuntime, server_env, server_env_vars
 from warren.app import app
 
 _HEADERS = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
@@ -253,3 +253,28 @@ def test_running_status_and_runtime_id_are_one_write(monkeypatch, tmp_path):
         ws = client.portal.call(store.get, resp.json()["workspace_id"])
     assert resp.status_code == 202, resp.text
     assert ws.status == "running" and ws.container_id
+
+
+def test_concurrent_operations_over_cap_leave_no_dangling_receipt(monkeypatch, tmp_path):
+    """Finding 11: a create refused by the atomic cap drops its just-recorded operation, so
+    a replay can't resume it past the cap and the operationId is reusable."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    ops = [_op() for _ in range(4)]
+    real_env = server_env_vars
+
+    def _capped_env(*args, **kwargs):
+        return {**real_env(*args, **kwargs), "WARREN_MAX_WORKSPACES_PER_USER": "1"}
+
+    monkeypatch.setattr("tests.control_plane.server_env_vars", _capped_env)
+    with _client(monkeypatch, tmp_path) as (client, runtime):
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            responses = list(
+                pool.map(lambda op: client.post("/workspaces", json={**_BODY, "operationId": op}), ops)
+            )
+        receipts = [client.get(f"/operations/{op}").status_code for op in ops]
+    codes = [r.status_code for r in responses]
+    assert codes.count(202) == 1, codes
+    assert codes.count(503) == 3
+    assert sorted(receipts) == [200, 404, 404, 404]
+    assert len(runtime.provisioned) == 1

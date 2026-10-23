@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING
 
 import structlog
 
+from .models import normalise_mount
 from .paths import ensure_within
 from .safe_git import object_scrubbed_environ, run_git, safe_git_argv, shadow_git_dir
 
@@ -279,6 +280,7 @@ class GitManager:
         short_id = workspace_id[:8]
         # Include subdir slug in branch name to avoid collision when two worktrees
         # from the same bare repo are provisioned in the same workspace (e.g. docs-kb + main)
+        subdir = normalise_mount(subdir)
         subdir_slug = _slug_non_alnum.sub("-", subdir.lower()).strip("-") or "workspace"
         ws_branch = f"warren/{intent}/{short_id}/{subdir_slug}"
         target = workspace_root / subdir
@@ -332,12 +334,13 @@ class GitManager:
         bare: Path, workspace_root: Path, branch: str, subdir: str = "workspace"
     ) -> None:
         """Remove the worktree at `workspace_root/<subdir>` and prune bare metadata."""
-        target = workspace_root / subdir
+        target = workspace_root / normalise_mount(subdir)
         lock = await _lock_for(bare)
         async with lock:
             # Delete the checkout ourselves rather than `worktree remove`, so
             # host git never opens the workspace-writable worktree (BB12).
             if target.is_symlink():
+                ensure_within(workspace_root, target.parent, allow_root=True)
                 target.unlink()
             elif target.exists():
                 ensure_within(workspace_root, target)

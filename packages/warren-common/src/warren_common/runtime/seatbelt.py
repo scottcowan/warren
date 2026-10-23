@@ -39,7 +39,7 @@ from warren_common.runtime.base import (
     WorkspaceSpec,
     harness_state,
 )
-from warren_common.runtime.sandbox_env import base_host_env, state_root
+from warren_common.runtime.sandbox_env import base_host_env, workspace_state_dir
 from warren_common.runtime.sbpl import build_sbpl_profile, sandbox_exec_param_args
 from warren_common.runtime_detect import SANDBOX_EXEC_PATH
 
@@ -55,7 +55,7 @@ def _state_dir_for(workspace_id: str) -> Path:
     inside the sandbox, so a sandboxed process could otherwise rewrite its
     own profile/argv and have it trusted on the next `warren connect`.
     """
-    return state_root() / workspace_id
+    return workspace_state_dir(workspace_id)
 
 
 class SeatbeltRuntime:

@@ -131,6 +131,16 @@ async def open_db(path: str | Path) -> aiosqlite.Connection:
     return db
 
 
+class CapacityExhausted(Exception):
+    """An insert refused because it would exceed max_workspaces (`scope="server"`) or
+    max_workspaces_per_user (`scope="owner"`)."""
+
+    def __init__(self, scope: str, limit: int) -> None:
+        super().__init__(f"{scope} workspace limit ({limit}) reached")
+        self.scope = scope
+        self.limit = limit
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -202,16 +212,26 @@ class WorkspaceStore:
         owner_id: str | None = None,
         idle_ttl_seconds: float | None = None,
         spec_json: str | None = None,
+        max_total: int | None = None,
+        max_per_owner: int | None = None,
     ) -> None:
+        """Insert a row. With `max_total`/`max_per_owner`, the non-terminal count check and
+        the insert are one SQL statement, so concurrent creates can't overshoot either cap
+        (SQLite takes the write lock before the statement's reads)."""
         now = _utcnow_iso()
-        await self._db.execute(
-            """
+        placeholders = ",".join("?" * len(_NON_TERMINAL))
+        cursor = await self._db.execute(
+            f"""
             INSERT INTO workspaces (
                 workspace_id, project, intent, image, root_path,
                 container_id, status, server_instance, labels_json,
                 created_at, updated_at, ssh_port, owner_id, idle_ttl_seconds,
                 spec_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE (? IS NULL OR (SELECT COUNT(*) FROM workspaces WHERE status IN ({placeholders})) < ?)
+              AND (? IS NULL OR (
+                  SELECT COUNT(*) FROM workspaces WHERE status IN ({placeholders}) AND owner_id IS ?
+              ) < ?)
             """,
             (
                 workspace_id,
@@ -229,8 +249,20 @@ class WorkspaceStore:
                 owner_id,
                 idle_ttl_seconds,
                 spec_json,
+                max_total,
+                *_NON_TERMINAL,
+                max_total,
+                max_per_owner,
+                *_NON_TERMINAL,
+                owner_id,
+                max_per_owner,
             ),
         )
+        if cursor.rowcount == 0:
+            active = await self.list_non_terminal()
+            if max_total is not None and len(active) >= max_total:
+                raise CapacityExhausted("server", max_total)
+            raise CapacityExhausted("owner", max_per_owner or 0)
 
     async def get(self, workspace_id: str) -> Workspace | None:
         async with self._db.execute(
@@ -428,6 +460,11 @@ class OperationStore:
             return None
         keys = ("operation_id", "kind", "request_hash", "stage", "workspace_id", "created_at", "updated_at")
         return dict(zip(keys, row))
+
+    async def delete(self, principal: str, operation_id: str) -> None:
+        await self._db.execute(
+            "DELETE FROM operations WHERE principal = ? AND operation_id = ?", (principal, operation_id)
+        )
 
     async def set_stage(self, principal: str, operation_id: str, stage: str) -> None:
         await self._db.execute(

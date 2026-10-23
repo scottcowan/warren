@@ -84,36 +84,6 @@ def test_bwrap_state_resolved_from_out_of_tree_dir_not_root(tmp_path, monkeypatc
     assert state["root_path"] == str(ws_dir)
 
 
-def test_nsjail_state_migrated_from_workspace_root(tmp_path, monkeypatch):
-    """nsjail now keeps state.json out-of-tree too (R3) — a workspace
-    provisioned before that fix (state.json only in root_path) gets migrated
-    on next connect rather than trusted in place. The in-root nsjail.cfg is
-    no longer used at all (BB3): connect regenerates it in the state dir."""
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    workspace_id = "cccccccc-1111-2222-3333-444444444444"
-    ws_dir = _seed_workspace(tmp_path, workspace_id)
-    (ws_dir / "nsjail.cfg").write_text("{}")
-    (ws_dir / "state.json").write_text(json.dumps({
-        "workspace_id": workspace_id,
-        "project": "proj",
-        "intent": "claude",
-        "app": "claude",
-        "cfg_path": str(ws_dir / "nsjail.cfg"),
-        "bind_mounts": [],
-        "ssh_key_paths": [],
-        "ssh_agent_sock": None,
-    }))
-
-    state = _load_workspace_state(workspace_id)
-
-    state_dir = tmp_path / ".warren" / "state" / workspace_id
-    assert state["runtime_type"] == "nsjail"
-    assert "cfg_path" not in state
-    assert state["nsjail_state_dir"] == str(state_dir)
-    assert (state_dir / "state.json").is_file()
-    assert not (ws_dir / "state.json").exists()
-
-
 @pytest.mark.parametrize("in_root", [True, False])
 def test_pre_bb3_nsjail_state_refused_with_recreate_hint(tmp_path, monkeypatch, capsys, in_root):
     """BB14: state.json from before bind_mounts/ssh were persisted can't be
@@ -141,59 +111,79 @@ def test_pre_bb3_nsjail_state_refused_with_recreate_hint(tmp_path, monkeypatch, 
     assert "Recreate it" in err and f"warren destroy {workspace_id}" in err
 
 
-# --- R3 (2026-10-17): the fix above (finding #1) was undone for every
-# workspace provisioned BEFORE it shipped -- those still had only the
-# sandbox-writable in-root copy, and the old fallback trusted it silently.
-# These tests cover the migration that replaces that silent fallback. --------
+# --- Legacy in-root state (pre finding #1) is sandbox-writable: it is
+# refused, never migrated into the trusted state dir. ------------------------
 
 
-def test_legacy_seatbelt_state_migrated_out_of_root(tmp_path, monkeypatch):
+@pytest.mark.parametrize("runtime", ["seatbelt", "bwrap", "nsjail"])
+def test_legacy_in_root_state_is_refused_not_promoted(tmp_path, monkeypatch, capsys, runtime):
+    import typer
+
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     workspace_id = "dddddddd-1111-2222-3333-444444444444"
     ws_dir = _seed_workspace(tmp_path, workspace_id)
-    (ws_dir / "sandbox.sb").write_text("(version 1)\n(deny default)\n")
-    (ws_dir / "state.json").write_text(json.dumps({
-        "workspace_id": workspace_id,
-        "project": "proj",
-        "intent": "claude",
-        "app": "claude",
-        "root_path": str(ws_dir),
-        "env_snapshot": {},
-    }))
+    payload = {
+        "workspace_id": workspace_id, "project": "proj", "intent": "claude",
+        "app": "claude", "root_path": str(ws_dir), "env_snapshot": {},
+        "bind_mounts": [["/", "host", "rw"]], "ssh_key_paths": [], "ssh_agent_sock": None,
+    }
+    if runtime == "seatbelt":
+        (ws_dir / "sandbox.sb").write_text("(version 1)\n(allow default)\n")
+    if runtime == "nsjail":
+        payload["runtime_type"] = "nsjail"
+    (ws_dir / "state.json").write_text(json.dumps(payload))
 
-    state = _load_workspace_state(workspace_id)
+    with pytest.raises(typer.Exit):
+        _load_workspace_state(workspace_id)
 
-    state_dir = tmp_path / ".warren" / "state" / workspace_id
-    assert state["runtime_type"] == "seatbelt"
-    assert state["profile_path"] == str(state_dir / "sandbox.sb")
-    # The legacy in-root copies are gone -- a sandboxed process can no longer
-    # influence what gets trusted on a LATER connect by rewriting them.
-    assert not (ws_dir / "sandbox.sb").exists()
-    assert not (ws_dir / "state.json").exists()
-    assert (state_dir / "sandbox.sb").is_file()
-    assert (state_dir / "state.json").is_file()
+    err = " ".join(capsys.readouterr().err.split())
+    assert f"warren destroy {workspace_id}" in err
+    assert not (tmp_path / ".warren" / "state" / workspace_id).exists()
+    assert (ws_dir / "state.json").is_file()
 
 
-def test_legacy_bwrap_state_migrated_out_of_root(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "bad_id", ["/etc", "../../victim", "a/b", "..", ".", "", "~", "-rf", "x\\y"]
+)
+def test_path_like_workspace_id_refused(tmp_path, monkeypatch, bad_id):
+    import typer
+
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    workspace_id = "eeeeeeee-1111-2222-3333-444444444444"
+    _seed_workspace(tmp_path, "aaaaaaaa-1111-2222-3333-444444444444")
+    with pytest.raises(typer.Exit):
+        _load_workspace_state(bad_id)
+
+
+@posix_exec_only
+def test_symlinked_workspace_dir_refused(tmp_path, monkeypatch):
+    import typer
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "state.json").write_text(json.dumps({"container_id": "x"}))
+    root = tmp_path / ".warren" / "workspaces"
+    root.mkdir(parents=True)
+    (root / "aaaaaaaa-1111-2222-3333-444444444444").symlink_to(victim)
+    for wid in ("aaaaaaaa-1111-2222-3333-444444444444", "aaaa"):
+        with pytest.raises(typer.Exit):
+            _load_workspace_state(wid)
+
+
+@posix_exec_only
+def test_symlinked_state_dir_refused(tmp_path, monkeypatch):
+    import typer
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    workspace_id = "bbbbbbbb-1111-2222-3333-444444444444"
     ws_dir = _seed_workspace(tmp_path, workspace_id)
-    (ws_dir / "state.json").write_text(json.dumps({
-        "workspace_id": workspace_id,
-        "project": "proj",
-        "intent": "claude",
-        "app": "claude",
-        "root_path": str(ws_dir),
-        "env_snapshot": {},
-    }))
-
-    state = _load_workspace_state(workspace_id)
-
-    state_dir = tmp_path / ".warren" / "state" / workspace_id
-    assert state["runtime_type"] == "bwrap"
-    assert state["bwrap_state_dir"] == str(state_dir)
-    assert not (ws_dir / "state.json").exists()
-    assert (state_dir / "state.json").is_file()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "state.json").write_text(json.dumps({"root_path": str(ws_dir)}))
+    (tmp_path / ".warren" / "state").mkdir(parents=True)
+    (tmp_path / ".warren" / "state" / workspace_id).symlink_to(elsewhere)
+    with pytest.raises(typer.Exit):
+        _load_workspace_state(workspace_id)
 
 
 def test_docker_state_not_migrated_stays_in_root(tmp_path, monkeypatch):

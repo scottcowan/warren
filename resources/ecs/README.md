@@ -193,6 +193,13 @@ process running in AWS at all.
 `aws ecs run-task --enable-execute-command` step — not an `aws_ecs_service`, ALB, NLB, or
 API Gateway.
 
+warren-server listens on `127.0.0.1:8420` inside the task by default, so the API is not
+reachable from the VPC at all. The CLI reaches it with an SSM `AWS-StartPortForwardingSession`
+to the task, which connects to the task's own loopback. Don't set `WARREN_HOST` here unless you
+put something in front of the task (a load balancer, a VPC peer), and then pair it with
+`WARREN_TLS_CERTFILE`/`WARREN_TLS_KEYFILE`
+([Listening address](../../packages/warren-server/README.md#listening-address)).
+
 ## Setup Instructions
 
 ### Option 1: setup.sh

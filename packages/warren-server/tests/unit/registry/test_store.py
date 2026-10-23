@@ -396,3 +396,53 @@ async def test_open_db_scrub_is_noop_for_rows_without_env(sqlite_path: str):
     finally:
         await store2.close()
 
+
+
+def _insert_kwargs(i: int, owner: str) -> dict:
+    return dict(
+        workspace_id=f"ws-{owner}-{i}",
+        project="p",
+        intent="i",
+        image="img",
+        root_path="",
+        server_instance="s1",
+        status="provisioning",
+        owner_id=owner,
+    )
+
+
+async def test_insert_caps_are_atomic_under_concurrency(sqlite_path: str):
+    """Finding 11: list-then-insert let concurrent creates overshoot max_workspaces."""
+    import asyncio
+
+    from warren.registry.store import CapacityExhausted
+
+    store = await WorkspaceStore.open(sqlite_path)
+    results = await asyncio.gather(
+        *(store.insert(**_insert_kwargs(i, "alice"), max_total=6, max_per_owner=3) for i in range(12)),
+        *(store.insert(**_insert_kwargs(i, "bob"), max_total=6, max_per_owner=6) for i in range(12)),
+        return_exceptions=True,
+    )
+    errors = [r for r in results if isinstance(r, BaseException)]
+    assert all(isinstance(e, CapacityExhausted) for e in errors)
+    rows = await store.list_non_terminal()
+    assert len(rows) == 6
+    assert len([w for w in rows if w.owner_id == "alice"]) <= 3
+    await store.close()
+
+
+async def test_insert_cap_scope_and_terminal_rows(sqlite_path: str):
+    from warren.registry.store import CapacityExhausted
+
+    store = await WorkspaceStore.open(sqlite_path)
+    await store.insert(**_insert_kwargs(0, "alice"), max_total=2, max_per_owner=1)
+    with pytest.raises(CapacityExhausted) as owner_exc:
+        await store.insert(**_insert_kwargs(1, "alice"), max_total=2, max_per_owner=1)
+    assert owner_exc.value.scope == "owner"
+    await store.insert(**_insert_kwargs(0, "bob"), max_total=2, max_per_owner=1)
+    with pytest.raises(CapacityExhausted) as server_exc:
+        await store.insert(**_insert_kwargs(0, "carol"), max_total=2, max_per_owner=1)
+    assert server_exc.value.scope == "server"
+    await store.update_status("ws-alice-0", "destroyed")
+    await store.insert(**_insert_kwargs(2, "alice"), max_total=2, max_per_owner=1)
+    await store.close()

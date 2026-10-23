@@ -134,7 +134,31 @@ def main() -> None:
         exit_code = asyncio.run(_recover_admin(args.username, args.reenable))
         raise SystemExit(exit_code)
 
-    uvicorn.run("warren.app:app", host="0.0.0.0", port=8420, log_level="info")
+    uvicorn.run("warren.app:app", log_level="info", **_listen_kwargs())
+
+
+def _listen_kwargs() -> dict:
+    from pydantic import ValidationError
+
+    from warren.config import BindSettings
+
+    try:
+        bind = BindSettings()
+    except ValidationError as exc:
+        print(f"error: {exc.errors()[0]['msg']}", file=sys.stderr)
+        raise SystemExit(2) from None
+    if not bind.is_loopback and not bind.tls_enabled:
+        log.warning(
+            "insecure_http_listener",
+            host=bind.host,
+            port=bind.port,
+            detail="serving cleartext HTTP on a non-loopback address (WARREN_ALLOW_INSECURE_HTTP=1); "
+            "bearer tokens are exposed to anything that can reach this port",
+        )
+    kwargs: dict = {"host": bind.host, "port": bind.port}
+    if bind.tls_enabled:
+        kwargs |= {"ssl_certfile": str(bind.tls_certfile), "ssl_keyfile": str(bind.tls_keyfile)}
+    return kwargs
 
 
 if __name__ == "__main__":

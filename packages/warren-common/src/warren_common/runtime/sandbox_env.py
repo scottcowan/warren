@@ -111,6 +111,14 @@ def state_root() -> Path:
     return Path(override) if override else Path.home() / ".warren" / "state"
 
 
+def workspace_state_dir(workspace_id: str) -> Path:
+    """``state_root()/<workspace_id>``, refusing any id that is not a single
+    safe path component."""
+    from warren_common.paths import validate_workspace_id  # noqa: PLC0415
+
+    return state_root() / validate_workspace_id(workspace_id)
+
+
 def nsjail_secret_env_path(workspace_id: str) -> Path:
     """Deterministic host path for a workspace's ephemeral secrets env file.
 
@@ -123,7 +131,7 @@ def nsjail_secret_env_path(workspace_id: str) -> Path:
     secrets file is never itself visible from inside the sandbox via any
     mount other than the single explicit `ENV_MOUNT_DEST` one.
     """
-    return state_root() / workspace_id / "warren-env.sh"
+    return workspace_state_dir(workspace_id) / "warren-env.sh"
 
 
 def write_secret_env_file(env: dict[str, str], directory: Path) -> Path:

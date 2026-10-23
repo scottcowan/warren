@@ -21,7 +21,6 @@ from podman.errors import APIError, BuildError, ImageNotFound, NotFound
 from podman.errors.exceptions import PodmanError
 
 from warren.images.build_spec import BuildSpec
-from warren.network.egress import EgressUnavailable, ensure_bridge_network
 from warren_common.errors import ImageUnavailable, RuntimeUnreachable
 from warren_common.agent_launch import SPEC_ENV as AGENT_SPEC_ENV
 from warren_common.harness_shell import seed_env, server_env, shell_first, workspace_shell
@@ -44,6 +43,13 @@ _WARREN_LABEL_WORKSPACE_ID = "warren.workspace_id"
 _WARREN_LABEL_SERVER_INSTANCE = "warren.server_instance"
 _WARREN_LABEL_PROJECT = "warren.project"
 _WARREN_LABEL_INTENT = "warren.intent"
+_WARREN_LABEL_NETWORK = "warren.network"
+
+# Netavark (and CNI, via ingressPolicy) drops forwarded traffic between two
+# networks that both carry `isolate`; "strict" (netavark >= 1.7) also drops
+# traffic to non-isolated networks. Either keeps one workspace's bridge from
+# reaching another's.
+_ISOLATE_VALUES = ("true", "strict")
 
 # Injection target for the minted SSH public key (D-01/D-02). Root-owned,
 # pre-created by the reference workspace image's Containerfile (plan 03-02) —
@@ -140,12 +146,9 @@ class PodmanRuntime:
         self._client = PodmanClient(
             base_url=f"unix://{self._socket_path}", timeout=client_timeout
         )
-        # D-04: default matches WarrenSettings.egress_bridge_name so a bare
-        # PodmanRuntime(...) already lands on the shared bridge. Plan 04-05
-        # threads egress_bridge_name=settings.egress_bridge_name through at
-        # construction in app.py — this plan does not touch app.py.
+        # D-04: prefix of each workspace's own bridge network (Finding 9);
+        # app.py threads settings.egress_bridge_name through. "" = pasta default.
         self._egress_bridge_name = egress_bridge_name
-        self._bridge_ensured = False
 
     # --- ContainerRuntime Protocol surface ---
 
@@ -252,26 +255,29 @@ class PodmanRuntime:
             ports={"22/tcp": ssh_port}
             create_kwargs["ports"] = ports
 
-        # D-04: attach every workspace to ONE SHARED rootless netavark bridge,
-        # never a per-workspace bridge and never network_mode="none". Rootless
-        # Podman's default network mode is `pasta`, which has no veth pair and
-        # therefore no host-readable byte counters — every workspace would
-        # read as permanently idle to LIFE-01's reaper (04-RESEARCH.md
-        # Pitfall 1). `network_mode="none"` is rejected for the same reason.
-        # Per D-05, egress traffic is never touched, shaped, or gated by this
-        # bridge in any way — it exists solely so per-container tx_bytes are
-        # observable; egress remains fully open (LIFE-02 is monitoring-only
-        # this phase).
+        # D-04: rootless `pasta` has no veth pair and so no host-readable byte
+        # counters (04-RESEARCH.md Pitfall 1), so every workspace is attached to
+        # a netavark bridge for LIFE-02's egress counting. Finding 9: one bridge
+        # PER WORKSPACE, created with `isolate`, so a workspace can't reach any
+        # other workspace's ports. Outbound traffic still NATs out through the
+        # bridge as before (D-05: observed, never blocked). SSH is a
+        # host-published port and the control plane reaches the container
+        # through the Podman API (exec/put_archive/logs), so neither needs a
+        # network shared between workspaces.
+        network_name = ""
         if self._egress_bridge_name:
-            if not self._bridge_ensured:
-                try:
-                    await asyncio.to_thread(
-                        ensure_bridge_network, self._egress_bridge_name
-                    )
-                except EgressUnavailable as e:
-                    raise RuntimeUnreachable(str(e)) from e
-                self._bridge_ensured = True
-            create_kwargs["networks"] = {self._egress_bridge_name: {}}
+            network_name = self._workspace_network_name(spec.workspace_id)
+            await asyncio.to_thread(
+                _ensure_workspace_network,
+                self._client,
+                network_name,
+                {
+                    _WARREN_LABEL_WORKSPACE_ID: spec.workspace_id,
+                    _WARREN_LABEL_SERVER_INSTANCE: self._server_id,
+                    _WARREN_LABEL_NETWORK: "workspace",
+                },
+            )
+            create_kwargs["networks"] = {network_name: {}}
             # podman-py only populates the create payload's `netns` field when
             # `network_mode` is explicitly passed (see containers_create.py's
             # `network_mode in args` check) -- omitting it leaves the
@@ -289,8 +295,10 @@ class PodmanRuntime:
                 **create_kwargs,
             )
         except ImageNotFound as e:
+            await self._remove_network_quietly(network_name)
             raise ImageUnavailable(str(e)) from e
         except (APIError, PodmanError, ConnectionError) as e:
+            await self._remove_network_quietly(network_name)
             raise RuntimeUnreachable(str(e)) from e
 
         # Inject the minted public key BEFORE start() so sshd never runs a
@@ -433,13 +441,52 @@ class PodmanRuntime:
         await asyncio.to_thread(container.stop, timeout=5)
 
     async def destroy(self, handle: WorkspaceHandle) -> None:
-        try:
-            container = await asyncio.to_thread(self._client.containers.get, handle.runtime_id)
-        except NotFound:
+        container = None
+        if handle.runtime_id:
+            try:
+                container = await asyncio.to_thread(self._client.containers.get, handle.runtime_id)
+            except NotFound:
+                container = None
+        if container is not None:
+            # D-03: wipe authorized_keys even if container removal later fails.
+            await self._wipe_authorized_keys(container, handle.workspace_id)
+            await asyncio.to_thread(container.remove, force=True)
+        if self._egress_bridge_name and handle.workspace_id:
+            await self._remove_network_quietly(self._workspace_network_name(handle.workspace_id))
+
+    def _workspace_network_name(self, workspace_id: str) -> str:
+        return f"{self._egress_bridge_name}-{workspace_id}"
+
+    async def _remove_network_quietly(self, name: str) -> None:
+        if not name:
             return
-        # D-03: wipe authorized_keys even if container removal later fails.
-        await self._wipe_authorized_keys(container, handle.workspace_id)
-        await asyncio.to_thread(container.remove, force=True)
+        try:
+            await asyncio.to_thread(self._client.networks.remove, name)
+        except NotFound:
+            pass
+        except (APIError, PodmanError, ConnectionError):
+            log.warning("workspace_network_remove_failed", network=name)
+
+    async def prune_workspace_networks(self, server_id: str, keep_workspace_ids: set[str]) -> None:
+        """Remove this server's per-workspace networks whose workspace is gone (reconcile).
+
+        Labels are the trust anchor, as for containers, and are matched client-side for
+        the same reason as `list_by_server`. A network still in use fails removal and stays."""
+        try:
+            networks = await asyncio.to_thread(self._client.networks.list)
+        except (APIError, PodmanError, ConnectionError):
+            log.warning("workspace_network_list_failed")
+            return
+        for net in networks:
+            labels = (net.attrs.get("labels") or {}) if isinstance(net.attrs, dict) else {}
+            if labels.get(_WARREN_LABEL_NETWORK) != "workspace":
+                continue
+            if labels.get(_WARREN_LABEL_SERVER_INSTANCE) != server_id:
+                continue
+            if labels.get(_WARREN_LABEL_WORKSPACE_ID) in keep_workspace_ids:
+                continue
+            log.warning("orphan workspace network", network=net.name)
+            await self._remove_network_quietly(net.name)
 
     async def exec(self, handle: WorkspaceHandle, cmd: list[str]) -> AsyncIterator[bytes]:
         raise NotImplementedError("exec lands in Phase 3/4 with the sidecar")
@@ -637,6 +684,39 @@ class PodmanRuntime:
                 if line.strip():
                     await event_buffer.push(line.decode(errors="replace"))
         await reader_future
+
+
+def _ensure_workspace_network(client: Any, name: str, labels: dict[str, str]) -> None:
+    """Create (or adopt) a workspace's isolated bridge network; fail closed otherwise.
+
+    An existing network of that name is reused only when it carries this server's label
+    and `isolate` -- attaching a workspace to a non-isolated network would reopen the
+    east-west path the per-workspace network exists to close."""
+    try:
+        try:
+            network = client.networks.get(name)
+        except NotFound:
+            try:
+                client.networks.create(
+                    name, driver="bridge", labels=labels, options={"isolate": "true"}
+                )
+                return
+            except APIError as e:
+                if "exist" not in str(e).lower():
+                    raise
+                network = client.networks.get(name)
+    except (APIError, PodmanError, ConnectionError) as e:
+        raise RuntimeUnreachable(f"failed to create workspace network {name!r}: {e}") from e
+    attrs = network.attrs if isinstance(network.attrs, dict) else {}
+    options = attrs.get("options") or {}
+    existing_labels = attrs.get("labels") or {}
+    if (
+        str(options.get("isolate", "")).lower() not in _ISOLATE_VALUES
+        or existing_labels.get(_WARREN_LABEL_SERVER_INSTANCE) != labels[_WARREN_LABEL_SERVER_INSTANCE]
+    ):
+        raise RuntimeUnreachable(
+            f"network {name!r} exists but is not an isolated warren workspace network for this server"
+        )
 
 
 async def run_preflight(socket_path: str | Path) -> None:

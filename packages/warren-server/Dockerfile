@@ -59,5 +59,8 @@ RUN useradd -u 1000 -m warren
 USER warren
 WORKDIR /var/lib/warren
 VOLUME /var/lib/warren
+# Listens on 127.0.0.1 by default (ECS reaches it via SSM port-forward to the task's
+# loopback). Publishing with `-p` needs WARREN_HOST=0.0.0.0 plus TLS or
+# WARREN_ALLOW_INSECURE_HTTP=1 -- see the package README's "Listening address".
 EXPOSE 8420
 CMD ["python", "-m", "warren"]
