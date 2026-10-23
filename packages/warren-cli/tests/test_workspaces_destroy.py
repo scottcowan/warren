@@ -200,3 +200,69 @@ def test_list_merged_offers_destroy_on_tty(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(main, "workspaces_destroy", lambda **kw: destroyed.append(kw["workspace_id"]))
     main._list_merged(None, output_json=False)
     assert destroyed == [wid]
+
+
+def _isolated(tmp_path: Path, monkeypatch) -> Path:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.delenv("REAL_HOME", raising=False)
+    monkeypatch.delenv("WARREN_PROJECT", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    (home / ".warren" / "workspaces" / "aaaaaaaa-1111-2222-3333-444444444444").mkdir(parents=True)
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "keep.txt").write_text("keep")
+    return victim
+
+
+@pytest.mark.parametrize(
+    "make_id",
+    [
+        lambda victim: str(victim),
+        lambda victim: "../../../victim",
+        lambda victim: "aaaaaaaa-1111-2222-3333-444444444444/../../../../victim",
+        lambda victim: "..",
+        lambda victim: ".",
+    ],
+)
+def test_destroy_refuses_path_like_workspace_ids(tmp_path: Path, monkeypatch, make_id):
+    victim = _isolated(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["destroy", "--", make_id(victim)], input="y\n")
+    assert result.exit_code != 0
+    assert (victim / "keep.txt").exists()
+    assert (tmp_path / "home" / ".warren" / "workspaces").is_dir()
+
+
+@posix_only
+def test_destroy_refuses_symlinked_workspace_dir(tmp_path: Path, monkeypatch):
+    victim = _isolated(tmp_path, monkeypatch)
+    link = tmp_path / "home" / ".warren" / "workspaces" / "bbbbbbbb-1111-2222-3333-444444444444"
+    link.symlink_to(victim)
+    for wid in (link.name, "bbbb"):
+        result = runner.invoke(app, ["destroy", "--", wid], input="y\n")
+        assert result.exit_code != 0
+    assert (victim / "keep.txt").exists()
+
+
+@posix_only
+def test_destroy_refuses_symlinked_state_dir(tmp_path: Path, monkeypatch):
+    victim = _isolated(tmp_path, monkeypatch)
+    wid = "aaaaaaaa-1111-2222-3333-444444444444"
+    state = tmp_path / "home" / ".warren" / "state"
+    state.mkdir(parents=True)
+    (state / wid).symlink_to(victim)
+    result = runner.invoke(app, ["destroy", "--", wid], input="y\n")
+    assert result.exit_code != 0
+    assert (victim / "keep.txt").exists()
+    assert (tmp_path / "home" / ".warren" / "workspaces" / wid).is_dir()
+
+
+def test_destroy_valid_id_still_removes_workspace(tmp_path: Path, monkeypatch):
+    victim = _isolated(tmp_path, monkeypatch)
+    wid = "aaaaaaaa-1111-2222-3333-444444444444"
+    result = runner.invoke(app, ["destroy", "--", "aaaa"], input="y\n")
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / "home" / ".warren" / "workspaces" / wid).exists()
+    assert (victim / "keep.txt").exists()

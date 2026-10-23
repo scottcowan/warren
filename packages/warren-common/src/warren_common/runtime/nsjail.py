@@ -34,7 +34,7 @@ from warren_common.runtime.sandbox_env import (
     ENV_MOUNT_DEST,
     ENV_SOURCE_SCRIPT,
     nsjail_secret_env_path,
-    state_root,
+    workspace_state_dir,
 )
 
 log = structlog.get_logger(__name__)
@@ -51,7 +51,7 @@ def _state_dir_for(workspace_id: str) -> Path:
     connect`. `nsjail.cfg` lives here too (BB3) and is regenerated from
     state.json before every use, never trusted as a file on disk.
     """
-    return state_root() / workspace_id
+    return workspace_state_dir(workspace_id)
 
 
 def _spec_from_state(state: dict, workspace_id: str, default_root: str) -> WorkspaceSpec:
@@ -92,8 +92,15 @@ def check_nsjail_state(state: dict, workspace_id: str) -> None:
 def write_nsjail_cfg(state_dir: Path | str, workspace_id: str, default_root: str = "") -> Path:
     """Regenerate `<state_dir>/nsjail.cfg` from `<state_dir>/state.json` and
     return its path. Call before every nsjail invocation."""
-    state_dir = Path(state_dir)
+    from warren_common.paths import PathEscapeError, ensure_private_dir  # noqa: PLC0415
+
+    try:
+        state_dir = ensure_private_dir(state_dir)
+    except PathEscapeError as e:
+        raise WorkspaceNeedsRecreate(f"refusing nsjail state dir: {e}") from e
     state_path = state_dir / "state.json"
+    if state_path.is_symlink():
+        raise WorkspaceNeedsRecreate(f"refusing symlinked nsjail state file {state_path}")
     state = json.loads(state_path.read_text()) if state_path.is_file() else {}
     check_nsjail_state(state, workspace_id)
     spec = _spec_from_state(state, workspace_id, default_root)
