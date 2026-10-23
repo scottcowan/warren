@@ -1222,17 +1222,32 @@ WARREN_EFS_ID=$(aws efs describe-file-systems \
   --query "FileSystems[?Tags[?Key=='Name' && Value=='$EFS_NAME']].FileSystemId | [0]" \
   --output text 2>/dev/null || echo "None")
 
+# Audit #15: always encrypted at rest. WARREN_EFS_KMS_KEY_ID (optional) picks a
+# customer-managed key; unset uses aws/elasticfilesystem. Mirrors terraform's
+# var.efs_kms_key_arn / CDK's efs_kms_key_arn.
+EFS_ENCRYPTION_ARGS=(--encrypted)
+if [[ -n "${WARREN_EFS_KMS_KEY_ID:-}" ]]; then
+  EFS_ENCRYPTION_ARGS+=(--kms-key-id "$WARREN_EFS_KMS_KEY_ID")
+fi
+
 if [[ "$WARREN_EFS_ID" == "None" || -z "$WARREN_EFS_ID" ]]; then
-  echo "Creating EFS file system '$EFS_NAME'..."
+  echo "Creating encrypted EFS file system '$EFS_NAME'..."
   WARREN_EFS_ID=$(aws efs create-file-system \
     --performance-mode generalPurpose \
     --throughput-mode bursting \
+    "${EFS_ENCRYPTION_ARGS[@]}" \
     --tags Key=Name,Value="$EFS_NAME" Key=warren,Value=true Key=warren-env,Value="$ENV" \
     --query "FileSystemId" \
     --output text)
   echo "EFS file system $WARREN_EFS_ID created."
 else
   echo "EFS file system '$EFS_NAME' already exists ($WARREN_EFS_ID). Skipping."
+  EFS_ENCRYPTED=$(aws efs describe-file-systems --file-system-id "$WARREN_EFS_ID" \
+    --query "FileSystems[0].Encrypted" --output text)
+  if [[ "$EFS_ENCRYPTED" != "True" ]]; then
+    echo "WARNING: $WARREN_EFS_ID is NOT encrypted at rest. Encryption cannot be enabled" >&2
+    echo "  on an existing filesystem; migrate per resources/ecs/README.md (EFS encryption)." >&2
+  fi
 fi
 
 # finding #20: no filesystem resource policy existed here at all. Without it, any
@@ -1508,6 +1523,9 @@ echo "    Secrets Manager) via the task definition's 'secrets' block — never a
 echo "    plaintext env override on a run-task call (finding #19b)."
 echo "  - Running as a long-lived ECS service (desired_count=1), not a one-off"
 echo "    'run-task', so it restarts automatically after a crash (finding #19c)."
+echo "  - That service deploying stop-before-start (audit #10): it is a single SQLite"
+echo "    writer on EFS, so create it with"
+echo "    --deployment-configuration minimumHealthyPercent=0,maximumPercent=100"
 echo "  - WARREN_AWS_TRUSTED_ASSUMED_ROLE_PATTERNS if operators authenticate via IAM"
 echo "    Identity Center assumed roles — empty by default, which rejects every such"
 echo "    caller with 401 (finding #18). Must be a JSON array of complete regexes"

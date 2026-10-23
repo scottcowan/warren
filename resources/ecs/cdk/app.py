@@ -21,6 +21,8 @@ Context variables (pass via --context or cdk.json):
                                                    runs with (WARREN_ECS_RESOURCE_PREFIX)
     kms_key_id              str  (default: "")    KMS key ID/ARN for SSM SecureString encryption
                                                    (WARREN_KMS_KEY_ID); empty uses the AWS-managed key
+    efs_kms_key_arn         str  (default: "")    KMS key ARN for EFS encryption at rest (always
+                                                   on); empty uses aws/elasticfilesystem
     assign_public_ip        bool (default: false) Assign a public IP to the control-plane service.
                                                    Only meaningful when create_vpc=false; ignored
                                                    (always disabled) when create_vpc=true
@@ -72,6 +74,7 @@ control_plane_image_uri = app.node.try_get_context("control_plane_image_uri") or
 env_suffix = app.node.try_get_context("env_suffix") or "prod"
 ecs_resource_prefix = app.node.try_get_context("ecs_resource_prefix") or "warren"
 kms_key_id = app.node.try_get_context("kms_key_id") or ""
+efs_kms_key_arn = app.node.try_get_context("efs_kms_key_arn") or ""
 
 assign_public_ip_raw = app.node.try_get_context("assign_public_ip")
 if assign_public_ip_raw is None:
@@ -112,6 +115,7 @@ WarrenECSStack(
     env_suffix=env_suffix,
     ecs_resource_prefix=ecs_resource_prefix,
     kms_key_id=kms_key_id,
+    efs_kms_key_arn=efs_kms_key_arn,
     assign_public_ip=assign_public_ip,
     exec_owner_principal_tag=exec_owner_principal_tag,
     break_glass_principal_arns=break_glass_principal_arns,

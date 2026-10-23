@@ -104,6 +104,14 @@ variable "kms_key_id" {
   default     = ""
 }
 
+# Audit #15: EFS is always encrypted at rest; this only picks the key. Must be a key
+# ARN (aws_efs_file_system.kms_key_id requires an ARN). Empty means aws/elasticfilesystem.
+variable "efs_kms_key_arn" {
+  description = "KMS key ARN for EFS encryption at rest. Empty (default) uses the AWS-managed aws/elasticfilesystem key."
+  type        = string
+  default     = ""
+}
+
 # finding #18: threaded into the control-plane task's WARREN_AWS_TRUSTED_ASSUMED_ROLE_PATTERNS
 # env var — see aws_ecs_task_definition.warren_server below. Must be a JSON array of
 # *complete* regex patterns (config.py's parsing matches with re.fullmatch, not a prefix

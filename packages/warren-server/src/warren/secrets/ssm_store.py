@@ -33,10 +33,14 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import structlog
+
 # Reuse the existing names-only SSM fetch rather than re-implementing its
 # pagination loop -- it's private to runtime/ecs.py by convention, not by any
 # real module boundary; both modules are warren-server-internal.
 from warren.runtime.ecs import _fetch_ssm_parameter_names
+
+log = structlog.get_logger(__name__)
 
 
 def _param_path(resource_prefix: str, server_id: str, owner_id: str, name: str) -> str:
@@ -93,3 +97,67 @@ async def list_secrets_for_owner(
     path = f"/{resource_prefix}/{server_id}/{owner_id}/"
     names = await asyncio.to_thread(_fetch_ssm_parameter_names, ssm, path)
     return [{"name": leaf} for leaf in names]
+
+
+async def reconcile_mirror(
+    ssm: Any,
+    db: Any,
+    cipher: Any,
+    resource_prefix: str,
+    server_id: str,
+    kms_key_id: str = "",
+) -> dict[str, int]:
+    """Audit #13: converge this server's SSM mirror onto the local store (the
+    source of truth) after a crash between the mirror write and the local write.
+    Deletes parameters with no local row and re-puts local secrets with no
+    parameter. A crash mid-overwrite (both sides present, values differ) is not
+    detectable here without decrypting SSM values, which this role deliberately
+    cannot do; it heals on the next write of that secret."""
+    from warren.secrets import store as local_store
+
+    for part in (resource_prefix, server_id):
+        if not part or not part.strip() or "/" in part or part != part.strip():
+            # An empty or slash-bearing segment would widen the listing (and the
+            # orphan delete) beyond this server's own /{prefix}/{server_id}/ subtree.
+            log.error(
+                "secret_ssm_reconcile_refused_unsafe_scope",
+                resource_prefix=resource_prefix,
+                server_id=server_id,
+            )
+            return {"deleted": 0, "restored": 0}
+
+    root = f"/{resource_prefix}/{server_id}/"
+    mirrored = set(await asyncio.to_thread(_fetch_ssm_parameter_names, ssm, root))
+    local = {
+        f"{owner_id}/{name}": (owner_id, name)
+        for owner_id, name in await local_store.list_all_secret_keys(db)
+    }
+
+    orphans = sorted(mirrored - local.keys())
+    if orphans and not local:
+        # An empty local store next to a populated mirror looks like a lost or
+        # misplaced data dir, not a crash: refuse to wipe every owner's secrets.
+        log.error("secret_ssm_reconcile_skipped_empty_local_store", orphans=len(orphans))
+        orphans = []
+
+    deleted = 0
+    for key in orphans:
+        owner_id, _, name = key.partition("/")
+        if not name:
+            continue
+        await delete_secret(ssm, resource_prefix, server_id, owner_id, name)
+        log.warning("secret_ssm_orphan_deleted", owner_id=owner_id, name=name)
+        deleted += 1
+
+    restored = 0
+    for key in sorted(local.keys() - mirrored):
+        owner_id, name = local[key]
+        values = await local_store.resolve_secrets_for_names(db, cipher, owner_id, [name])
+        if name not in values:
+            continue
+        await put_secret(
+            ssm, resource_prefix, server_id, owner_id, name, values[name], kms_key_id=kms_key_id
+        )
+        log.warning("secret_ssm_mirror_restored", owner_id=owner_id, name=name)
+        restored += 1
+    return {"deleted": deleted, "restored": restored}
