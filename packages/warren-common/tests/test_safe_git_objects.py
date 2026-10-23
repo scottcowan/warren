@@ -154,3 +154,50 @@ def test_readonly_result_voided_when_objects_swapped(tmp_path: Path):
         with readonly_shadow_git_dir(a / ".git", tmp_path / "shadow", work_tree=a) as sh:
             run_git("rev-parse", "HEAD", extra_env=sh.env(), isolated=True)
             _swap_objects(a, b)
+
+
+def _unlinkable_sources(monkeypatch) -> list[Path]:
+    """os.link fails for repo-side sources (as under protected_hardlinks) and
+    records every copy made instead."""
+    real_link, real_copy = os.link, safe_git._copy_fd
+    copies: list[Path] = []
+
+    def link(src, dst, *args, **kwargs):
+        if kwargs.get("src_dir_fd") is not None:
+            raise OSError(errno.EPERM, "protected_hardlinks")
+        return real_link(src, dst, *args, **kwargs)
+
+    def copy(fd, dst, **kwargs):
+        copies.append(Path(dst))
+        return real_copy(fd, dst, **kwargs)
+
+    monkeypatch.setattr(safe_git.os, "link", link)
+    monkeypatch.setattr(safe_git, "_copy_fd", copy)
+    return copies
+
+
+def test_unlinkable_objects_copied_once_then_reused(tmp_path: Path, monkeypatch):
+    a, a_sha = _repo(tmp_path / "a", "one\n")
+    shadow_root = tmp_path / "shadow"
+    copies = _unlinkable_sources(monkeypatch)
+    for _ in range(2):
+        with shadow_git_dir(a / ".git", shadow_root, [], work_tree=a) as sh:
+            assert run_git("rev-parse", "HEAD", extra_env=sh.env(), isolated=True).strip() == a_sha
+            run_git("cat-file", "-p", "HEAD:a.txt", extra_env=sh.env(), isolated=True)
+    first = len(copies)
+    assert first == 3  # blob, tree, commit
+    assert all(p.parent.parent == shadow_root / "object-cache" for p in copies)
+
+    loose = _loose(a / ".git", a_sha)
+    data = loose.read_bytes()
+    loose.chmod(0o644)
+    loose.write_bytes(data)  # same bytes, new ctime: never trusted from cache
+    os.unlink(_loose(a / ".git", _git("-C", str(a), "rev-parse", "HEAD:a.txt")))
+    with shadow_git_dir(a / ".git", shadow_root, []) as sh:
+        run_git("rev-parse", "HEAD", extra_env=sh.env(), isolated=True)
+    assert len(copies) == first + 1
+    (partition,) = (shadow_root / "object-cache").iterdir()
+    assert len(list(partition.iterdir())) == 2  # the removed blob's entry was pruned
+
+    safe_git.drop_object_cache(a / ".git", shadow_root)
+    assert not partition.exists()

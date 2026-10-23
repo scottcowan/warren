@@ -394,21 +394,94 @@ def _object_subdirs(objects_fd: int) -> list[str]:
     return names
 
 
-def _copy_at(src_dir_fd: int, name: str, dst: Path) -> None:
+def _copy_fd(fd: int, dst: Path, *, exclusive: bool = True) -> None:
+    os.lseek(fd, 0, os.SEEK_SET)
+    with os.fdopen(os.dup(fd), "rb") as src, open(dst, "xb" if exclusive else "wb") as out:
+        shutil.copyfileobj(src, out)
+
+
+class _ObjectCache:
+    """Warren-owned copies of one store's object files that can't be hard-linked
+    (another uid's file under protected_hardlinks, another filesystem), so each
+    is copied once rather than on every run. Keyed by inode, size, mtime and
+    ctime: ctime moves on any write, and the workspace can't set it."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.used: set[str] = set()
+
+    def place(self, fd: int, st: os.stat_result, dst: Path) -> None:
+        key = f"{st.st_ino}-{st.st_size}-{st.st_mtime_ns}-{st.st_ctime_ns}"
+        self.used.add(key)
+        cached = self.root / key
+        try:
+            os.link(cached, dst)
+            return
+        except FileNotFoundError:
+            pass
+        except OSError:
+            _copy_fd(fd, dst)
+            return
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp_fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=self.root)
+        os.close(tmp_fd)
+        try:
+            _copy_fd(fd, Path(tmp), exclusive=False)
+            os.replace(tmp, cached)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp)
+        try:
+            os.link(cached, dst)
+        except OSError:
+            _copy_fd(fd, dst)
+
+    def prune(self) -> None:
+        with contextlib.suppress(FileNotFoundError):
+            for name in os.listdir(self.root):
+                if name not in self.used and not name.startswith(".tmp-"):
+                    with contextlib.suppress(OSError):
+                        os.unlink(self.root / name)
+
+
+def _object_cache_dir(cache_root: Path, objects_st: os.stat_result) -> Path:
+    return cache_root / f"{objects_st.st_dev}-{objects_st.st_ino}"
+
+
+def drop_object_cache(git_dir: Path, shadow_root: Path) -> None:
+    """Remove the copy cache kept for `git_dir`'s object store, e.g. before the
+    repo is deleted."""
+    try:
+        st = os.lstat(git_dir / "objects")
+    except OSError:
+        return
+    if stat.S_ISDIR(st.st_mode):
+        shutil.rmtree(_object_cache_dir(shadow_root / "object-cache", st), ignore_errors=True)
+
+
+def _copy_at(src_dir_fd: int, name: str, dst: Path, cache: _ObjectCache | None) -> None:
     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=src_dir_fd)
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
             raise SafeGitError(f"object file {name} is not a regular file")
-        with os.fdopen(os.dup(fd), "rb") as src, open(dst, "xb") as out:
-            shutil.copyfileobj(src, out)
+        if cache is None:
+            _copy_fd(fd, dst)
+        else:
+            cache.place(fd, st, dst)
     finally:
         os.close(fd)
 
 
-def _link_objects(objects_fd: int, dst: Path) -> set[str]:
-    """Hard-link (copy where linking isn't allowed) the repo's own loose objects
-    and packs into warren-owned `dst`, never following a symlink, so host git
-    never resolves a path inside the workspace-writable object store."""
+def _link_objects(objects_fd: int, dst: Path, cache_root: Path | None = None) -> set[str]:
+    """Hard-link (copy where linking isn't allowed, via a per-store cache under
+    `cache_root`) the repo's own loose objects and packs into warren-owned
+    `dst`, never following a symlink, so host git never resolves a path inside
+    the workspace-writable object store."""
+    cache = (
+        _ObjectCache(_object_cache_dir(cache_root, os.fstat(objects_fd)))
+        if cache_root is not None else None
+    )
     linked: set[str] = set()
     for sub in _object_subdirs(objects_fd):
         sub_fd = os.open(sub, _NOFOLLOW_DIR, dir_fd=objects_fd)
@@ -426,13 +499,15 @@ def _link_objects(objects_fd: int, dst: Path) -> set[str]:
                 try:
                     os.link(name, target, src_dir_fd=sub_fd, follow_symlinks=False)
                 except OSError:
-                    _copy_at(sub_fd, name, target)
+                    _copy_at(sub_fd, name, target, cache)
                 else:
                     if not stat.S_ISREG(os.lstat(target).st_mode):
                         raise SafeGitError(f"objects/{sub}/{name} is not a regular file")
                 linked.add(os.path.join(sub, name))
         finally:
             os.close(sub_fd)
+    if cache is not None:
+        cache.prune()
     return linked
 
 
@@ -481,7 +556,7 @@ def linked_objects(git_dir: Path, shadow_root: Path) -> Iterator[Path]:
         try:
             objects_fd = os.open("objects", _NOFOLLOW_DIR, dir_fd=root_fd)
             try:
-                _link_objects(objects_fd, tmp)
+                _link_objects(objects_fd, tmp, shadow_root / "object-cache")
             finally:
                 os.close(objects_fd)
         finally:
@@ -557,7 +632,7 @@ def shadow_git_dir(
             dst.write_bytes(data)
         (shadow / "refs" / "heads").mkdir(parents=True, exist_ok=True)
         (shadow / "objects").mkdir()
-        linked = _link_objects(objects_fd, shadow / "objects")
+        linked = _link_objects(objects_fd, shadow / "objects", shadow_root / "object-cache")
         cfg = str(shadow / "config")
         base = [
             ("core.repositoryformatversion", "1" if fmt else "0"),

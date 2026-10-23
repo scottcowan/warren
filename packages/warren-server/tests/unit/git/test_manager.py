@@ -656,3 +656,70 @@ async def test_pull_timeout_kills_git_and_raises_git_pull_error(
     with pytest.raises(GitPullError, match=r"timed out after 0\.5s"):
         await mgr.pull("ws-slow")
     assert time.monotonic() - started < 10
+
+
+async def _root_and_folder(mgr: GitManager, source_repo: Path, ws: str) -> tuple[Path, Path]:
+    root = await mgr.clone(ws, _file_url(source_repo))
+    folder = await mgr.clone_into(mgr.folder_worktree_path(ws, "app"), _file_url(source_repo))
+    return root, folder
+
+
+async def test_folder_clone_not_reachable_through_root_clone(worktree_root, source_repo):
+    """The root clone is bind-mounted rw at /workspace; a folder clone inside
+    it could be renamed from the workspace while host git checks out into it."""
+    mgr = GitManager(worktree_root)
+    root, folder = await _root_and_folder(mgr, source_repo, "ws-layout")
+    assert folder == mgr.folders_root("ws-layout") / "app"
+    assert root not in folder.parents and folder != root
+    assert not (root / "app").exists()
+
+
+async def test_folder_swapped_from_workspace_mid_pull_gets_no_writes(
+    worktree_root, source_repo, tmp_path, monkeypatch
+):
+    """Everything the workspace can write (its root clone mount) is used to
+    swap the folder's directory for a symlink to a victim dir right before
+    the checkout; the pull's writes still land only in the real folder clone."""
+    mgr = GitManager(worktree_root)
+    root, folder = await _root_and_folder(mgr, source_repo, "ws-swap")
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    new_sha = _advance_upstream(source_repo)
+    real_run_git = manager_module.run_git
+
+    def swap_then_run(*args, **kwargs):
+        if args[0] == "merge":
+            planted = root / "app"
+            if planted.exists():
+                os.rename(planted, root / "app-moved")
+            planted.symlink_to(victim)
+        return real_run_git(*args, **kwargs)
+
+    monkeypatch.setattr(manager_module, "run_git", swap_then_run)
+
+    assert await mgr.pull_at(folder) == new_sha
+    assert (folder / "file2.txt").read_text() == "second file"
+    assert list(victim.iterdir()) == []
+
+
+async def test_legacy_nested_folder_migrated_on_provision_and_refused_for_pull(
+    worktree_root, source_repo
+):
+    mgr = GitManager(worktree_root)
+    root = await mgr.clone("ws-old", _file_url(source_repo))
+    legacy = root / "app"
+    Repo.clone_from(_file_url(source_repo), legacy)
+    (legacy / "wip.txt").write_text("local work")
+
+    assert mgr.folder_worktree_path("ws-old", "app") == legacy
+    with pytest.raises(GitPullError, match="re-provision"):
+        await mgr.pull_at(legacy)
+
+    moved = await mgr.clone_into(mgr.folder_worktree_path("ws-old", "app"), _file_url(source_repo))
+    assert moved == mgr.folders_root("ws-old") / "app"
+    assert (moved / "wip.txt").read_text() == "local work"
+    assert not os.path.lexists(legacy)
+    assert mgr.folder_worktree_path("ws-old", "app") == moved
+
+    await mgr.remove_worktree("ws-old")
+    assert not root.exists() and not mgr.folders_root("ws-old").exists()
