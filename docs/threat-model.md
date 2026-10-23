@@ -51,11 +51,13 @@ Warren's own processes are trusted: the CLI on the user's host, the control plan
 
 The orchestrator never dials the sidecar. All orchestrator→workspace traffic uses the
 runtime's own authenticated control channel: podman API exec or the ECS Exec relay,
-container logs, and host-side state files read without following links. The sidecar is an
-in-container helper on a root-only Unix socket. If the orchestrator needs structured data
-from inside a workspace, it runs a command through the control channel (which may talk to
-the local socket) and reads the output. No runtime has an inbound network listener on
-a workspace.
+container logs, and host-side state files read without following links. The sidecar is
+only an in-container agent-state recorder: it tails the tmux pane for the OSC 7501 status
+escape and writes `osc-state.json` under the harness root, and it has no socket or port.
+That file is agent-writable like the rest of the harness state, so the server parses it
+as untrusted (size-capped, no-follow read, schema-checked). If the orchestrator ever needs
+structured data from inside a workspace, it runs a command through the control channel
+and reads the output. No runtime has an inbound network listener on a workspace.
 
 ### ECS Fargate
 

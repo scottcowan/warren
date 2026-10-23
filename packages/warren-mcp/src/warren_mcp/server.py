@@ -111,8 +111,8 @@ def workspace_status(workspace_id: str, server: str) -> dict[str, Any]:
 @mcp.tool()
 def exec_command(workspace_id: str, command: list[str]) -> dict[str, Any]:
     """Run a command non-interactively inside an existing LOCAL workspace and
-    return its output. Not available for server-mode workspaces (no sidecar
-    exec channel yet) — use workspace_status against those instead.
+    return its output. For a server-mode workspace use the server's control-plane MCP
+    exec_command (or POST /workspaces/{id}/exec) instead.
 
     command: the argv to run, e.g. ["pytest", "packages/warren-server/tests/unit"].
     """

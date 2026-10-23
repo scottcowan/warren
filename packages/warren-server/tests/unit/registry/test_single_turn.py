@@ -208,7 +208,7 @@ async def test_list_non_terminal_carries_mode(sqlite_path):
 
 
 def _row(ws_id: str, mode: str):
-    handle = SimpleNamespace(workspace_id=ws_id, runtime_id=f"cid-{ws_id}", root_path="", sidecar_url="")
+    handle = SimpleNamespace(workspace_id=ws_id, runtime_id=f"cid-{ws_id}", root_path="")
     return SimpleNamespace(workspace_id=ws_id, handle=handle, mode=mode)
 
 

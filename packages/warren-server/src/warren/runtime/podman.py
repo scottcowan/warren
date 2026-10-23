@@ -26,13 +26,7 @@ from warren_common.agent_launch import SPEC_ENV as AGENT_SPEC_ENV
 from warren_common.harness_shell import seed_env, server_env, shell_first, workspace_shell
 from warren_common.models import template_env_for
 from warren_common.seed_prompt import app_command_with_seed
-from warren_common.runtime.base import (
-    SIDECAR_TOKEN_ENV,
-    ExecExit,
-    WorkspaceHandle,
-    WorkspaceSpec,
-    new_sidecar_token,
-)
+from warren_common.runtime.base import ExecExit, WorkspaceHandle, WorkspaceSpec
 
 if TYPE_CHECKING:
     from warren.registry.events import WorkspaceEventBuffer
@@ -206,7 +200,6 @@ class PodmanRuntime:
             # connect, same as the local workspace zshrc already gets from spec.env.
             "WARREN_PROJECT": spec.project,
             "WARREN_TEMPLATE": spec.intent,
-            SIDECAR_TOKEN_ENV: new_sidecar_token(),
         }
         if spec.model_access == "bedrock" and not (
             "AWS_ACCESS_KEY_ID" in env or "AWS_CONTAINER_CREDENTIALS_FULL_URI" in env
@@ -324,8 +317,6 @@ class PodmanRuntime:
             workspace_id=spec.workspace_id,
             runtime_id=container.id,
             root_path=spec.root_path,
-            sidecar_url="",
-            sidecar_socket_path="/tmp/warren-sidecar.sock",  # D-12: fixed path
         )
 
     async def start(self, handle: WorkspaceHandle) -> None:
@@ -554,7 +545,7 @@ class PodmanRuntime:
             await self._remove_network_quietly(net.name)
 
     async def exec(self, handle: WorkspaceHandle, cmd: list[str]) -> AsyncIterator[bytes]:
-        raise NotImplementedError("exec lands in Phase 3/4 with the sidecar")
+        raise NotImplementedError("use exec_stream")
 
     async def exec_stream(self, handle: WorkspaceHandle, argv: list[str]) -> AsyncIterator[bytes | ExecExit]:
         """#59: run argv in the container (no TTY, no stdin), yielding output chunks then ExecExit.

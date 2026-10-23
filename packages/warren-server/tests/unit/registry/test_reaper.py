@@ -21,7 +21,7 @@ def _ws(workspace_id: str, runtime_id: str = "cid-default"):
     # tests exercise the POLLING behavior, which only applies to a row that
     # already has a real container, hence the non-empty default here.
     handle = SimpleNamespace(
-        workspace_id=workspace_id, runtime_id=runtime_id, root_path="/tmp", sidecar_url=""
+        workspace_id=workspace_id, runtime_id=runtime_id, root_path="/tmp"
     )
     return SimpleNamespace(workspace_id=workspace_id, handle=handle)
 

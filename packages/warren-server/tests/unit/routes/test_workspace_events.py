@@ -153,11 +153,11 @@ def test_events_route_replays_completed_single_turn_after_destroy(env_defaults, 
 
 def test_events_route_200_streams_ndjson(env_defaults, auth_headers):
     """GET /workspaces/{id}/events returns 200 with application/x-ndjson and buffered lines."""
-    buf = _FiniteBuffer(['{"type":"sidecar_ready"}'])
+    buf = _FiniteBuffer(['{"type":"workspace_ready"}'])
     response = _get_events(auth_headers, _store_for(buf))
     assert response.status_code == 200
     assert "ndjson" in response.headers.get("content-type", "")
-    assert response.text == '{"type":"sidecar_ready"}\n'
+    assert response.text == '{"type":"workspace_ready"}\n'
     assert buf.calls == [{"since": None}]
 
 

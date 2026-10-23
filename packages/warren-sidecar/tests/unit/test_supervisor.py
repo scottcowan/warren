@@ -13,7 +13,6 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from warren_sidecar.events import EventBuffer
 from warren_sidecar.supervisor import WorkspaceAppSupervisor
 
 
@@ -57,8 +56,8 @@ async def test_start_waits_for_session_then_pipes_pane(monkeypatch, tmp_path):
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
 
-    buf = EventBuffer()
-    supervisor = WorkspaceAppSupervisor(event_buffer=buf, session="main")
+    seen: list[bytes] = []
+    supervisor = WorkspaceAppSupervisor(on_output=seen.append, session="main")
     await supervisor.start()
     await supervisor._reader_task
 
@@ -70,8 +69,7 @@ async def test_start_waits_for_session_then_pipes_pane(monkeypatch, tmp_path):
     # Never forks the actual app command -- only tmux/tail invocations happen.
     assert all(c[0] in ("tmux", "tail") for c in calls)
 
-    events = list(buf._events)
-    assert any(e["type"] == "output" and "hello from pane" in e["content"] for e in events)
+    assert seen == [b"hello from pane\n"]
 
     assert supervisor.active is True
 
@@ -100,8 +98,8 @@ async def test_stop_turns_off_pipe_pane_without_signaling_app(monkeypatch):
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
 
-    buf = EventBuffer()
-    supervisor = WorkspaceAppSupervisor(event_buffer=buf, session="main")
+    seen: list[bytes] = []
+    supervisor = WorkspaceAppSupervisor(on_output=seen.append, session="main")
     await supervisor.start()
     await supervisor.stop()
 
@@ -130,8 +128,8 @@ async def test_start_degrades_gracefully_when_no_session(monkeypatch):
     monkeypatch.setattr(supervisor_mod, "_SESSION_WAIT_RETRIES", 2)
     monkeypatch.setattr(supervisor_mod, "_SESSION_WAIT_DELAY_S", 0.0)
 
-    buf = EventBuffer()
-    supervisor = WorkspaceAppSupervisor(event_buffer=buf, session="main")
+    seen: list[bytes] = []
+    supervisor = WorkspaceAppSupervisor(on_output=seen.append, session="main")
     await supervisor.start()  # must not raise
 
     assert supervisor.active is False
@@ -140,15 +138,15 @@ async def test_start_degrades_gracefully_when_no_session(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_start_degrades_gracefully_when_tmux_missing(monkeypatch):
-    """When the tmux binary itself is missing, start() must not crash the lifespan."""
+    """When the tmux binary itself is missing, start() must not crash the recorder."""
 
     async def fake_create_subprocess_exec(*args, **kwargs):
         raise FileNotFoundError("tmux: command not found")
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
 
-    buf = EventBuffer()
-    supervisor = WorkspaceAppSupervisor(event_buffer=buf, session="main")
+    seen: list[bytes] = []
+    supervisor = WorkspaceAppSupervisor(on_output=seen.append, session="main")
     await supervisor.start()  # must not raise
 
     assert supervisor.active is False

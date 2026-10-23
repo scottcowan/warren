@@ -1,24 +1,11 @@
 from __future__ import annotations
 
-import secrets
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Literal, Protocol, runtime_checkable
 
 # Re-export ProvisionError from warren.errors for convenience.
 from warren_common.errors import ProvisionError as ProvisionError  # noqa: F401
 from warren_common.models import AwsConfig, CustomHarness, FolderSpec, ScopeConfig
-
-# Audit finding 12: the shared secret every sidecar request (bar /healthz) must carry.
-# Nothing outside the container calls the sidecar's HTTP API -- the server serves
-# exec/events/agent state through the runtime (podman exec, log tail, host-side
-# no-follow reads) and its socket isn't reachable from the host -- so each container
-# gets a fresh random token that lives only in its own env and is never stored or
-# returned. The sidecar fails closed without it.
-SIDECAR_TOKEN_ENV = "WARREN_SIDECAR_TOKEN"
-
-
-def new_sidecar_token() -> str:
-    return secrets.token_urlsafe(32)
 
 
 @dataclass
@@ -95,8 +82,6 @@ class WorkspaceHandle:
     workspace_id: str
     runtime_id: str                     # container ID, nsjail PID, etc.
     root_path: str
-    sidecar_url: str = ""               # http://... for file/exec/events API (empty for ECS/Fargate)
-    sidecar_socket_path: str = ""       # AF_UNIX socket path inside container (D-12)
     state_dir: str = ""                 # where this runtime's own sandbox.sb/state.json live, when that
                                          # MUST live outside root_path (audit finding #1: root_path is
                                          # writable from inside the sandbox, so a sandboxed process could

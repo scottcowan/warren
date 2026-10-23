@@ -99,7 +99,6 @@ async def reconcile_from_disk(
                 workspace_id=row.workspace_id,
                 runtime_id=row.container_id,
                 root_path="",
-                sidecar_url="",
             )
             try:
                 ws_status = await runtime.status(handle)
@@ -141,7 +140,6 @@ async def reconcile_from_disk(
             workspace_id=ws_id,
             runtime_id=getattr(c, "id", ""),
             root_path="",
-            sidecar_url="",
         )
         await runtime.destroy(handle)
 

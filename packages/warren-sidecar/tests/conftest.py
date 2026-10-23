@@ -39,53 +39,13 @@ def _no_real_exec(monkeypatch):
         monkeypatch.setattr(_os, name, _refuse)
 
 
-import os
-
-import pytest
-
-
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Skip tests marked requires_podman unless PODMAN_SOCKET is set."""
-    if os.environ.get("PODMAN_SOCKET"):
-        return
-    skip_marker = pytest.mark.skip(
-        reason="PODMAN_SOCKET not set; skipping live-podman integration test"
-    )
-    for item in items:
-        if "requires_podman" in item.keywords:
-            item.add_marker(skip_marker)
-
-
-TEST_SIDECAR_TOKEN = "test-sidecar-token"
-
-
-@pytest.fixture
-def env_defaults(monkeypatch, tmp_path):
-    """Monkeypatch env vars required by warren-sidecar; clear app state on teardown."""
-    monkeypatch.setenv("WARREN_WORKSPACE_ID", "ws-test")
-    monkeypatch.setenv("WARREN_APP", "bash")
-    monkeypatch.setenv("WARREN_SOCKET_PATH", str(tmp_path / "test.sock"))
-    monkeypatch.setenv("WARREN_SIDECAR_TOKEN", TEST_SIDECAR_TOKEN)
-    yield
-    from warren_sidecar.app import app
-
-    app.state._state.clear()
-
-
-@pytest.fixture
-def auth_headers() -> dict[str, str]:
-    """Header set every authenticated /files or /exec request must send."""
-    return {"X-Warren-Sidecar-Token": TEST_SIDECAR_TOKEN}
-
-
-@pytest.fixture(autouse=True)
+@_pytest.fixture(autouse=True)
 def _fast_supervisor_session_wait(monkeypatch):
     """Keep WorkspaceAppSupervisor's tmux-session wait from slowing the suite.
 
-    No test environment has a real "main" tmux session, so every TestClient(app)
-    test would otherwise pay the full production retry budget during lifespan
-    startup. Tests that exercise the wait/retry logic itself override these
-    again locally.
+    No test environment has a real "main" tmux session, so every recorder start
+    would otherwise pay the full production retry budget. Tests that exercise
+    the wait/retry logic itself override these again locally.
     """
     import warren_sidecar.supervisor as supervisor_mod
 

@@ -132,10 +132,9 @@ container images
 └── warren-agent-base / warren-ecs-agent-base   stubs for purpose-built agent tooling (deferred)
 
 warren-sidecar (in-workspace)
-└── records the agent's terminal state for the server; also serves a file/exec/events
-    HTTP API on a root-only in-container socket, gated by a per-container random token.
-    Nothing outside the container calls that API: the server uses the runtime's own
-    exec, log stream and host-side state reads instead.
+└── agent-state recorder: tails the tmux pane for OSC 7501 state and writes
+    osc-state.json, which the server reads host-side. No listener; the server uses the
+    runtime's own exec, log stream and host-side state reads.
 ```
 
 Interactive remote SSH access (for a Docker/Podman-backed workspace on a remote host) uses

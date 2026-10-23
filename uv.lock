@@ -1928,32 +1928,20 @@ name = "warren-sidecar"
 version = "0.1.0"
 source = { editable = "packages/warren-sidecar" }
 dependencies = [
-    { name = "aiofiles" },
-    { name = "fastapi" },
-    { name = "pathspec" },
-    { name = "pydantic-settings" },
     { name = "structlog" },
-    { name = "uvicorn", extra = ["standard"] },
 ]
 
 [package.optional-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "aiofiles", specifier = ">=25.1,<26" },
-    { name = "fastapi", specifier = ">=0.149,<0.150" },
-    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.28,<0.29" },
-    { name = "pathspec", specifier = ">=1.1,<2" },
-    { name = "pydantic-settings", specifier = ">=2.16.0,<3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
     { name = "structlog", specifier = ">=24.4" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.54,<0.55" },
 ]
 provides-extras = ["dev"]
 

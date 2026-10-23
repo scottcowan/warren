@@ -265,7 +265,7 @@ def test_workspace_events_streams_multiple_chunks(env_defaults, auth_headers):
     fake_registry = _make_fake_registry()
 
     async def _fake_stream():
-        for line in ('{"type":"sidecar_ready"}', '{"type":"log_line"}'):
+        for line in ('{"type":"workspace_ready"}', '{"type":"log_line"}'):
             yield line
 
     fake_event_store = MagicMock()
@@ -286,5 +286,5 @@ def test_workspace_events_streams_multiple_chunks(env_defaults, auth_headers):
                 chunks = list(response.iter_lines())
 
     assert len(chunks) >= 2
-    assert any("sidecar_ready" in c for c in chunks)
+    assert any("workspace_ready" in c for c in chunks)
     assert any("log_line" in c for c in chunks)

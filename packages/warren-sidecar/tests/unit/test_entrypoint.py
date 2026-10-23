@@ -53,11 +53,11 @@ def test_entrypoint_emits_workspace_ready():
 
 
 def test_entrypoint_emits_events_in_order():
-    """When WARREN_WORKTREE_PATHS is empty, order must be: claude_md_ready, sidecar_ready, workspace_ready."""
+    """When WARREN_WORKTREE_PATHS is empty, order must be: claude_md_ready, workspace_ready."""
     result = _run_entrypoint({"WARREN_WORKSPACE_ID": "ws-test"})
     events = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
     types = [e["type"] for e in events]
-    assert types == ["claude_md_ready", "sidecar_ready", "workspace_ready"]
+    assert types == ["claude_md_ready", "workspace_ready"]
 
 
 def test_preflight_fail_missing_workspace_id():
@@ -67,30 +67,38 @@ def test_preflight_fail_missing_workspace_id():
     assert "workspace_failed" in result.stdout
 
 
-def test_sidecar_socket_is_restricted_to_its_owner():
-    """Audit finding 12: uvicorn's uds bind leaves the socket 0o666."""
-    result = _run_entrypoint({"WARREN_WORKSPACE_ID": "ws-test", "WARREN_SIDECAR_TOKEN": "t"})
-    ready = [json.loads(line) for line in result.stdout.splitlines() if '"sidecar_ready"' in line]
-    assert ready
-    assert os.stat(ready[0]["socket"]).st_mode & 0o777 == 0o600
-
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell shim")
-def test_workspace_app_does_not_inherit_the_sidecar_token(tmp_path):
-    """Audit finding 12: the token is for the sidecar alone. A `tmux` shim on PATH
-    records the env the entrypoint launches the workspace app's session with."""
-    dump = tmp_path / "app-env"
+def test_entrypoint_starts_the_app_and_the_agent_state_recorder(tmp_path):
+    """A `tmux` shim on PATH stands in for the workspace session: it records what the
+    entrypoint (app launch) and the recorder (session probe, pipe-pane) ask of it, and
+    writes an OSC 7501 state into the pane log the recorder tails."""
+    calls = tmp_path / "tmux-calls"
+    app_env = tmp_path / "app-env"
+    session = tmp_path / "harness" / ".session"
+    session.mkdir(parents=True)
     shim = tmp_path / "bin" / "tmux"
     shim.parent.mkdir()
-    shim.write_text(f'#!/bin/sh\ncase "$1" in new-session) env > "{dump}";; esac\nexit 0\n')
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'echo "$1" >> "{calls}"\n'
+        'case "$1" in\n'
+        f'  new-session) env > "{app_env}"\n'
+        "    (sleep 1; printf '\\033]7501;working\\007\\n' >> \"$TMPDIR/warren-sidecar-pane-main.log\") & ;;\n"
+        "  wait-for) sleep 4 ;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
     shim.chmod(0o755)
     result = _run_entrypoint({
         "WARREN_WORKSPACE_ID": "ws-test",
-        "WARREN_SIDECAR_TOKEN": "tok-must-not-leak",
+        "WARREN_HARNESS_ROOT": str(tmp_path / "harness"),
+        "TMPDIR": str(tmp_path),
         "PATH": f"{shim.parent}{os.pathsep}{_BASE_ENV['PATH']}",
     })
-    assert '"workspace_ready"' in result.stdout
-    app_env = dump.read_text()
-    assert "WARREN_WORKSPACE_ID=ws-test" in app_env
-    assert "WARREN_SIDECAR_TOKEN" not in app_env
-    assert "tok-must-not-leak" not in app_env
+    assert result.returncode == 0, result.stdout + result.stderr
+    invoked = calls.read_text().split()
+    assert "new-session" in invoked
+    assert {"has-session", "pipe-pane"} <= set(invoked)
+    assert "WARREN_WORKSPACE_ID=ws-test" in app_env.read_text()
+    assert json.loads((session / "osc-state.json").read_text())["state"] == "working"

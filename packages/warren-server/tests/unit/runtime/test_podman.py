@@ -254,17 +254,6 @@ async def test_provision_injects_warren_worktree_paths_populated():
         assert env["WARREN_WORKTREE_PATHS"] == "/workspace/repo-a:/workspace/repo-b"
 
 
-@pytest.mark.asyncio
-async def test_provision_returns_handle_with_sidecar_socket_path():
-    """provision() must set sidecar_socket_path on the returned WorkspaceHandle (04-05, D-12)."""
-    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
-        client = ClientCls.return_value
-        client.containers.create.return_value = MagicMock(id="ctr-abc")
-        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
-        handle = await runtime.provision(_spec())
-        assert handle.sidecar_socket_path == "/tmp/warren-sidecar.sock"
-
-
 def _extract_authorized_keys(data: bytes) -> tuple[list[str], bytes]:
     """Read a put_archive tar payload back and return (member names, content of authorized_keys)."""
     with tarfile.open(fileobj=io.BytesIO(data)) as tar:
@@ -1100,22 +1089,3 @@ async def test_provision_points_harness_config_at_workspace_dir():
         assert env["OPENCODE_CONFIG_DIR"] == "/var/lib/warren/harness/opencode/config"
         assert env["OPENCODE_DB"] == "/var/lib/warren/harness/opencode/data/opencode.db"
         assert "CLAUDE_CONFIG_DIR" not in env
-
-
-@pytest.mark.asyncio
-async def test_provision_mints_a_fresh_sidecar_token_per_container():
-    """Audit finding 12: the sidecar gets a random token held only in its own env --
-    never a same-named secret's value, never returned on the handle."""
-    spec = _spec()
-    spec.env = {"WARREN_SIDECAR_TOKEN": "attacker-chosen"}
-    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
-        client = ClientCls.return_value
-        client.containers.create.return_value = MagicMock(id="ctr-abc")
-        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
-        handle = await runtime.provision(spec)
-        first = client.containers.create.call_args.kwargs["environment"]["WARREN_SIDECAR_TOKEN"]
-        await runtime.provision(_spec())
-        second = client.containers.create.call_args.kwargs["environment"]["WARREN_SIDECAR_TOKEN"]
-    assert first != "attacker-chosen" and len(first) >= 32
-    assert second != first
-    assert first not in repr(vars(handle))

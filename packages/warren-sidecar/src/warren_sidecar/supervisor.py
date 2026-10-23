@@ -1,4 +1,4 @@
-"""WorkspaceAppSupervisor: observes the entrypoint's tmux pane, feeding its output into EventBuffer.
+"""WorkspaceAppSupervisor: observes the entrypoint's tmux pane, feeding its output to a callback.
 
 The entrypoint (images/warren-docker-base/entrypoint.py) is the sole owner of the
 workspace app process: in server/no-TTY mode it runs the app inside a detached
@@ -6,8 +6,8 @@ tmux session named "main" (a human reattaches via `tmux attach -t main`); in
 local/TTY mode it execs the app directly with no tmux session at all.
 
 This supervisor must NOT fork a second copy of the app -- it only tails a copy
-of the tmux pane's output via `tmux pipe-pane`, so EventBuffer/`/events` stays
-backed by what the real, interactive session actually produced. It never signals
+of the tmux pane's output via `tmux pipe-pane`, so the agent-state recorder sees
+what the real, interactive session actually produced. It never signals
 the app process itself; starting/stopping that process is the entrypoint/tmux's
 job alone.
 """
@@ -18,12 +18,9 @@ import asyncio
 import os
 import pathlib
 import tempfile
-from typing import TYPE_CHECKING
+from collections.abc import Callable
 
 import structlog
-
-if TYPE_CHECKING:
-    from warren_sidecar.events import EventBuffer
 
 log = structlog.get_logger(__name__)
 
@@ -40,17 +37,16 @@ class WorkspaceAppSupervisor:
     named tmux session to exist (the entrypoint creates it; there's a startup
     race since the sidecar may come up first), pipes a copy of the pane's
     output to a plain file via `tmux pipe-pane`, and tails that file with its
-    own `tail -F` subprocess into EventBuffer.
+    own `tail -F` subprocess, handing each line to `on_output`.
 
     Degrades gracefully (logs a warning, does nothing else) when tmux isn't
     installed or the session never appears -- e.g. local/TTY mode, where the
     app runs directly with no tmux session.
     """
 
-    def __init__(self, event_buffer: EventBuffer, session: str = TMUX_SESSION, on_output=None) -> None:
+    def __init__(self, on_output: Callable[[bytes], object], session: str = TMUX_SESSION) -> None:
         self._session = session
         self._on_output = on_output
-        self._buf = event_buffer
         self._pane_log_path = os.path.join(tempfile.gettempdir(), f"warren-sidecar-pane-{session}.log")
         self._tail_proc: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
@@ -62,7 +58,7 @@ class WorkspaceAppSupervisor:
             log.warning(
                 "supervisor_no_tmux_session",
                 session=self._session,
-                detail="no tmux session found; live event streaming disabled",
+                detail="no tmux session found; OSC agent state not recorded",
             )
             return
 
@@ -113,12 +109,10 @@ class WorkspaceAppSupervisor:
     async def _pipe_stdout(self) -> None:
         assert self._tail_proc and self._tail_proc.stdout
         async for line in self._tail_proc.stdout:
-            if self._on_output is not None:
-                try:
-                    self._on_output(line)
-                except Exception:
-                    log.exception("supervisor_output_hook_failed")
-            self._buf.push_output_event("stdout", line.decode(errors="replace"))
+            try:
+                self._on_output(line)
+            except Exception:
+                log.exception("supervisor_output_hook_failed")
 
     async def stop(self) -> None:
         """Turn off pipe-pane and stop our tail process; never signals the app."""

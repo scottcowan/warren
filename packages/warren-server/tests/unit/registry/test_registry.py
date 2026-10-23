@@ -238,7 +238,6 @@ async def test_provision_and_destroy_race_does_not_resurrect_workspace(sqlite_pa
                 workspace_id=spec.workspace_id,
                 runtime_id="ctr-slow",
                 root_path="",
-                sidecar_url="",
             )
 
         async def destroy(self, handle):
@@ -445,7 +444,7 @@ def _handle_from(ws_id: str, container_id: str) -> "object":
     from warren_common.runtime.base import WorkspaceHandle
 
     return WorkspaceHandle(
-        workspace_id=ws_id, runtime_id=container_id, root_path="", sidecar_url=""
+        workspace_id=ws_id, runtime_id=container_id, root_path=""
     )
 
 

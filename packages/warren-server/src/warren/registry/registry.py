@@ -418,7 +418,7 @@ class WorkspaceRegistry:
         if exec_stream is None or not ws.container_id:
             return False
         handle = WorkspaceHandle(
-            workspace_id=ws.workspace_id, runtime_id=ws.container_id, root_path=ws.root_path, sidecar_url=""
+            workspace_id=ws.workspace_id, runtime_id=ws.container_id, root_path=ws.root_path
         )
         out = b""
         code: int | None = None
@@ -787,7 +787,7 @@ class WorkspaceRegistry:
         """Return non-terminal workspaces as rows carrying a WorkspaceHandle.
 
         Thin passthrough to the store; reaper consumes ``ws.workspace_id`` and
-        ``ws.handle``. Full wiring (sidecar_url, etc.) lands in Phase 6.
+        ``ws.handle``.
         """
         rows = await self.store.list_non_terminal()
         return [
@@ -797,7 +797,6 @@ class WorkspaceRegistry:
                     workspace_id=r.workspace_id,
                     runtime_id=r.container_id or "",
                     root_path=r.root_path,
-                    sidecar_url="",
                 ),
                 mode=_spec_mode(r.spec_json),
             )
@@ -840,7 +839,6 @@ class WorkspaceRegistry:
             workspace_id=ws.workspace_id,
             runtime_id=ws.container_id or "",
             root_path=ws.root_path,
-            sidecar_url="",
         )
         try:
             await self.runtime.destroy(handle)
@@ -931,7 +929,6 @@ class WorkspaceRegistry:
                 workspace_id=ws.workspace_id,
                 runtime_id=ws.container_id or "",
                 root_path=ws.root_path,
-                sidecar_url="",
             )
             try:
                 if hasattr(self.runtime, "stop"):
@@ -1068,7 +1065,6 @@ class WorkspaceRegistry:
                 workspace_id=ws.workspace_id,
                 runtime_id=ws.container_id or "",
                 root_path=ws.root_path,
-                sidecar_url="",
             )
 
             # D-05: the ssh_port lives for the workspace's whole life — reuse the
@@ -1222,7 +1218,6 @@ class WorkspaceRegistry:
             workspace_id=ws.workspace_id,
             runtime_id=ws.container_id or "",
             root_path=ws.root_path,
-            sidecar_url="",
         )
         event = await self._completion_event(ws, handle)
         await self.event_store.get_or_create(ws.workspace_id).push(json.dumps(event))
