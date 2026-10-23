@@ -8,7 +8,13 @@ import json
 import httpx
 from fastapi.testclient import TestClient
 from warren_sidecar.app import app
+from warren_sidecar.auth import TOKEN_HEADER
+from warren_sidecar.config import SidecarSettings
 from warren_sidecar.events import EventBuffer
+
+from tests.conftest import TEST_SIDECAR_TOKEN
+
+_AUTH = {TOKEN_HEADER: TEST_SIDECAR_TOKEN}
 
 
 def test_seq_monotonic():
@@ -34,7 +40,7 @@ def test_event_has_required_fields():
 
 def test_events_stream_returns_ndjson(env_defaults):
     with TestClient(app) as client:
-        response = client.get("/events")
+        response = client.get("/events", headers=_AUTH)
     assert response.status_code == 200
     assert "ndjson" in response.headers.get("content-type", "")
 
@@ -49,7 +55,8 @@ def _client_with_buffer(n: int) -> tuple[TestClient, EventBuffer]:
     for i in range(n):
         buf.push({"type": "x", "i": i})
     app.state.event_buffer = buf
-    return TestClient(app), buf
+    app.state.settings = SidecarSettings()
+    return TestClient(app, headers=_AUTH), buf
 
 
 async def test_stream_live_subscriber_receives_all_events_past_ring_capacity():
@@ -75,6 +82,7 @@ async def test_stream_live_subscriber_receives_all_events_past_ring_capacity():
 async def test_events_route_live_subscriber_receives_all_events(env_defaults):
     buf = EventBuffer()
     app.state.event_buffer = buf
+    app.state.settings = SidecarSettings()
 
     async def _produce():
         await asyncio.sleep(0.01)
@@ -84,7 +92,7 @@ async def test_events_route_live_subscriber_receives_all_events(env_defaults):
                 await asyncio.sleep(0.001)
 
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://sidecar") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://sidecar", headers=_AUTH) as client:
         producer = asyncio.create_task(_produce())
         response = await client.get("/events")
         await producer

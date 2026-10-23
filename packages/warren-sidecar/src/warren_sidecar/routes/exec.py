@@ -7,14 +7,13 @@ import json
 import time
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from warren_sidecar.auth import require_sidecar_token
 
 log = structlog.get_logger(__name__)
-router = APIRouter(dependencies=[Depends(require_sidecar_token)])
+router = APIRouter()
 
 
 class ExecRequest(BaseModel):

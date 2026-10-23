@@ -1,31 +1,59 @@
-"""Shared-secret auth dependency for /files and /exec (audit 2026-10-16 P2 #47).
+"""Shared-secret auth for every sidecar route except /healthz.
 
 The sidecar listens on a `/tmp` AF_UNIX socket running as root with no other
 access control, so anything able to reach that socket — including, on prod
 hosts where /tmp ends up shared, processes outside the workspace container —
-could otherwise read arbitrary files or run arbitrary commands. Every
-request to a protected route must carry the per-workspace token issued at
-provision time via the `X-Warren-Sidecar-Token` header.
+could otherwise read files, diffs, events or run commands. Every request must
+carry the per-workspace token issued at provision time via the
+`X-Warren-Sidecar-Token` header. Enforced as ASGI middleware so a new route is
+protected by default (audit finding 12: /diff and /events were added without
+the per-router dependency).
 """
 
 from __future__ import annotations
 
 import hmac
-
-from fastapi import HTTPException, Request
+import json
 
 TOKEN_HEADER = "X-Warren-Sidecar-Token"
+OPEN_PATHS = frozenset({"/healthz"})
+
+_TOKEN_HEADER_BYTES = TOKEN_HEADER.lower().encode()
 
 
-def require_sidecar_token(request: Request) -> None:
-    """FastAPI dependency: 401 unless the request's token header matches.
+def token_valid(expected: str, provided: str) -> bool:
+    """Fails CLOSED: an unconfigured token (`""`) never matches anything."""
+    return bool(expected) and hmac.compare_digest(provided.encode(), expected.encode())
 
-    Fails CLOSED: a sidecar started with no `WARREN_SIDECAR_TOKEN` configured
-    (`settings.sidecar_token == ""`) rejects every request rather than
-    treating an unconfigured token as "auth disabled".
-    """
-    settings = request.app.state.settings
-    expected = settings.sidecar_token
-    provided = request.headers.get(TOKEN_HEADER, "")
-    if not expected or not hmac.compare_digest(provided, expected):
-        raise HTTPException(status_code=401, detail="missing or invalid sidecar token")
+
+class SidecarTokenMiddleware:
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] not in ("http", "websocket") or scope["path"] in OPEN_PATHS:
+            await self.app(scope, receive, send)
+            return
+        settings = getattr(scope["app"].state, "settings", None)
+        expected = settings.sidecar_token if settings is not None else ""
+        provided = ""
+        for name, value in scope.get("headers", ()):
+            if name == _TOKEN_HEADER_BYTES:
+                provided = value.decode("latin-1")
+                break
+        if token_valid(expected, provided):
+            await self.app(scope, receive, send)
+            return
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        body = json.dumps({"detail": "missing or invalid sidecar token"}).encode()
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})

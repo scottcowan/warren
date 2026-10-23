@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Request
 
 from warren_sidecar.agent_state import current_state
-from warren_sidecar.auth import require_sidecar_token
 
-router = APIRouter(dependencies=[Depends(require_sidecar_token)])
+router = APIRouter()
 
 
 @router.get("/agent-state")
