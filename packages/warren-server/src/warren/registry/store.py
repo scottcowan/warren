@@ -34,8 +34,6 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         # snapshotted at provision time so ensure_running can reprovision a
         # lost/reaped container faithfully instead of as a bare shell.
         "spec_json": "TEXT",
-        # Audit finding 12: the workspace's sidecar token, Fernet-encrypted (LocalCipher).
-        "sidecar_token_enc": "BLOB",
     },
     "users": {
         # Issue #11: nullable-timestamp "disabled" flag, matching the existing
@@ -101,6 +99,24 @@ async def _scrub_legacy_plaintext_env(db: aiosqlite.Connection) -> None:
         )
 
 
+async def _drop_stored_sidecar_tokens(db: aiosqlite.Connection) -> None:
+    """Audit finding 12 follow-up: an earlier release stored every workspace's
+    sidecar token (Fernet-encrypted) in `workspaces.sidecar_token_enc`, including
+    destroyed rows', for a server->sidecar call that never existed. Tokens now live
+    only in each container's env, so drop the column -- or, on an SQLite too old for
+    DROP COLUMN, null it -- with secure_delete so the freed pages are zeroed.
+    """
+    async with db.execute("PRAGMA table_info(workspaces)") as cur:
+        if "sidecar_token_enc" not in {row[1] for row in await cur.fetchall()}:
+            return
+    await db.execute("PRAGMA secure_delete=ON")
+    try:
+        await db.execute("ALTER TABLE workspaces DROP COLUMN sidecar_token_enc")
+    except aiosqlite.OperationalError:
+        await db.execute("UPDATE workspaces SET sidecar_token_enc = NULL")
+    await db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+
 async def open_db(path: str | Path) -> aiosqlite.Connection:
     """Open an aiosqlite connection in autocommit + WAL mode and apply schema.
 
@@ -126,6 +142,7 @@ async def open_db(path: str | Path) -> aiosqlite.Connection:
     await db.executescript(_SCHEMA_SQL)
     await _ensure_columns(db)
     await _scrub_legacy_plaintext_env(db)
+    await _drop_stored_sidecar_tokens(db)
 
     os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
     return db
@@ -329,19 +346,6 @@ class WorkspaceStore:
         await self._db.execute(
             "UPDATE workspaces SET ssh_port = ?, updated_at = ? WHERE workspace_id = ?",
             (port, _utcnow_iso(), workspace_id),
-        )
-
-    async def get_sidecar_token_enc(self, workspace_id: str) -> bytes | None:
-        async with self._db.execute(
-            "SELECT sidecar_token_enc FROM workspaces WHERE workspace_id = ?", (workspace_id,)
-        ) as cur:
-            row = await cur.fetchone()
-        return row[0] if row and row[0] else None
-
-    async def set_sidecar_token_enc(self, workspace_id: str, token_enc: bytes) -> None:
-        await self._db.execute(
-            "UPDATE workspaces SET sidecar_token_enc = ?, updated_at = ? WHERE workspace_id = ?",
-            (token_enc, _utcnow_iso(), workspace_id),
         )
 
     async def list_non_terminal(self) -> list[Workspace]:

@@ -446,3 +446,32 @@ async def test_insert_cap_scope_and_terminal_rows(sqlite_path: str):
     await store.update_status("ws-alice-0", "destroyed")
     await store.insert(**_insert_kwargs(2, "alice"), max_total=2, max_per_owner=1)
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_open_db_drops_legacy_stored_sidecar_tokens(sqlite_path: str):
+    """Audit finding 12 follow-up: a previous release stored every workspace's sidecar
+    token (live, reaped and destroyed rows alike). Reopening the DB removes them all,
+    including from the file's freed pages."""
+    store = await WorkspaceStore.open(sqlite_path)
+    await store._db.execute("ALTER TABLE workspaces ADD COLUMN sidecar_token_enc BLOB")
+    for ws, status in (("ws-live", "running"), ("ws-reaped", "stopped"), ("ws-gone", "destroyed")):
+        await store.insert(
+            workspace_id=ws, project="p", intent="i", image="img", root_path="",
+            server_instance="s1", status=status,
+        )
+        await store._db.execute(
+            "UPDATE workspaces SET sidecar_token_enc = ? WHERE workspace_id = ?",
+            (f"LEGACY-SIDECAR-TOKEN-{ws}".encode(), ws),
+        )
+    await store.close()
+
+    store2 = await WorkspaceStore.open(sqlite_path)
+    try:
+        async with store2._db.execute("PRAGMA table_info(workspaces)") as cur:
+            assert "sidecar_token_enc" not in {row[1] for row in await cur.fetchall()}
+        assert (await store2.get("ws-gone")).status == "destroyed"
+    finally:
+        await store2.close()
+    for path in Path(sqlite_path).parent.glob(Path(sqlite_path).name + "*"):
+        assert b"LEGACY-SIDECAR-TOKEN" not in path.read_bytes()
