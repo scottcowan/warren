@@ -203,5 +203,16 @@ def itest_env(
                 "itest_env teardown: failed to list containers for cleanup",
                 server_id=itest_server_id,
             )
+        try:
+            for network in client.networks.list():
+                labels = network.attrs.get("labels") or {}
+                if labels.get("warren.server_instance") != itest_server_id:
+                    continue
+                try:
+                    network.remove()
+                except Exception:
+                    log.warning("itest_env teardown: failed to remove network", network=network.name)
+        except Exception:
+            log.warning("itest_env teardown: failed to list networks", server_id=itest_server_id)
         finally:
             client.close()
