@@ -182,5 +182,45 @@ class ReleasedTests(RepoTest):
     def test_released_is_empty_before_config_existed(self):
         self.assertEqual(release.released(self.root, self.baseline), {})
 
+
+class CheckTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def dockerfile(self, text, path="img/Dockerfile"):
+        (self.root / path).parent.mkdir(parents=True, exist_ok=True)
+        (self.root / path).write_text(text)
+
+    def test_sources_skip_flags_from_and_urls(self):
+        text = (
+            "FROM x\n"
+            "COPY --chown=0:0 --chmod=0755 a.sh /bin/a\n"
+            "COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/\n"
+            'COPY ["b dir/c", "d", "/opt/"]\n'
+            "ADD https://example.invalid/f.tgz /tmp/\n"
+            "COPY e \\\n    f /srv/\n"
+        )
+        self.assertEqual(release.dockerfile_sources(text), ["a.sh", "b dir/c", "d", "e", "f"])
+
+    def test_uncovered_reports_missing_and_excluded_sources(self):
+        self.dockerfile("FROM x\nCOPY img/run.sh common/assets/ /x/\nCOPY common/tool.py /y\nCOPY img/tests/t.py /z\n")
+        component = {
+            "dockerfile": "img/Dockerfile",
+            "context": ".",
+            "paths": ["img/", "common/assets/"],
+            "exclude": ["img/tests/"],
+        }
+        self.assertEqual(release.uncovered(self.root, component), ["common/tool.py", "img/tests/t.py"])
+
+    def test_uncovered_resolves_against_context_and_skips_whole_context(self):
+        self.dockerfile("FROM x\nCOPY . /app\nCOPY run.sh /bin/\n", "img/sub/Dockerfile")
+        component = {"dockerfile": "img/sub/Dockerfile", "context": "img/sub", "paths": ["img/sub/"]}
+        self.assertEqual(release.uncovered(self.root, component), [])
+        component["paths"] = ["img/sub/Dockerfile"]
+        self.assertEqual(release.uncovered(self.root, component), ["img/sub", "img/sub/run.sh"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -60,5 +60,7 @@ version in `pyproject.toml`.
 Published images are released through the `release: …` PR that the release workflow keeps
 open. It lists every image whose build inputs (`.github/releases.json`) changed since its
 last tag; merging it tags and publishes them. PR titles decide the bump: `feat:` is minor,
-`!` or a `BREAKING CHANGE:` footer is major, anything else is patch. When an image gains a
-new build input, add the path to its entry in `.github/releases.json`.
+`!` or a `BREAKING CHANGE:` footer is major, anything else is patch. CI fails
+(`scripts/release.py check`) when a Dockerfile copies in a path its entry in
+`.github/releases.json` doesn't list; warren-server's `COPY .` can't be checked, so keep its
+paths current by hand.
