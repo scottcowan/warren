@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 import socket
 from pathlib import Path
 from typing import Annotated, Literal
@@ -46,6 +47,14 @@ class WarrenSettings(BaseSettings):
                 f"WARREN_SECRET_KEY must be at least {_MIN_SECRET_LENGTH} characters "
                 f"(got {len(raw)}) -- generate one with e.g. `openssl rand -base64 32`"
             )
+        return v
+
+    @field_validator("bedrock_gateway_url")
+    @classmethod
+    def _validate_bedrock_gateway_url(cls, v: str) -> str:
+        v = v.strip().rstrip("/")
+        if v and not re.fullmatch(r"https://[A-Za-z0-9.-]+(:\d+)?(/[A-Za-z0-9._~/-]*)?", v):
+            raise ValueError("WARREN_BEDROCK_GATEWAY_URL must be an https:// URL with no query or credentials")
         return v
 
     @field_validator("bootstrap_token")
@@ -144,6 +153,11 @@ class WarrenSettings(BaseSettings):
     ecs_task_role_arn: str = ""
     ecs_task_execution_role_arn: str = ""
     aws_region: str = "us-east-1"
+    # WARREN_BEDROCK_GATEWAY_URL: a Bedrock-compatible gateway (an LLM proxy) for
+    # bedrock-mode workspaces. When set they get ANTHROPIC_BEDROCK_BASE_URL and
+    # CLAUDE_CODE_SKIP_BEDROCK_AUTH=1 instead of calling Bedrock with their task role,
+    # and their template must declare the ANTHROPIC_AUTH_TOKEN secret (the gateway key).
+    bedrock_gateway_url: str = ""
     # Assumed-role ARNs trusted for warren.secrets ownership (auth/aws_identity.py) --
     # empty by default, meaning no assumed role is trusted, only plain IAM user ARNs.
     # An assumed role's session-name segment is chosen by whoever calls sts:AssumeRole,

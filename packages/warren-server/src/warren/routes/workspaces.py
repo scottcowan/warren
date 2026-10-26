@@ -51,6 +51,8 @@ router = APIRouter()
 # can exhaust max_workspaces/max_workspaces_per_user's capacity check-then-insert race
 # far faster than any legitimate caller would ever provision workspaces. Per-user, not
 # per-IP, since every caller here is already authenticated.
+GATEWAY_TOKEN_SECRET = "ANTHROPIC_AUTH_TOKEN"
+
 _CREATE_WORKSPACE_MAX = 10
 _CREATE_WORKSPACE_WINDOW_SECONDS = 60.0
 _create_workspace_limiter = SlidingWindowRateLimiter(
@@ -348,6 +350,19 @@ async def _provision_workspace(
     )
     if model_access:
         template_env.update(BEDROCK_ENV)
+        gateway = getattr(settings, "bedrock_gateway_url", "") if settings is not None else ""
+        if gateway:
+            if GATEWAY_TOKEN_SECRET not in secret_names:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "template_denied",
+                        "detail": f"this server routes Bedrock through a gateway; the template must "
+                        f"declare the {GATEWAY_TOKEN_SECRET} secret holding your gateway key",
+                    },
+                )
+            template_env.setdefault("ANTHROPIC_BEDROCK_BASE_URL", gateway)
+            template_env.setdefault("CLAUDE_CODE_SKIP_BEDROCK_AUTH", "1")
     idle_ttl_seconds = template_cfg.idle_ttl_seconds if template_cfg is not None else None
     idle_destroy_seconds = template_cfg.idle_destroy_seconds if template_cfg is not None else None
     # Issue #23: these were silently dropped on the floor -- every workspace got
