@@ -12,7 +12,7 @@
 #
 # Re-runs on every task launch against the same volume, so everything already on it is
 # agent-written and untrusted. Credentials never meet it:
-#   1. Copy the credentials ECS injected into 0600 files in a container-local private dir,
+#   1. Copy the credentials from git-init.env (then deleted) into 0600 files in a container-local private dir,
 #      then re-exec with an empty environment (and, if started as root, as uid 1000 via
 #      su-exec). After execve /proc/1/environ no longer holds them.
 #   2. Clone over the network into fresh repos in that private dir (no checkout, so no
@@ -34,6 +34,7 @@ PINNED_KNOWN_HOSTS=/etc/warren/ssh_known_hosts
 WARREN_UID=1000
 SU_EXEC=/sbin/su-exec
 INIT_VOLUME=/usr/local/bin/warren-init-volume
+SECRETS_LIB=/usr/local/lib/warren/secrets.sh
 # The same fixed-name pins as host-side git (warren_common.safe_git.SAFE_GIT_CONFIG; a
 # unit test keeps the two in step), applied to every git call here. Values never contain
 # whitespace or glob characters, so the list is word-split unquoted.
@@ -87,6 +88,13 @@ if [ "${1:-}" != --scrubbed ]; then
     case "$0" in /*) SELF=$0 ;; *) SELF="$(pwd)/$0" ;; esac
     umask 077
     PRIV=$(mktemp -d /tmp/warren-git.XXXXXX) && mkdir "$PRIV/creds" || { log "cannot create private dir"; exit 1; }
+    # The clone credentials arrive as $ROOT/.warren/git-init.env, written by the control
+    # plane just before RunTask (runtime/ecs_secrets.py). Load and delete it first, so it
+    # is gone before the workspace container (dependsOn this one) starts.
+    if [ -r "$SECRETS_LIB" ]; then
+        . "$SECRETS_LIB"
+        warren_secrets_take "$ROOT/.warren" git-init.env
+    fi
     each_record stash_cred
     printf '%s\n' "${WARREN_GIT_KNOWN_HOSTS:-}" > "$PRIV/known_hosts_extra"
     drop=

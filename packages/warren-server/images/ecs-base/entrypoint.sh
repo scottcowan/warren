@@ -1,6 +1,21 @@
 #!/bin/sh
 set -e
 
+# Secrets arrive as a file the control plane wrote onto this workspace's volume just
+# before RunTask (runtime/ecs_secrets.py). Export them, keep a root-only copy for ECS
+# Exec sessions (warren-session) when root, and delete the file, all before anything
+# workspace-controlled runs. git-init's clone credentials are never loaded here; its
+# file is normally gone already and is deleted unread in case it isn't.
+. /usr/local/lib/warren/secrets.sh
+if [ "$(/usr/bin/id -u)" = 0 ]; then
+    warren_secrets_take /var/lib/warren/.warren workspace.env /run/warren/secrets.env
+else
+    warren_secrets_take /var/lib/warren/.warren workspace.env
+fi
+if [ -d /var/lib/warren/.warren ] && [ ! -L /var/lib/warren/.warren ]; then
+    /bin/rm -f /var/lib/warren/.warren/git-init.env
+fi
+
 # AD3: started as root (unless the task definition sets `user`), take ownership of the
 # volume mount points, then re-exec as warren. Nothing workspace-controlled runs as root.
 if [ "$(/usr/bin/id -u)" = 0 ]; then

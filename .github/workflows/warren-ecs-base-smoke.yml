@@ -130,3 +130,23 @@ jobs:
               /usr/local/bin/entrypoint.sh')"
           echo "$out"
           test "$out" = "$(printf '1000:1000\n/var/lib/warren/workspace\n/workspace\n1000\nwarren/dev/abcdef12/code-app')"
+          # Secrets arrive as files on the volume (runtime/ecs_secrets.py): the entrypoint
+          # exports workspace.env, deletes both files (git-init.env unread) before the app
+          # starts, and keeps a copy the workspace user can't read for ECS Exec sessions.
+          test "$(docker run --rm --entrypoint stat "$IMG" -c '%u:%g:%a' /usr/local/lib/warren/secrets.sh)" = "0:0:644"
+          out="$(docker run --rm --user 0 --mount type=tmpfs,destination=/var/lib/warren,tmpfs-mode=0755 --entrypoint sh "$IMG" -c '
+            set -e
+            mkdir -p /var/lib/warren/.warren
+            printf "API_KEY=%s\n" "$(printf "s3cret\n" | base64)" > /var/lib/warren/.warren/workspace.env
+            printf "GITHUB_PAT=%s\n" "$(printf clone | base64)" > /var/lib/warren/.warren/git-init.env
+            chown -R 1000:1000 /var/lib/warren
+            cat > /tmp/app.sh <<"EOF"
+          printf "%s|" "$API_KEY"
+          ls -A /var/lib/warren/.warren | tr "\n" " "; printf "|"
+          printf "%s|" "${GITHUB_PAT:-none}"
+          cat /run/warren/secrets.env >/dev/null 2>&1 && echo readable || echo unreadable
+          EOF
+            chmod 755 /tmp/app.sh
+            WARREN_APP_CMD=/tmp/app.sh /usr/local/bin/entrypoint.sh')"
+          echo "$out" | sed 's/s3cret/<value>/'
+          test "$out" = "$(printf 's3cret\n||none|unreadable')"
