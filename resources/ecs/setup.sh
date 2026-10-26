@@ -654,13 +654,9 @@ if ! aws iam get-role --role-name "$TASK_ROLE_NAME" > /dev/null 2>&1; then
   # warren_stack.py's WarrenTaskPolicy (findings #17/#20/#21 — this script had drifted
   # from both since PR #3).
   #
-  # This role holds no SSM read action at all (no GetParameter*/GetParametersByPath):
-  # GetParametersByPath can't be limited to WithDecryption=false in IAM, so it would let
-  # the control plane decrypt every workspace secret. ecs.py builds secret ARNs from
-  # warren's own store; only the EXECUTION role (Step 4 below) reads values, via
-  # ssm:GetParameters, when ECS resolves a `secrets` entry at container start.
-  # SSMSecretsWrite covers /warren/*; narrow it to /warren/<WARREN_SERVER_ID>/* once
-  # you've chosen the control plane's server id (resources/ecs/README.md).
+  # No SSM action at all: workspace secrets live only in warren-server's own SQLite store
+  # and reach a task as a file on its EFS volume, written through the control plane's
+  # mount of the filesystem (WARREN_EFS_LOCAL_MOUNT_PATH, resources/ecs/README.md).
   #
   # R17/S13/X2: DeregisterTaskDefinition takes no ecs:cluster condition key -- an
   # ArnEquals condition on a key an action doesn't support evaluates to FALSE, not
@@ -776,15 +772,6 @@ if ! aws iam get-role --role-name "$TASK_ROLE_NAME" > /dev/null 2>&1; then
         "arn:aws:iam::${ACCOUNT_ID}:role/${EXEC_ROLE_NAME}",
         "arn:aws:iam::${ACCOUNT_ID}:role/${WORKSPACE_ROLE_NAME}"
       ]
-    },
-    {
-      "Sid": "SSMSecretsWrite",
-      "Effect": "Allow",
-      "Action": [
-        "ssm:PutParameter",
-        "ssm:DeleteParameter"
-      ],
-      "Resource": "arn:aws:ssm:*:*:parameter/warren/*"
     },
     {
       "Sid": "ECSExec",
@@ -962,14 +949,11 @@ if ! aws iam get-role --role-name "$EXEC_ROLE_NAME" > /dev/null 2>&1; then
     --role-name "$EXEC_ROLE_NAME" \
     --policy-arn "arn:aws:iam::aws:policy/AmazonECSTaskExecutionRolePolicy"
 
-  # Inline supplement: logs:CreateLogGroup (Pitfall 2 fix), plus ssm:GetParameters
-  # (R23) for the ECS agent to resolve a workspace task's `secrets` entries at
-  # container start — secrets are declared as `secrets` ARN references (never
-  # plaintext RunTask overrides, finding #4), and the execution role (not the task
-  # role, see WarrenTaskPolicy's SSMSecrets above) is what ECS uses to fetch them.
-  # This script never granted it anywhere, unlike terraform/main.tf's exec_log_policy
-  # SSMSecretsResolve statement / cdk/warren_stack.py's exec_role SSMSecretsResolve —
-  # every workspace secret injection would have hit AccessDenied.
+  # Inline supplement: logs:CreateLogGroup (Pitfall 2 fix), plus ssm:GetParameters so
+  # the ECS agent can resolve the control plane's own WARREN_SECRET_KEY if you keep it
+  # as an SSM SecureString under /warren/ (finding #19b; narrow the Resource to that one
+  # parameter, or drop the statement if it's in Secrets Manager). Workspace tasks have
+  # no `secrets` entries and need no SSM access.
   EXEC_LOG_POLICY='{
   "Version": "2012-10-17",
   "Statement": [
@@ -980,7 +964,7 @@ if ! aws iam get-role --role-name "$EXEC_ROLE_NAME" > /dev/null 2>&1; then
       "Resource": "arn:aws:logs:*:*:log-group:/warren/*"
     },
     {
-      "Sid": "SSMSecretsResolve",
+      "Sid": "ControlPlaneSecretKey",
       "Effect": "Allow",
       "Action": "ssm:GetParameters",
       "Resource": "arn:aws:ssm:*:*:parameter/warren/*"
@@ -1341,16 +1325,14 @@ for SUBNET in "${_SUBNET_ARRAY[@]}"; do
   fi
 done
 
-# R13: the access-point-TTL reaper (registry/efs_reaper.py) only ever deletes a
-# workspace's actual data directory (not just its access point) when the control-plane
-# task has WARREN_EFS_LOCAL_MOUNT_PATH set to a path where this access point's root is
-# locally NFS-mounted (config.py's efs_local_mount_path docstring). Rooted at
+# The control plane mounts this access point (WARREN_EFS_LOCAL_MOUNT_PATH) to write each
+# ECS workspace's secrets onto its volume just before RunTask (runtime/ecs_secrets.py),
+# so it is always created. With WARREN_EFS_PURGE_WORKSPACE_DATA=true (R13) the
+# access-point-TTL reaper also deletes a workspace's data directory through it. Rooted at
 # "/var/lib/warren" (NOT the filesystem's true root "/", and NOT a per-workspace subpath
 # like WarrenControlPlaneAccessPoint in terraform/main.tf or cdk/warren_stack.py) -- the
 # reaper needs to reach every workspaces/{id} directory under THIS prefix to delete it.
-# Opt-in and off by default (orphan-on-delete, the original behavior) since it's a
-# deliberate trust expansion: this access point grants broader filesystem access than
-# the control plane's own scoped state directory. Mirrors terraform/main.tf's
+# Mirrors terraform/main.tf's
 # aws_efs_access_point.warren_root / cdk/warren_stack.py's WarrenRootAccessPoint.
 #
 # Audit Z10: this was rooted at "/" until this fix. efs.py's per-workspace access points
@@ -1363,27 +1345,27 @@ done
 # nothing (debug-logged only) and no workspace data was ever actually freed despite the
 # feature being "on".
 WARREN_EFS_ROOT_AP_ID=""
-if [[ "$(yesno "Enable actual EFS data deletion on workspace destroy (mounts /var/lib/warren into the control-plane task; broader access than its own state directory)" "n")" == "y" ]]; then
-  EFS_ROOT_AP_NAME="warren-root-ap-$ENV"
-  WARREN_EFS_ROOT_AP_ID=$(aws efs describe-access-points \
+WARREN_EFS_PURGE_WORKSPACE_DATA=false
+if [[ "$(yesno "Delete a workspace's EFS data when its access point is reaped (R13)" "n")" == "y" ]]; then
+  WARREN_EFS_PURGE_WORKSPACE_DATA=true
+fi
+EFS_ROOT_AP_NAME="warren-root-ap-$ENV"
+WARREN_EFS_ROOT_AP_ID=$(aws efs describe-access-points \
+  --file-system-id "$WARREN_EFS_ID" \
+  --query "AccessPoints[?Tags[?Key=='Name' && Value=='$EFS_ROOT_AP_NAME']].AccessPointId | [0]" \
+  --output text 2>/dev/null || echo "None")
+if [[ "$WARREN_EFS_ROOT_AP_ID" == "None" || -z "$WARREN_EFS_ROOT_AP_ID" ]]; then
+  echo "Creating EFS root access point '$EFS_ROOT_AP_NAME'..."
+  WARREN_EFS_ROOT_AP_ID=$(aws efs create-access-point \
     --file-system-id "$WARREN_EFS_ID" \
-    --query "AccessPoints[?Tags[?Key=='Name' && Value=='$EFS_ROOT_AP_NAME']].AccessPointId | [0]" \
-    --output text 2>/dev/null || echo "None")
-  if [[ "$WARREN_EFS_ROOT_AP_ID" == "None" || -z "$WARREN_EFS_ROOT_AP_ID" ]]; then
-    echo "Creating EFS root access point '$EFS_ROOT_AP_NAME'..."
-    WARREN_EFS_ROOT_AP_ID=$(aws efs create-access-point \
-      --file-system-id "$WARREN_EFS_ID" \
-      --posix-user Uid=1000,Gid=1000 \
-      --root-directory "Path=/var/lib/warren" \
-      --tags Key=Name,Value="$EFS_ROOT_AP_NAME" Key=warren,Value=true \
-      --query "AccessPointId" \
-      --output text)
-    echo "EFS root access point $WARREN_EFS_ROOT_AP_ID created."
-  else
-    echo "EFS root access point '$EFS_ROOT_AP_NAME' already exists ($WARREN_EFS_ROOT_AP_ID). Skipping."
-  fi
+    --posix-user Uid=1000,Gid=1000 \
+    --root-directory "Path=/var/lib/warren" \
+    --tags Key=Name,Value="$EFS_ROOT_AP_NAME" Key=warren,Value=true \
+    --query "AccessPointId" \
+    --output text)
+  echo "EFS root access point $WARREN_EFS_ROOT_AP_ID created."
 else
-  echo "Skipping EFS root access point — workspace data will be orphaned (not deleted) on destroy."
+  echo "EFS root access point '$EFS_ROOT_AP_NAME' already exists ($WARREN_EFS_ROOT_AP_ID). Skipping."
 fi
 
 # WarrenTaskEFSPolicy — EFS IAM inline policy for task role (D-08). finding #20/#16:
@@ -1499,16 +1481,17 @@ echo "export WARREN_ECS_IMAGE_URI=\"$IMAGE_URI\""
 echo "export WARREN_EFS_ID=\"$WARREN_EFS_ID\""
 if [[ -n "$WARREN_EFS_ROOT_AP_ID" ]]; then
   echo ""
-  echo "R13: to actually delete workspace data (not just its access point) on destroy,"
-  echo "  mount access point $WARREN_EFS_ROOT_AP_ID (filesystem root) into the control-plane"
-  echo "  task at, e.g., /mnt/warren-efs-root (iam=ENABLED, transit encryption enabled), then:"
+  echo "Workspace secrets are delivered through the filesystem: mount access point"
+  echo "  $WARREN_EFS_ROOT_AP_ID into the control-plane task at /mnt/warren-efs-root"
+  echo "  (iam=ENABLED, transit encryption enabled), then:"
   echo "  export WARREN_EFS_LOCAL_MOUNT_PATH=\"/mnt/warren-efs-root\""
+  echo "  export WARREN_EFS_PURGE_WORKSPACE_DATA=\"$WARREN_EFS_PURGE_WORKSPACE_DATA\""
 fi
 echo ""
 echo "The control-plane task itself still needs (not generated by this script):"
 echo "  - WARREN_SERVER_ID set to a STABLE value (e.g. your ECS service name) — the"
-echo "    default (hostname) changes on every Fargate restart, orphaning SSM secret"
-echo "    paths and the EFS reaper's server-instance match (finding #19a)."
+echo "    default (hostname) changes on every Fargate restart, breaking the AWS"
+echo "    audience clients sign for and the EFS reaper's server-instance match (finding #19a)."
 echo "  - WARREN_SECRET_KEY sourced from a real secret store (SSM SecureString /"
 echo "    Secrets Manager) via the task definition's 'secrets' block — never a"
 echo "    plaintext env override on a run-task call (finding #19b)."
