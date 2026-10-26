@@ -462,6 +462,20 @@ matches any other family starting with `<prefix>-`, including this stack's own
 `warren-server-control-plane-<env>` with the default prefix. Keep the explicit Deny on the
 control plane's own family, and give each deployment in an account its own prefix.
 
+## Model access through a Bedrock gateway
+
+By default a bedrock-mode workspace (`model_access: bedrock`) calls Bedrock with its task
+role. To route it through a Bedrock-compatible gateway instead (an LLM proxy that meters
+per-user keys), set `WARREN_BEDROCK_GATEWAY_URL` on the control-plane task, for example
+`https://int.llm-proxy.example.com/bedrock`. Bedrock-mode workspaces then get:
+
+- `ANTHROPIC_BEDROCK_BASE_URL` set to that URL, and `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1`
+- their gateway key from the `ANTHROPIC_AUTH_TOKEN` secret, which the template must declare
+  (provisioning fails with `template_denied` otherwise); each user stores their own key
+
+A template's own `env` wins over both values. Once every workspace goes through the gateway,
+drop `bedrock:InvokeModel*` from the workspace task role so the gateway is the only path.
+
 ## ECS Exec access
 
 Every workspace task carries a `warren.owner_id` tag (`<WARREN_ECS_RESOURCE_PREFIX>.owner_id`).

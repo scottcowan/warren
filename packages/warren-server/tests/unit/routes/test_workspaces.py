@@ -742,6 +742,67 @@ def test_provision_bedrock_rejects_claude_oauth_token_secret(env_defaults, auth_
     fake_registry._do_provision.assert_not_called()
 
 
+_GATEWAY = "https://int.llm-proxy.example.com/bedrock"
+
+
+def test_provision_bedrock_gateway_sets_base_url_and_skips_aws_auth(env_defaults, auth_headers, monkeypatch):
+    monkeypatch.setenv("WARREN_BEDROCK_GATEWAY_URL", _GATEWAY + "/")
+    resp, fake_registry = _provision_template(
+        auth_headers, {"app": "claude", "model_access": "bedrock", "secrets": [{"name": "ANTHROPIC_AUTH_TOKEN"}]}
+    )
+    assert resp.status_code == 202
+    _, spec = fake_registry._do_provision.call_args.args
+    assert spec.template_env["ANTHROPIC_BEDROCK_BASE_URL"] == _GATEWAY
+    assert spec.template_env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
+    assert spec.template_env["CLAUDE_CODE_USE_BEDROCK"] == "1"
+    assert "ANTHROPIC_AUTH_TOKEN" not in spec.template_env
+
+
+def test_provision_bedrock_gateway_requires_token_secret(env_defaults, auth_headers, monkeypatch):
+    monkeypatch.setenv("WARREN_BEDROCK_GATEWAY_URL", _GATEWAY)
+    resp, fake_registry = _provision_template(auth_headers, {"app": "claude", "model_access": "bedrock"})
+    assert resp.status_code == 422
+    assert "ANTHROPIC_AUTH_TOKEN" in resp.json()["detail"]["detail"]
+    fake_registry._do_provision.assert_not_called()
+
+
+def test_provision_bedrock_gateway_template_env_wins(env_defaults, auth_headers, monkeypatch):
+    monkeypatch.setenv("WARREN_BEDROCK_GATEWAY_URL", _GATEWAY)
+    resp, fake_registry = _provision_template(
+        auth_headers,
+        {
+            "app": "claude",
+            "model_access": "bedrock",
+            "env": {"ANTHROPIC_BEDROCK_BASE_URL": "https://other.example.com/bedrock"},
+            "secrets": [{"name": "ANTHROPIC_AUTH_TOKEN"}],
+        },
+    )
+    assert resp.status_code == 202
+    _, spec = fake_registry._do_provision.call_args.args
+    assert spec.template_env["ANTHROPIC_BEDROCK_BASE_URL"] == "https://other.example.com/bedrock"
+
+
+def test_provision_without_gateway_leaves_bedrock_env_alone(env_defaults, auth_headers, monkeypatch):
+    monkeypatch.delenv("WARREN_BEDROCK_GATEWAY_URL", raising=False)
+    resp, fake_registry = _provision_template(auth_headers, {"app": "claude", "model_access": "bedrock"})
+    assert resp.status_code == 202
+    _, spec = fake_registry._do_provision.call_args.args
+    assert "ANTHROPIC_BEDROCK_BASE_URL" not in spec.template_env
+    assert "CLAUDE_CODE_SKIP_BEDROCK_AUTH" not in spec.template_env
+
+
+@pytest.mark.parametrize(
+    "url", ["http://int.example.com/bedrock", "https://user:pw@int.example.com/", "https://h.example.com/?k=v"]
+)
+def test_bedrock_gateway_url_must_be_plain_https(env_defaults, monkeypatch, url):
+    from pydantic import ValidationError
+    from warren.config import WarrenSettings
+
+    monkeypatch.setenv("WARREN_BEDROCK_GATEWAY_URL", url)
+    with pytest.raises(ValidationError):
+        WarrenSettings()
+
+
 def test_provision_drops_image_not_sanctioned_falls_back_to_default(env_defaults, auth_headers):
     """Z12: a user-scoped template's docker_image naming an arbitrary registry
     image -- not the model's own default, not declared in any server-wide
