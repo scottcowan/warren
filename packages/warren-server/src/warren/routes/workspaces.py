@@ -409,12 +409,10 @@ async def _provision_workspace(
 
     # For podman/docker, decrypt and inject this workspace OWNER's (never
     # another user's — isolation is per-owner, routes/secrets.py) visible
-    # secret tier directly into spec.env. ECS does NOT go through this path --
-    # its secrets are resolved by the ECS agent itself from the SSM mirror at
-    # container start (runtime/ecs.py reads the same owner_id-scoped path), so
-    # a decrypted value never needs to pass through this process for that
-    # runtime (routes/secrets.py's module docstring has the full reasoning for
-    # why SSM is a write-time mirror rather than a provision-time sync).
+    # secret tier directly into spec.env. ECS does NOT go through this path:
+    # spec.env becomes RunTask overrides, which DescribeTasks/CloudTrail record,
+    # so runtime/ecs.py resolves the same owner's declared secrets itself and
+    # writes them onto the task's own EFS volume (runtime/ecs_secrets.py).
     secret_env: dict[str, str] = {}
     if settings is not None and getattr(settings, "runtime_type", "podman") != "ecs":
         from warren.secrets import store as local_store

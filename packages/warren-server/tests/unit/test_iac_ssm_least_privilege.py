@@ -1,5 +1,5 @@
-"""Guards: the control plane holds no SSM read action and, for secrets, only
-kms:Encrypt; the server image ships a pinned, checksum-verified session-manager-plugin."""
+"""Guards: workspace secrets touch no SSM/KMS in any IaC (they are delivered through the
+EFS root mount); the server image ships a pinned, checksum-verified session-manager-plugin."""
 
 from __future__ import annotations
 
@@ -36,37 +36,44 @@ def _block(text: str, header: str) -> str:
     raise AssertionError(header)
 
 
-def test_terraform_control_plane_kms_is_encrypt_only_for_ssm():
+def test_terraform_grants_no_ssm_for_workspace_secrets():
     tf = (_ECS / "terraform" / "main.tf").read_text()
-    policy = _block(tf, 'data "aws_iam_policy_document" "task_role_policy"')
-    enc = policy[policy.index('sid       = "SSMSecretsKMSEncrypt"') :]
-    enc = enc[: enc.index("\n    }\n")]
-    assert 'actions   = ["kms:Encrypt"]' in enc
-    assert "kms:EncryptionContext:PARAMETER_ARN" in enc and "kms:ViaService" in enc
-    # The only Decrypt left on this role is ECS Exec session/log encryption.
-    decrypts = [m.start() for m in re.finditer(r'"kms:Decrypt"', policy)]
+    task_policy = _block(tf, 'data "aws_iam_policy_document" "task_role_policy"')
+    assert '"ssm:' not in task_policy
+    # The only Decrypt left on the control-plane role is ECS Exec session/log encryption.
+    decrypts = [m.start() for m in re.finditer(r'"kms:Decrypt"', task_policy)]
     assert len(decrypts) == 1
-    assert 'sid       = "ECSExecLogKMS"' in policy[max(0, decrypts[0] - 200) : decrypts[0]]
-    assert '"ssm:Get' not in policy
-    assert 'resources = [local.ssm_secret_parameter_arns]' in _block(policy, "statement {\n    sid    = \"SSMSecretsWrite\"")
-
-
-def test_terraform_wires_the_ssm_key_into_the_server_and_exec_role():
-    tf = (_ECS / "terraform" / "main.tf").read_text()
-    assert '{ name = "WARREN_KMS_KEY_ID", value = local.ssm_kms_key_arn }' in tf
+    assert 'sid       = "ECSExecLogKMS"' in task_policy[max(0, decrypts[0] - 200) : decrypts[0]]
     exec_policy = _block(tf, 'data "aws_iam_policy_document" "exec_log_policy"')
-    assert "resources = local.exec_decrypt_keys" in exec_policy
-    variables = (_ECS / "terraform" / "variables.tf").read_text()
-    assert 'variable "create_ssm_kms_key"' in variables and 'variable "ssm_kms_key_arn"' in variables
+    assert re.findall(r'"ssm:[A-Za-z]+"', exec_policy) == ['"ssm:GetParameters"']
+    assert "resources = [aws_ssm_parameter.warren_secret_key.arn]" in exec_policy
+    for gone in ("WARREN_KMS_KEY_ID", "ssm_kms_key_arn", "create_ssm_kms_key", '"ssm:PutParameter"'):
+        assert gone not in tf
+        assert gone not in (_ECS / "terraform" / "variables.tf").read_text()
 
 
-def test_cdk_control_plane_kms_is_encrypt_only_for_ssm():
+def test_terraform_always_mounts_the_efs_root_for_secret_delivery():
+    tf = (_ECS / "terraform" / "main.tf").read_text()
+    root_ap = _block(tf, 'resource "aws_efs_access_point" "warren_root"')
+    assert "count = var.create_efs ? 1 : 0" in root_ap
+    assert '{ name = "WARREN_EFS_LOCAL_MOUNT_PATH", value = var.create_efs ? "/mnt/warren-efs-root" : "" }' in tf
+    assert "WARREN_EFS_PURGE_WORKSPACE_DATA" in tf
+    assert "efs_delete_workspace_data_on_destroy ? [" not in tf
+
+
+def test_cdk_grants_no_ssm_for_workspace_secrets():
     cdk = (_ECS / "cdk" / "warren_stack.py").read_text()
-    enc = cdk[cdk.index('sid="SSMSecretsKMSEncrypt"') :]
-    enc = enc[: enc.index("),")]
-    assert 'actions=["kms:Encrypt"]' in enc
+    for gone in ('"ssm:GetParameters"', '"ssm:PutParameter"', "WARREN_KMS_KEY_ID", "ssm_kms_key_arn"):
+        assert gone not in cdk
     assert '"kms:Decrypt",\n' not in cdk[cdk.index('"WarrenTaskPolicy"') :]
-    assert 'name="WARREN_KMS_KEY_ID", value=ssm_kms_key_arn' in cdk
+    assert "root_ap = efs_fs.add_access_point(" in cdk
+    assert 'value="/mnt/warren-efs-root" if root_ap is not None else ""' in cdk
+
+
+def test_setup_sh_grants_no_ssm_writes():
+    sh = (_ECS / "setup.sh").read_text()
+    assert '"ssm:PutParameter"' not in sh and '"ssm:DeleteParameter"' not in sh
+    assert 'Enable actual EFS data deletion' not in sh  # the root access point is always created
 
 
 def test_server_image_pins_and_verifies_session_manager_plugin():

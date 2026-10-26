@@ -42,8 +42,6 @@ def _make_runtime(
 
     rt = ECSRuntime(server_id="test-server")
     rt._ecs = mock_ecs
-    rt._ssm = mock_ssm
-    rt._sts = mock_sts or _mock_sts()
     rt._logs = mock_logs or _mock_logs()
     rt._preflight_ok = True
     return rt
@@ -339,64 +337,6 @@ def test_status_with_empty_runtime_id_returns_unknown_without_calling_ecs():
 
     assert status == "unknown"
     mock_ecs.describe_tasks.assert_not_called()
-
-
-def test_secrets_declared_as_arn_refs_never_as_plaintext_overrides():
-    """Secrets are declared on the task def as `secrets` ARN references, never as
-    plaintext in run_task containerOverrides.environment (fixes issue #4: decrypted
-    plaintext secret values were previously sent via RunTask overrides, exposing them
-    in DescribeTasks/CloudTrail).
-    """
-    from warren.runtime.ecs import ECSRuntime
-
-    mock_ecs = _mock_ecs()
-    mock_ssm = _mock_ssm()
-    rt = _make_runtime(mock_ecs, mock_ssm)
-
-    spec = _spec()
-    spec.secret_names = ["api-key"]
-    asyncio.run(rt.provision(spec))
-
-    # Task definition's container gets a `secrets` entry referencing the parameter's
-    # ARN — never the decrypted value itself.
-    register_call_kwargs = mock_ecs.register_task_definition.call_args
-    assert register_call_kwargs is not None
-    call_dict = (
-        register_call_kwargs.kwargs
-        if register_call_kwargs.kwargs
-        else register_call_kwargs[1] if len(register_call_kwargs) > 1 else {}
-    )
-    container_defs = call_dict.get("containerDefinitions", [])
-    assert container_defs, "expected at least one container definition"
-    for container in container_defs:
-        assert "environment" not in container, (
-            "Secrets must NOT appear in task definition containerDefinitions.environment"
-        )
-        secrets = container.get("secrets", [])
-        assert any(s["name"] == "api-key" for s in secrets), (
-            f"expected a secrets entry for 'api-key', got {secrets}"
-        )
-        for s in secrets:
-            assert s["valueFrom"].startswith("arn:aws:ssm:"), (
-                f"secrets valueFrom must be an SSM parameter ARN, got {s['valueFrom']!r}"
-            )
-            assert "/warren/test-server/test-user/api-key" in s["valueFrom"]
-
-    # run_task's containerOverrides.environment must contain NO secret values at all —
-    # only whatever spec.env carries (non-secret, caller-supplied env vars).
-    run_call_kwargs = mock_ecs.run_task.call_args
-    assert run_call_kwargs is not None
-    run_dict = (
-        run_call_kwargs.kwargs
-        if run_call_kwargs.kwargs
-        else run_call_kwargs[1] if len(run_call_kwargs) > 1 else {}
-    )
-    overrides = run_dict.get("overrides", {})
-    override_env = overrides.get("containerOverrides", [{}])[0].get("environment", [])
-    assert all(e["name"] != "api-key" for e in override_env), (
-        "secret must never appear in containerOverrides.environment"
-    )
-
 
 def test_status_mapping_running():
     """describe_tasks lastStatus 'RUNNING' maps to 'running'."""
@@ -718,7 +658,6 @@ def test_provision_passes_owner_id_to_volume_attach():
     rt._ecs = mock_ecs
     rt._ssm = mock_ssm
     rt._logs = _mock_logs()
-    rt._sts = _mock_sts()
     rt._preflight_ok = True
 
     spec = WorkspaceSpec(
@@ -752,7 +691,6 @@ def test_provision_passes_none_owner_id_to_volume_attach_when_unset():
     rt._ecs = mock_ecs
     rt._ssm = mock_ssm
     rt._logs = _mock_logs()
-    rt._sts = _mock_sts()
     rt._preflight_ok = True
 
     spec = WorkspaceSpec(
@@ -809,7 +747,6 @@ def test_provision_detaches_access_point_when_run_task_fails_after_attach():
     rt._ecs = mock_ecs
     rt._ssm = mock_ssm
     rt._logs = _mock_logs()
-    rt._sts = _mock_sts()
     rt._preflight_ok = True
 
     with pytest.raises(ProvisionError):
@@ -862,7 +799,6 @@ def test_destroy_deregisters_workspace_specific_task_definition():
     rt._ecs = mock_ecs
     rt._ssm = mock_ssm
     rt._logs = _mock_logs()
-    rt._sts = _mock_sts()
     rt._preflight_ok = True
 
     handle = WorkspaceHandle(
@@ -905,7 +841,6 @@ def test_destroy_does_not_deregister_cached_task_definition():
     rt._ecs = mock_ecs
     rt._ssm = mock_ssm
     rt._logs = _mock_logs()
-    rt._sts = _mock_sts()
     rt._preflight_ok = True
     rt._task_def_cache[("some-key",)] = cached_arn
 
@@ -982,18 +917,11 @@ def test_resource_prefix_defaults_to_warren():
     mock_ecs = _mock_ecs()
     mock_ssm = _mock_ssm()
     rt = _make_runtime(mock_ecs, mock_ssm)
-    spec = _spec()
-    spec.secret_names = ["K"]
-
-    asyncio.run(rt.provision(spec))
-
-    assert mock_ssm.method_calls == []
+    asyncio.run(rt.provision(_spec()))
 
     register_kwargs = mock_ecs.register_task_definition.call_args.kwargs
     assert register_kwargs["family"] == "warren-test-warren-base-latest"
-    assert register_kwargs["containerDefinitions"][0]["secrets"][0]["valueFrom"].endswith(
-        ":parameter/warren/test-server/test-user/K"
-    )
+    assert "secrets" not in register_kwargs["containerDefinitions"][0]
     log_opts = register_kwargs["containerDefinitions"][0]["logConfiguration"]["options"]
     assert log_opts["awslogs-group"] == "/warren/test-server"
     tag_keys = {t["key"] for t in register_kwargs["tags"]}
@@ -1072,23 +1000,15 @@ def test_resource_prefix_override_replaces_warren_everywhere(monkeypatch: pytest
     rt._ecs = mock_ecs
     rt._ssm = mock_ssm
     rt._logs = _mock_logs()
-    rt._sts = _mock_sts()
     rt._preflight_ok = True
-    spec = _spec()
-    spec.secret_names = ["K"]
-
-    asyncio.run(rt.provision(spec))
-
-    assert mock_ssm.method_calls == []
+    asyncio.run(rt.provision(_spec()))
 
     register_kwargs = mock_ecs.register_task_definition.call_args.kwargs
     # finding #15: the task-definition family must carry the resource prefix too, not
     # just tags/log groups/SSM paths — otherwise a deployment can never scope
     # ecs:RunTask/RegisterTaskDefinition IAM to its own task-definition/<prefix>-* families.
     assert register_kwargs["family"] == "control-plane-test-warren-base-latest"
-    assert register_kwargs["containerDefinitions"][0]["secrets"][0]["valueFrom"].endswith(
-        ":parameter/control-plane/test-server/test-user/K"
-    )
+    assert "secrets" not in register_kwargs["containerDefinitions"][0]
     log_opts = register_kwargs["containerDefinitions"][0]["logConfiguration"]["options"]
     assert log_opts["awslogs-group"] == "/control-plane/test-server"
     tag_keys = {t["key"] for t in register_kwargs["tags"]}
@@ -1107,7 +1027,7 @@ def test_resource_prefix_override_replaces_warren_everywhere(monkeypatch: pytest
     assert run_kwargs["startedBy"] == "control-plane-test-server"
 
 
-def test_ssm_client_reused_across_calls_not_recreated_per_call(monkeypatch: "pytest.MonkeyPatch"):
+def test_boto3_session_reused_across_calls_not_recreated_per_call(monkeypatch: "pytest.MonkeyPatch"):
     """R15: a single ECSRuntime instance (the app-state singleton every HTTP request
     shares, constructed once in app.py's lifespan) must open its boto3 ECS/SSM/STS/
     logs session exactly once and reuse it on every subsequent call -- not open a
@@ -1134,24 +1054,12 @@ def test_ssm_client_reused_across_calls_not_recreated_per_call(monkeypatch: "pyt
 
     rt = ECSRuntime(server_id="test-server")
 
-    # First access constructs the session/clients.
-    ecs1, ssm1 = rt._ensure_clients()
-    assert len(session_calls) == 1
+    ecs1 = rt._ensure_clients()
+    ecs2 = rt._ensure_clients()
 
-    # Every subsequent access -- via the internal accessor and the public
-    # ssm_client() accessor routes/secrets.py calls on every request -- must reuse
-    # the already-constructed clients, not open a new boto3.Session.
-    ecs2, ssm2 = rt._ensure_clients()
-    ssm3 = rt.ssm_client()
-    ssm4 = rt.ssm_client()
-
-    assert len(session_calls) == 1, (
-        "ECSRuntime opened more than one boto3 session across repeated calls -- "
-        "every HTTP request sharing this runtime instance would pay for a fresh "
-        "SSM session instead of reusing one (R15)."
-    )
+    assert len(session_calls) == 1, "ECSRuntime opened more than one boto3 session (R15)"
     assert ecs1 is ecs2
-    assert ssm1 is ssm2 is ssm3 is ssm4
+    assert not hasattr(rt, "ssm_client")
 
 
 def test_provision_omits_container_user_by_default():
@@ -1178,7 +1086,6 @@ def test_provision_sets_container_user_from_ecs_task_user():
     rt._ecs = mock_ecs
     rt._ssm = _mock_ssm()
     rt._logs = _mock_logs()
-    rt._sts = _mock_sts()
     rt._preflight_ok = True
 
     asyncio.run(rt.provision(_spec()))
@@ -1515,53 +1422,3 @@ def test_operation_client_token_changes_with_launch_payload():
         asyncio.run(rt.provision(spec))
         tokens.append(mock_ecs.run_task.call_args.kwargs["clientToken"])
     assert tokens[0] != tokens[1]
-
-
-def test_provision_takes_secret_names_from_the_mirror_never_from_ssm():
-    """Least privilege: secret ARNs come from warren's own store (SsmMirror), and
-    provisioning makes no SSM call at all -- the control plane holds no SSM read."""
-    mock_ecs = _mock_ecs()
-    mock_ssm = _mock_ssm()
-    rt = _make_runtime(mock_ecs, mock_ssm)
-    mirror = MagicMock()
-    mirror.mirrored_names = AsyncMock(return_value=["A"])
-    rt.secret_mirror = mirror
-    spec = _spec()
-    spec.secret_names = ["A", "NOT_SET"]
-
-    asyncio.run(rt.provision(spec))
-
-    mirror.mirrored_names.assert_awaited_once_with("test-user", ["A", "NOT_SET"])
-    secrets = mock_ecs.register_task_definition.call_args.kwargs["containerDefinitions"][0]["secrets"]
-    assert [s["name"] for s in secrets] == ["A"]
-    assert mock_ssm.method_calls == []
-
-
-def test_provision_fails_closed_while_a_declared_secret_is_unmirrored():
-    from warren_common.errors import ProvisionError
-
-    mock_ecs = _mock_ecs()
-    rt = _make_runtime(mock_ecs, _mock_ssm())
-    rt.secret_mirror = MagicMock()
-    rt.secret_mirror.mirrored_names = AsyncMock(side_effect=ProvisionError("not yet mirrored: A"))
-    spec = _spec()
-    spec.secret_names = ["A"]
-
-    with pytest.raises(ProvisionError):
-        asyncio.run(rt.provision(spec))
-    mock_ecs.register_task_definition.assert_not_called()
-    mock_ecs.run_task.assert_not_called()
-
-
-def test_provision_without_owner_gets_no_secret_arns():
-    mock_ecs = _mock_ecs()
-    rt = _make_runtime(mock_ecs, _mock_ssm())
-    spec = _spec()
-    spec.owner_id = ""
-    spec.secret_names = ["A"]
-
-    asyncio.run(rt.provision(spec))
-
-    assert "secrets" not in mock_ecs.register_task_definition.call_args.kwargs["containerDefinitions"][0] or (
-        mock_ecs.register_task_definition.call_args.kwargs["containerDefinitions"][0]["secrets"] == []
-    )

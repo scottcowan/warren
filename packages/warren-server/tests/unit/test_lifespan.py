@@ -152,10 +152,10 @@ async def test_lifespan_omits_git_manager_for_ecs(env_defaults, monkeypatch):
             pass
 
     assert reg_cls.call_args.kwargs["git_manager"] is None
-    from warren.secrets.ssm_store import SsmMirror
+    # Secret values come from the local store, wired straight into the runtime.
+    import inspect
 
-    assert isinstance(fake_runtime.secret_mirror, SsmMirror)
-    assert app.state.secret_mirror is fake_runtime.secret_mirror
+    assert inspect.iscoroutinefunction(fake_runtime.secret_values)
 
 
 @pytest.mark.asyncio

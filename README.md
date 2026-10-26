@@ -149,9 +149,8 @@ There's no separate "intent" type — each named entry under `templates` is a fu
 node itself, so it can nest its own `templates` in turn. A child inherits everything from
 its parent unless it overrides it: scalars (`docker_image`, `app`, `permission`, ...) are
 replaced, lists (`mounts`, `secrets`, `docker_networks`) are appended to, and `scope`/`aws`/
-`ssh` are merged key-by-key. `permission` controls which SSM secret tier gets fetched on
-ECS-backed servers (readonly templates never see write/admin-tier secrets); the sandbox
-itself is enforced through `mounts` (each one explicitly `ro` or `rw`) — not through `scope`,
+`ssh` are merged key-by-key. A workspace gets exactly the `secrets` its template declares,
+from its owner's own secrets in warren's store; the sandbox itself is enforced through `mounts` (each one explicitly `ro` or `rw`) — not through `scope`,
 which exists on the model today but isn't enforced yet.
 
 ```yaml

@@ -4,13 +4,11 @@ Full implementation per Plan 07-02. Follows DockerRuntime file-layout
 pattern: same module docstring format, same import block, same class layout.
 
 Security invariants (see 07-RESEARCH.md threat model):
-    - Secrets are declared in the task definition's `secrets` block as SSM
-      ARN references, resolved by the ECS agent at container start — never
-      as plaintext `run_task` environment overrides (T-07-01, D-07). (Audit
-      #61: this docstring previously described the opposite — the plaintext
-      containerOverrides approach was the pre-fix design; the registered
-      task definition's `secrets` block, built in `_register_and_run`, is
-      what's actually used today.)
+    - Secrets live only in warren's encrypted store. They reach a task as a
+      file on its own EFS volume, written just before RunTask and consumed
+      (then deleted) by the image's entrypoint and git-init (ecs_secrets.py)
+      -- never as plaintext `run_task` overrides (T-07-01, D-07), and never in
+      the task definition.
     - cpu/memory validated against VALID_FARGATE_PAIRS before any AWS call
       (T-07-02, D-02).
     - Task ARNs read from warren's own SQLite store (T-07-04).
@@ -42,6 +40,13 @@ from warren.runtime.ecs_git import (
     WORKSPACE_DIR,
     GitInitPlan,
     build_git_init_plan,
+)
+from warren.runtime.ecs_secrets import (
+    GIT_INIT_FILE,
+    WORKSPACE_FILE,
+    is_env_name,
+    remove_secrets,
+    write_secrets,
 )
 from warren_common.agent_launch import SPEC_ENV as AGENT_SPEC_ENV
 from warren_common.errors import ProvisionError, RuntimeUnreachable
@@ -110,10 +115,9 @@ class ECSRuntime:
         # AI3: get/put/delete of the per-workspace launch identity; app.py wires the
         # SQLite-backed LaunchAttemptStore so it survives a server restart.
         self.launch_store: Any = launch_store or _MemoryLaunchStore()
-        # warren.secrets.ssm_store.SsmMirror, wired by app.py: the authoritative list
-        # of which declared secret names an owner has mirrored. Unset (tests), every
-        # declared name gets an ARN.
-        self.secret_mirror: Any = None
+        # async (owner_id, names) -> {name: value} over warren's encrypted secret store,
+        # wired by app.py. Unset, a workspace gets no secrets.
+        self.secret_values: Any = None
         self._settings = settings
         # Allow direct cpu/memory kwargs to override settings (used in tests
         # and when calling without a full WarrenSettings object).
@@ -123,12 +127,9 @@ class ECSRuntime:
         # tag keys all derive from this instead of a hardcoded "warren" literal.
         self._resource_prefix = getattr(settings, "ecs_resource_prefix", None) or "warren"
         self._ecs: Any = None
-        self._ssm: Any = None
-        self._sts: Any = None
         self._logs: Any = None
         self._log_retention_days = getattr(settings, "ecs_log_retention_days", None) or 90
         self._ensured_log_groups: set[str] = set()
-        self._account_id: str | None = None
         self._preflight_ok = False
         self._task_def_cache: dict[str, str] = {}  # canonical task-definition JSON → task_def_arn
         self._volume: WorkspaceVolume | None = volume
@@ -169,8 +170,8 @@ class ECSRuntime:
                 return task["task_arn"]
         return None
 
-    def _ensure_clients(self) -> tuple[Any, Any]:
-        """Lazily initialise boto3 ECS and SSM clients (deferred import).
+    def _ensure_clients(self) -> Any:
+        """Lazily initialise the boto3 ECS (and logs) clients; returns ECS.
 
         Passes region_name explicitly so WARREN_AWS_REGION controls the boto3
         endpoint — not just the CloudWatch log group config string (WR-02).
@@ -181,10 +182,57 @@ class ECSRuntime:
             region = getattr(self._settings, "aws_region", "us-east-1") or "us-east-1"
             session = boto3.Session(region_name=region)
             self._ecs = session.client("ecs")
-            self._ssm = session.client("ssm")
-            self._sts = session.client("sts")
             self._logs = session.client("logs")
-        return self._ecs, self._ssm
+        return self._ecs
+
+    def _local_mount(self) -> str:
+        path = getattr(self._settings, "efs_local_mount_path", "")
+        return path if isinstance(path, str) else ""
+
+    async def _resolve_secrets(self, spec: WorkspaceSpec) -> dict[str, str]:
+        owner_id = getattr(spec, "owner_id", "") or ""
+        declared = list(getattr(spec, "secret_names", []) or [])
+        if not owner_id or not declared or self.secret_values is None:
+            return {}
+        values = await self.secret_values(owner_id, declared)
+        out: dict[str, str] = {}
+        for name in declared:
+            if name not in values:
+                continue
+            if not is_env_name(name):
+                log.warning("ecs_secret_skipped_not_env_name", workspace_id=spec.workspace_id, name=name)
+                continue
+            out[name] = values[name]
+        return out
+
+    async def _deliver_secrets(
+        self, workspace_id: str, delivered: dict[str, str], git_plan: GitInitPlan | None
+    ) -> None:
+        """Write this launch's secrets files on the workspace's volume (or clear stale
+        ones). The git-init credentials go only to git-init's file."""
+        local_mount = self._local_mount()
+        if not local_mount or self._volume is None:
+            return
+        init_names = set(git_plan.init_secret_names) if git_plan is not None else set()
+        files = {
+            WORKSPACE_FILE: {k: v for k, v in delivered.items() if k not in init_names},
+            GIT_INIT_FILE: {k: v for k, v in delivered.items() if k in init_names},
+        }
+        try:
+            await asyncio.to_thread(write_secrets, local_mount, workspace_id, files)
+        except (OSError, ValueError) as exc:
+            raise ProvisionError(
+                f"cannot write secrets onto workspace {workspace_id}'s volume: {type(exc).__name__}"
+            ) from exc
+
+    async def _remove_secrets(self, workspace_id: str) -> None:
+        local_mount = self._local_mount()
+        if not local_mount or self._volume is None:
+            return
+        try:
+            await asyncio.to_thread(remove_secrets, local_mount, workspace_id)
+        except (OSError, ProvisionError):
+            log.warning("ecs_secrets_remove_failed", workspace_id=workspace_id)
 
     async def _ensure_log_group(self, group_name: str) -> None:
         """Idempotently create `group_name` with bounded retention (audit #53).
@@ -215,26 +263,9 @@ class ECSRuntime:
         )
         self._ensured_log_groups.add(group_name)
 
-    def ssm_client(self) -> Any:
-        """Return the lazily-constructed boto3 SSM client.
-
-        Used only by the secret mirror's writes (PutParameter/DeleteParameter); this
-        runtime never reads SSM itself.
-        """
-        _, ssm = self._ensure_clients()
-        return ssm
-
-    async def _ensure_account_id(self) -> str:
-        """Lazily resolve and cache the AWS account ID (needed to build SSM parameter ARNs)."""
-        if self._account_id is None:
-            self._ensure_clients()
-            identity = await asyncio.to_thread(self._sts.get_caller_identity)
-            self._account_id = identity["Account"]
-        return self._account_id
-
     async def preflight(self) -> None:
         """Verify ECS cluster is reachable; raise RuntimeUnreachable on failure."""
-        ecs, _ = self._ensure_clients()
+        ecs = self._ensure_clients()
         cluster = getattr(self._settings, "ecs_cluster", "") or ""
         try:
             resp = await asyncio.to_thread(
@@ -274,38 +305,18 @@ class ECSRuntime:
         # Validate before any AWS call (T-07-02).
         self._validate_cpu_memory(resolved_cpu, resolved_memory)
 
-        ecs, _ = self._ensure_clients()
-
-        # Secret NAMES come from warren's own store, never from listing SSM: the
-        # control plane holds no SSM read permission at all (GetParametersByPath can't
-        # be limited to WithDecryption=false in IAM). spec.secret_names is the
-        # resolved template's declared allow-list; only names this workspace's OWNER
-        # actually has, already mirrored, get an ARN.
-        owner_id = getattr(spec, "owner_id", "") or ""
-        declared = list(getattr(spec, "secret_names", []) or [])
-        if self.secret_mirror is not None:
-            names = await self.secret_mirror.mirrored_names(owner_id, declared)
-        else:
-            names = declared if owner_id else []
-
-        region = getattr(self._settings, "aws_region", "us-east-1") or "us-east-1"
-        account_id = await self._ensure_account_id()
-        # ECS `secrets` entries — resolved to plaintext by the ECS agent itself at container
-        # start (via the task execution role's ssm:GetParameters), never appearing in
-        # RunTask's request/response, DescribeTasks, or CloudTrail as plaintext.
-        secret_defs = [
-            {
-                "name": name,
-                "valueFrom": (
-                    f"arn:aws:ssm:{region}:{account_id}:parameter"
-                    f"{ssm_parameter_name(self._resource_prefix, self.server_id, owner_id, name)}"
-                ),
-            }
-            for name in names
-        ]
+        # Exactly the template-declared secrets this workspace's OWNER has, decrypted
+        # from warren's own store. They reach the task only as a file on its EFS volume
+        # (runtime/ecs_secrets.py), written just before RunTask.
+        delivered = await self._resolve_secrets(spec)
+        if delivered and not (self._volume is not None and self._local_mount()):
+            raise ProvisionError(
+                "this workspace declares secrets, and ECS delivers them through its EFS "
+                "volume: set WARREN_EFS_ID and WARREN_EFS_LOCAL_MOUNT_PATH"
+            )
 
         family = _slug(spec.image, self._resource_prefix)
-        git_plan = build_git_init_plan(spec, secret_defs)
+        git_plan = build_git_init_plan(spec, frozenset(delivered))
 
         # D-10: EFS is opt-in — only activate when a volume is wired in
         access_point_id: str | None = None
@@ -320,7 +331,7 @@ class ECSRuntime:
         # expiry — then re-raise so the caller still sees the original error.
         try:
             return await self._register_and_run(
-                spec, access_point_id, resolved_cpu, resolved_memory, family, secret_defs, git_plan,
+                spec, access_point_id, resolved_cpu, resolved_memory, family, delivered, git_plan,
             )
         except Exception:
             if self._volume is not None:
@@ -340,10 +351,10 @@ class ECSRuntime:
         resolved_cpu: str,
         resolved_memory: str,
         family: str,
-        secret_defs: list[dict[str, str]],
+        delivered: dict[str, str],
         git_plan: GitInitPlan | None = None,
     ) -> WorkspaceHandle:
-        ecs, _ = self._ensure_clients()
+        ecs = self._ensure_clients()
         await self._ensure_log_group(f"/{self._resource_prefix}/{self.server_id}")
 
         region = getattr(self._settings, "aws_region", "us-east-1") or "us-east-1"
@@ -372,13 +383,9 @@ class ECSRuntime:
                     "name": "workspace",
                     "image": spec.image,
                     "essential": True,
-                    # NO environment here — non-secret spec.env goes via run_task
-                    # overrides below; secrets are declared here as `secrets`
-                    # entries (SSM ARN references, resolved by the ECS agent at
-                    # container start) — never as plaintext overrides (D-07, T-07-01).
-                    "secrets": (
-                        git_plan.workspace_secret_defs if git_plan is not None else secret_defs
-                    ),
+                    # NO environment and no secrets here: non-secret spec.env goes via
+                    # run_task overrides below, secrets via the volume (ecs_secrets.py),
+                    # so this definition carries nothing owner-specific.
                     "linuxParameters": {"initProcessEnabled": True},
                     "logConfiguration": {"logDriver": "awslogs", "options": log_options},
                 }
@@ -437,7 +444,6 @@ class ECSRuntime:
                     "essential": False,
                     "entryPoint": [GIT_INIT_ENTRYPOINT],
                     "command": [],
-                    "secrets": git_plan.init_secret_defs,
                     "mountPoints": mount_points,
                     "logConfiguration": {
                         "logDriver": "awslogs",
@@ -450,9 +456,8 @@ class ECSRuntime:
             ]
 
         # Build environment overrides list — spec.env only. Secrets never flow through
-        # here (issue #4): they're declared on the task definition's `secrets` field
-        # above (ARN references, resolved by the ECS agent itself at container start),
-        # never as plaintext RunTask.containerOverrides.environment values.
+        # here (issue #4): RunTask overrides are recorded in DescribeTasks/CloudTrail, so
+        # secrets go through the workspace's volume instead (_deliver_secrets below).
         # ecs-base/entrypoint.sh execs WARREN_APP_CMD as PID 1 when set, falling back to
         # `tail -f /dev/null` (idle, awaiting `aws ecs execute-command`) when unset. "bash"
         # is WorkspaceSpec.app's interactive default and has no business being exec'd as
@@ -513,17 +518,16 @@ class ECSRuntime:
             )
 
         # Audit BB2: the cache key is the whole canonical task definition, so a cached
-        # definition is reused only when it is identical -- secrets carry owner-specific
-        # SSM valueFrom ARNs (and the git-init container's clone credentials), so two
-        # owners with the same secret names never share one. EFS definitions are never
-        # cached: each has its own access point.
+        # definition is reused only when it is identical. It holds nothing per-owner
+        # (secrets, env and owner tags go per launch), and EFS definitions, which name a
+        # workspace's own access point, are never cached.
         cache_key = json.dumps(register_kwargs, sort_keys=True)
 
         # AI3: a retry of the same provision generation (e.g. after a lost RunTask
         # response) reuses the persisted task definition + clientToken, and adopts a
         # task that launch already started rather than starting a second one. The
         # fingerprint covers the whole multi-container launch payload: the canonical task
-        # definition (both containers, their secrets, volumes, access point) and the
+        # definition (both containers, volumes, access point) and the
         # RunTask container overrides (incl. git-init's WARREN_GIT_FOLDERS). Any change
         # to what would be launched gets a fresh identity rather than a stale token.
         generation = getattr(spec, "provision_generation", "") or ""
@@ -584,6 +588,11 @@ class ECSRuntime:
             else "DISABLED"
         )
 
+        # Immediately before every RunTask, so a relaunch always gets current values and
+        # never a stale file. (An exception from RunTask itself may still have launched
+        # a task that needs the file, so only a definitive failure below removes it.)
+        await self._deliver_secrets(spec.workspace_id, delivered, git_plan)
+
         run_resp = await asyncio.to_thread(
             ecs.run_task,
             cluster=cluster,
@@ -607,12 +616,14 @@ class ECSRuntime:
         failures = run_resp.get("failures", [])
         if failures:
             await self.launch_store.delete(spec.workspace_id)
+            await self._remove_secrets(spec.workspace_id)
             reason = failures[0].get("reason", "unknown")
             raise ProvisionError(f"ECS run_task failed: {reason}")
 
         tasks = run_resp.get("tasks", [])
         if not tasks:
             await self.launch_store.delete(spec.workspace_id)
+            await self._remove_secrets(spec.workspace_id)
             raise ProvisionError("ECS run_task returned no tasks and no failures (unexpected empty response)")
 
         task_arn: str = tasks[0]["taskArn"]
@@ -642,7 +653,7 @@ class ECSRuntime:
         two is what happens to the EFS access point afterward (see each
         caller).
         """
-        ecs, _ = self._ensure_clients()
+        ecs = self._ensure_clients()
         if not handle.runtime_id:
             return
         cluster = getattr(self._settings, "ecs_cluster", "") or ""
@@ -670,7 +681,7 @@ class ECSRuntime:
         this server_id exactly (startedBy truncates server_id). Returns dicts
         with task_arn, workspace_id (tag, or "") and created_at (datetime or None).
         """
-        ecs, _ = self._ensure_clients()
+        ecs = self._ensure_clients()
         cluster = getattr(self._settings, "ecs_cluster", "") or ""
         arns: list[str] = []
         kwargs: dict[str, Any] = {"cluster": cluster, "startedBy": self.started_by}
@@ -719,6 +730,7 @@ class ECSRuntime:
         stay reconnectable via `ensure_running()`, which launches a fresh
         task against the SAME access point (D-04)."""
         await self._stop_task(handle, reason="warren stop (idle)")
+        await self._remove_secrets(handle.workspace_id)
 
     async def destroy(self, handle: WorkspaceHandle) -> None:
         """Stop Fargate task; idempotent (already stopped is acceptable)."""
@@ -730,7 +742,7 @@ class ECSRuntime:
         task_def_arn: str | None = None
         if self._volume is not None and handle.runtime_id:
             try:
-                ecs, _ = self._ensure_clients()
+                ecs = self._ensure_clients()
                 cluster = getattr(self._settings, "ecs_cluster", "") or ""
                 desc = await asyncio.to_thread(
                     ecs.describe_tasks, cluster=cluster, tasks=[handle.runtime_id]
@@ -746,6 +758,7 @@ class ECSRuntime:
 
         await self._stop_task(handle, reason="warren destroy")
         await self.launch_store.delete(handle.workspace_id)
+        await self._remove_secrets(handle.workspace_id)
 
         # D-04: detach sets warren.expires_at tag; does NOT delete the access point
         if self._volume is not None:
@@ -756,7 +769,7 @@ class ECSRuntime:
 
         if task_def_arn and task_def_arn not in self._task_def_cache.values():
             try:
-                ecs, _ = self._ensure_clients()
+                ecs = self._ensure_clients()
                 await asyncio.to_thread(ecs.deregister_task_definition, taskDefinition=task_def_arn)
                 log.info("ecs_deregistered_task_definition", task_definition_arn=task_def_arn)
             except Exception:
@@ -768,7 +781,7 @@ class ECSRuntime:
         """AH2: the workspace container's exit code from DescribeTasks (None if not recorded)."""
         if not handle.runtime_id:
             return None
-        ecs, _ = self._ensure_clients()
+        ecs = self._ensure_clients()
         cluster = getattr(self._settings, "ecs_cluster", "") or ""
         resp = await asyncio.to_thread(ecs.describe_tasks, cluster=cluster, tasks=[handle.runtime_id])
         for task in resp.get("tasks", []):
@@ -795,7 +808,7 @@ class ECSRuntime:
         plugin = shutil.which("session-manager-plugin")
         if plugin is None:
             raise ExecUnavailable("session-manager-plugin is not installed on the control plane")
-        ecs, _ = self._ensure_clients()
+        ecs = self._ensure_clients()
         cluster = getattr(self._settings, "ecs_cluster", "") or ""
         region = getattr(self._settings, "aws_region", "us-east-1") or "us-east-1"
         described = await asyncio.to_thread(ecs.describe_tasks, cluster=cluster, tasks=[handle.runtime_id])
@@ -874,7 +887,7 @@ class ECSRuntime:
         """Map Fargate lastStatus to warren status literals."""
         if not handle.runtime_id:
             return "unknown"
-        ecs, _ = self._ensure_clients()
+        ecs = self._ensure_clients()
         cluster = getattr(self._settings, "ecs_cluster", "") or ""
         resp = await asyncio.to_thread(
             ecs.describe_tasks,
@@ -901,13 +914,6 @@ class ECSRuntime:
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
-
-def ssm_parameter_name(resource_prefix: str, server_id: str, owner_id: str, name: str) -> str:
-    """The SSM parameter a secret is mirrored to: /{prefix}/{server_id}/{owner_id}/{name}.
-    Shared by the mirror's writes (secrets/ssm_store.py) and the task-definition
-    `secrets` ARNs built here, so both always agree."""
-    return f"/{resource_prefix}/{server_id}/{owner_id}/{name}"
-
 
 def _slug(image: str, resource_prefix: str = "warren") -> str:
     """Convert an image string to a safe Fargate task definition family name.

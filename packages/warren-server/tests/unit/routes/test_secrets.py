@@ -135,7 +135,7 @@ def test_non_admin_can_write_and_list_their_own_secrets(env_defaults, auth_heade
             assert put_resp.status_code == 204
 
 
-def test_put_rejects_ssm_unsafe_name(env_defaults, auth_headers):
+def test_put_rejects_unsafe_name(env_defaults, auth_headers):
     """Issue #22: a name outside SSM's allowed charset must fail fast, before
     any write happens -- not only once it reaches the (ECS-only) mirror step."""
     fake_registry = _make_fake_registry()
@@ -159,15 +159,11 @@ def test_put_rejects_oversized_value(env_defaults, auth_headers):
             assert client.get("/secrets").json() == []
 
 
-def test_ssm_mirror_not_attempted_on_podman(env_defaults, auth_headers):
-    """runtime_type defaults to 'podman' in these tests -- no SSM mirror call,
-    and no app.state.runtime.ssm_client() dependency at all."""
+def test_podman_put_needs_no_runtime_call(env_defaults, auth_headers):
+    """runtime_type defaults to 'podman' in these tests."""
     fake_registry = _make_fake_registry()
     with _lifespan_patches(fake_registry):
         with TestClient(app, headers=auth_headers) as client:
-            # app.state.runtime is a real PodmanRuntime-shaped mock with no
-            # ssm_client attribute; if the route tried to call it, this would
-            # raise AttributeError and the request would 500.
             resp = client.put("/secrets", json={"name": "A", "value": "v"})
     assert resp.status_code == 204
 
@@ -190,40 +186,10 @@ def test_ecs_put_without_aws_identity_header_401s(env_defaults, monkeypatch, aut
     assert resp.json()["detail"]["error"] == "aws_identity_required"
 
 
-def test_ssm_mirror_called_on_ecs_put_and_delete(env_defaults, monkeypatch, auth_headers):
-    monkeypatch.setenv("WARREN_RUNTIME_TYPE", "ecs")
-    fake_registry = _make_fake_registry()
-    fake_ssm = MagicMock()
-    fake_runtime = MagicMock()
-    fake_runtime.ssm_client.return_value = fake_ssm
-    aws_headers = {"X-AWS-STS-Signed-Request": '{"url": "https://sts.amazonaws.com/"}'}
-    derived_owner_id = "deadbeef" * 4  # SSM-safe hex, as derive_owner_id would return
-
-    with (
-        patch("warren.app.WorkspaceRegistry", return_value=fake_registry),
-        patch("warren.runtime.ecs.ECSRuntime", return_value=fake_runtime),
-        patch(
-            "warren.auth.aws_identity.verify_signed_caller_identity",
-            AsyncMock(return_value=derived_owner_id),
-        ),
-    ):
-        with TestClient(app, headers={**auth_headers, **aws_headers}) as client:
-            put_resp = client.put("/secrets", json={"name": "A", "value": "v"})
-            assert put_resp.status_code == 204
-            fake_ssm.put_parameter.assert_called_once()
-            assert derived_owner_id in fake_ssm.put_parameter.call_args.kwargs["Name"]
-
-            del_resp = client.delete("/secrets/A")
-            assert del_resp.status_code == 204
-            fake_ssm.delete_parameter.assert_called_once()
-
-
 @contextmanager
 def _ecs_client(monkeypatch, auth_headers):
     monkeypatch.setenv("WARREN_RUNTIME_TYPE", "ecs")
-    fake_ssm = MagicMock()
     fake_runtime = MagicMock()
-    fake_runtime.ssm_client.return_value = fake_ssm
     aws_headers = {"X-AWS-STS-Signed-Request": '{"url": "https://sts.amazonaws.com/"}'}
     with (
         patch("warren.app.WorkspaceRegistry", return_value=_make_fake_registry()),
@@ -233,84 +199,49 @@ def _ecs_client(monkeypatch, auth_headers):
             AsyncMock(return_value="deadbeef" * 4),
         ),
     ):
-        with TestClient(
-            app, headers={**auth_headers, **aws_headers}, raise_server_exceptions=False
-        ) as client:
-            yield client, fake_ssm
+        with TestClient(app, headers={**auth_headers, **aws_headers}) as client:
+            yield client, fake_runtime
 
 
-def _outbox(client) -> list[tuple]:
-    async def rows():
-        async with app.state.db.execute("SELECT * FROM ssm_outbox") as cur:
-            return await cur.fetchall()
-
-    return client.portal.call(rows)
-
-
-def test_put_with_ssm_down_is_saved_and_queued_then_converges(env_defaults, monkeypatch, auth_headers):
-    # Outbox: the local store is authoritative, a failed SSM push is recorded and retried.
-    with _ecs_client(monkeypatch, auth_headers) as (client, fake_ssm):
-        fake_ssm.put_parameter.side_effect = RuntimeError("ssm unavailable")
-        resp = client.put("/secrets", json={"name": "A", "value": "sk-plain"})
-        assert resp.status_code == 202
-        assert resp.json()["status"] == "mirror_pending"
-        assert client.get("/secrets").json() == [{"name": "A", "mirror_pending": True}]
-        rows = _outbox(client)
-        assert [(r[1], r[2]) for r in rows] == [("A", "put")]
-        assert "sk-plain" not in repr(rows)
-
-        fake_ssm.put_parameter.side_effect = None
-        assert client.portal.call(app.state.secret_mirror.flush) == []
-        assert fake_ssm.put_parameter.call_args.kwargs["Value"] == "sk-plain"
-        assert _outbox(client) == []
+def test_ecs_secret_writes_stay_local_and_call_the_runtime_for_nothing(
+    env_defaults, monkeypatch, auth_headers
+):
+    # Secrets live only in warren's SQLite store; nothing is mirrored anywhere.
+    with _ecs_client(monkeypatch, auth_headers) as (client, fake_runtime):
+        fake_runtime.reset_mock()
+        assert client.put("/secrets", json={"name": "A", "value": "v1"}).status_code == 204
+        assert client.post("/secrets/A/rotate", json={"value": "v2"}).status_code == 204
         assert client.get("/secrets").json() == [{"name": "A"}]
-
-
-def test_delete_with_ssm_down_is_queued_and_retried(env_defaults, monkeypatch, auth_headers):
-    with _ecs_client(monkeypatch, auth_headers) as (client, fake_ssm):
-        assert client.put("/secrets", json={"name": "A", "value": "v"}).status_code == 204
-        fake_ssm.delete_parameter.side_effect = RuntimeError("ssm unavailable")
-        resp = client.delete("/secrets/A")
-        assert resp.status_code == 202
+        assert client.delete("/secrets/A").status_code == 204
         assert client.get("/secrets").json() == []
-        assert [(r[1], r[2]) for r in _outbox(client)] == [("A", "delete")]
-
-        fake_ssm.delete_parameter.side_effect = None
-        assert client.portal.call(app.state.secret_mirror.flush) == []
-        assert fake_ssm.delete_parameter.call_count == 2
-        assert _outbox(client) == []
+        assert fake_runtime.method_calls == []
 
 
-def test_failed_local_write_never_reaches_ssm(env_defaults, monkeypatch, auth_headers):
-    # The outbox row is recorded first; SSM is only pushed after the local write, and a
-    # retry re-syncs SSM from the unchanged local state (here: no secret -> delete).
-    with _ecs_client(monkeypatch, auth_headers) as (client, fake_ssm):
-        with patch("warren.secrets.store.set_secret", AsyncMock(side_effect=RuntimeError("disk"))):
-            resp = client.put("/secrets", json={"name": "A", "value": "new"})
-        assert resp.status_code == 500
-        fake_ssm.put_parameter.assert_not_called()
-        assert client.portal.call(app.state.secret_mirror.flush) == []
-        fake_ssm.put_parameter.assert_not_called()
-        fake_ssm.delete_parameter.assert_called_once_with(Name=f"/warren/test-server/{'deadbeef' * 4}/A")
+def test_ecs_runtime_resolves_secret_values_from_the_local_store(env_defaults, monkeypatch, auth_headers):
+    with _ecs_client(monkeypatch, auth_headers) as (client, fake_runtime):
+        client.put("/secrets", json={"name": "A", "value": "v1"})
+        client.put("/secrets", json={"name": "B", "value": "v2"})
+        values = client.portal.call(fake_runtime.secret_values, "deadbeef" * 4, ["A", "MISSING"])
+        assert values == {"A": "v1"}
+        assert client.portal.call(fake_runtime.secret_values, "someone-else", ["A"]) == {}
 
 
-def test_rotate_with_ssm_down_is_queued(env_defaults, monkeypatch, auth_headers):
-    with _ecs_client(monkeypatch, auth_headers) as (client, fake_ssm):
-        assert client.put("/secrets", json={"name": "A", "value": "old"}).status_code == 204
-        fake_ssm.put_parameter.side_effect = RuntimeError("ssm unavailable")
-        assert client.post("/secrets/A/rotate", json={"value": "new"}).status_code == 202
-        fake_ssm.put_parameter.side_effect = None
-        client.portal.call(app.state.secret_mirror.flush)
-        assert fake_ssm.put_parameter.call_args.kwargs["Value"] == "new"
+def test_open_db_drops_the_old_ssm_outbox_table(tmp_path):
+    import asyncio
 
+    from warren.registry.store import open_db
 
-def test_ecs_write_never_reads_ssm(env_defaults, monkeypatch, auth_headers):
-    with _ecs_client(monkeypatch, auth_headers) as (client, fake_ssm):
-        client.put("/secrets", json={"name": "A", "value": "v"})
-        client.get("/secrets")
-        client.delete("/secrets/A")
-    called = {name for name, _, _ in fake_ssm.method_calls}
-    assert called <= {"put_parameter", "delete_parameter"}
+    async def go():
+        db = await open_db(tmp_path / "warren.db")
+        await db.execute("CREATE TABLE ssm_outbox (owner_id TEXT)")
+        await db.close()
+        db = await open_db(tmp_path / "warren.db")
+        async with db.execute("SELECT name FROM sqlite_master WHERE name = 'ssm_outbox'") as cur:
+            rows = await cur.fetchall()
+        await db.close()
+        return rows
+
+    assert asyncio.run(go()) == []
 
 
 def test_put_secret_logs_audit_line_never_value(env_defaults, auth_headers, caplog):

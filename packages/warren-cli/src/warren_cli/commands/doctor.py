@@ -105,29 +105,7 @@ def _check_ecs(cfg, cred_ok: bool = False, out: Out = typer.echo) -> dict:
         out(f"  AWS credentials:        {'✓' if cred_ok else '✗ run `aws sso login` or set AWS_ACCESS_KEY_ID'}")
         result["aws_credentials"] = cred_ok
 
-    server_id = getattr(cfg, "server_id", None) if cfg else None
-    try:
-        if cred_ok and server_id:
-            import boto3 as _boto3
-            ssm = _boto3.client("ssm")
-            ssm_path = f"/warren/{server_id}/"
-            ssm.describe_parameters(
-                ParameterFilters=[{"Key": "Path", "Values": [ssm_path]}],
-                MaxResults=1,
-            )
-            out(f"  SSM path: {ssm_path}  ✓")
-            result["ssm_path"] = {"path": ssm_path, "ok": True}
-        elif cred_ok:
-            out("  SSM path:               (skipped — server_id not configured)")
-            result["ssm_path"] = None
-        else:
-            out("  SSM path:               (skipped — no credentials)")
-            result["ssm_path"] = None
-    except Exception:
-        ssm_path = f"/warren/{server_id}/" if server_id else "/warren/.../"
-        out(f"  SSM path: {ssm_path}  ✗")
-        result["ssm_path"] = {"path": ssm_path, "ok": False}
-
+    # Workspace secrets live only in warren-server's own store (no SSM path to check).
     ecs_cluster = getattr(cfg, "ecs_cluster", None) if cfg else None
     ecs_cluster = ecs_cluster or os.environ.get("WARREN_ECS_CLUSTER")
     try:

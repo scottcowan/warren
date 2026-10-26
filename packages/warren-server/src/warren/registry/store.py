@@ -241,6 +241,8 @@ async def open_db(path: str | Path, journal_mode: str = "auto") -> aiosqlite.Con
     await _ensure_columns(db)
     await _scrub_legacy_plaintext_env(db)
     await _drop_stored_sidecar_tokens(db)
+    # The SSM secret mirror and its outbox are gone: secrets live only in `secrets`.
+    await db.execute("DROP TABLE IF EXISTS ssm_outbox")
 
     os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
     return db
