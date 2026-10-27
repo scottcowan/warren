@@ -69,7 +69,8 @@ credentials endpoint `169.254.170.2` from the agent. So:
 - **Everything inside a workspace task is agent-controlled**, including any warren helper
   or sidecar in the same task. Nothing goes into a task that the agent must not have.
 - **The workspace task role is the control and stays minimal**: EFS ClientMount/ClientWrite
-  and the ECS Exec channel. Interim exception, documented: direct Bedrock needs
+  (or, with EBS storage, `kms:Decrypt` on the secrets key under a `warren:workspace_id`
+  encryption context) and the ECS Exec channel. Interim exception, documented: direct Bedrock needs
   `bedrock:InvokeModel*` scoped to exact model/inference-profile ARNs in one region, as a
   separately named statement to remove when the model proxy lands.
 - Per-workspace secrets live only in warren's encrypted SQLite store. Just before each
@@ -80,6 +81,16 @@ credentials endpoint `169.254.170.2` from the agent. So:
   task definition, which therefore holds nothing per-owner and can be shared by its cache.
   The access point maps everyone to uid 1000, so the file's protection is timing, not
   permissions: it is on the (encrypted) volume only between the write and container start.
+- EBS storage (`WARREN_ECS_WORKSPACE_STORAGE=ebs` or a template's `ecs_storage: ebs`) has
+  no volume to write to before the task starts. There, each container's secrets travel as
+  an AES-256-GCM envelope in its own RunTask override (`WARREN_SECRETS_BLOB`). The data
+  key is wrapped by KMS under the context `warren:workspace_id`/`warren:container`. The
+  control plane can only `GenerateDataKey`; the task role `Decrypt`s it in the
+  entrypoint/git-init before any workspace process runs, and the blob is unset.
+  DescribeTasks and CloudTrail see ciphertext only. The task role is shared, so IAM can't
+  stop one workspace from decrypting another's envelope; that needs the envelope, which
+  only DescribeTasks/CloudTrail readers have. A workspace's volume is snapshotted on every
+  stop and deleted, with all its snapshots, on destroy.
 - Clone credentials are given only to the `git-init` container (#29). It copies them into
   private files, re-execs with an empty environment, clones into a private dir, deletes the
   credentials, and only then touches the volume. The workspace container depends on it
@@ -96,7 +107,7 @@ credentials endpoint `169.254.170.2` from the agent. So:
 | T2 | Agent rewrites its own sandbox policy for the next connect | nsjail config and seatbelt profile live in warren's out-of-tree state dir and are regenerated from the persisted spec on each connect; profiles are parameter-based, not string-built (#34) | #31, #34 |
 | T3 | Agent plants `.git` config/hooks (`core.fsmonitor`, hooks, `ext::`) that host-side git then runs | One shared safe-git helper pins `core.hooksPath=/dev/null`, `core.fsmonitor=false`, `protocol.ext.allow=never` on every host-side git call; `.git` rename protection in the sandbox (AE1); `git-materialize.sh` uses the same pins, rewrites reused bare-store config from scratch, and never fetches into agent-written repos | #31, #34, #29 |
 | T4 | PATH hijack of the sandbox binary itself | `sandbox-exec`/`bwrap`/`nsjail` invoked by absolute path (AE2) | #34 |
-| T5 | Workspace gets every project secret, not just its template's | Local provisioning filters `secrets.env` to the template's declared names and errors on missing ones; ECS delivers only the declared names, as a file on the workspace's own volume | #31, #29 |
+| T5 | Workspace gets every project secret, not just its template's | Local provisioning filters `secrets.env` to the template's declared names and errors on missing ones; ECS delivers only the declared names, as a file on the workspace's own volume (EBS: a per-container KMS envelope) | #31, #29 |
 | T6 | Host `~/.claude/settings.json` env (API keys etc.) leaks into workspaces and rc files | Implicit import removed; env comes only from template `env:` / `secrets`; `~/.claude` grants scoped per harness, mostly read-only | #31, #34, #36 |
 | T7 | Agent steals the SSO token and mints credentials for every AWS account/role | AWS `export` mode: host runs `aws configure export-credentials` for the template's one profile and serves it over a local endpoint; no `~/.aws/sso` grant. `sso` mode only for interactive local `kind: user` workspaces, with a warning | #34 |
 | T8 | Long-lived GitHub PAT in the workspace is exfiltrated | GitHub App installation tokens per workspace, limited to the template's repos and `contents`/`pull_requests`, 1-hour lifetime, delivered by a git credential helper (not env, URLs or `.git/config`); local issuer (OS keychain) or control-plane issuer (Secrets Manager, unreadable by the task role) | #33 |

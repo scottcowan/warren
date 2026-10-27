@@ -591,6 +591,194 @@ up. The same 409 applies to a workspace whose owner has been removed from the ma
   `WARREN_AWS_TRUSTED_ASSUMED_ROLE_PATTERNS` covering your users' roles (the key only
   exists for trusted ARNs).
 
+## Workspace storage: EFS or EBS (`WARREN_ECS_WORKSPACE_STORAGE`)
+
+A workspace's `/var/lib/warren` (its git checkouts, harness state, everything the agent
+writes) lives on one of two kinds of storage. Both are first-class:
+
+| | `efs` (default) | `ebs` |
+|---|---|---|
+| Volume | a per-workspace EFS access point | an ECS-managed EBS volume, created at launch |
+| Between tasks | the access point stays | the volume is snapshotted on stop and deleted; the next launch restores from the snapshot |
+| Isolation | the access point root, plus per-user filesystems and security groups (`WARREN_ECS_OWNER_STORAGE`) | each volume is attached only to its own task, and isn't reachable over the network |
+| Secrets delivery | a file written onto the access point through the control plane's mount | KMS ciphertext in the RunTask overrides |
+| Destroy | the access point is tagged and reaped after `efs_retention_days` | the volume and every snapshot are deleted immediately |
+
+`WARREN_ECS_WORKSPACE_STORAGE` is the deployment default for new workspaces (`efs` unless
+set, so nothing changes for an existing deployment). A template can choose its own with
+`ecs_storage: ebs` or `ecs_storage: efs`, a scalar that inherits through nested templates
+like `ecs_cpu`. A template may only choose a mode the deployment has configured: `efs`
+needs `WARREN_EFS_ID` or `WARREN_ECS_OWNER_STORAGE`, and `ebs` needs
+`WARREN_ECS_EBS_INFRA_ROLE_ARN` and `WARREN_ECS_SECRETS_KMS_KEY_ID`. Otherwise
+provisioning fails with `422 template_denied`. The mode is recorded on the workspace
+(`ecs_storage` in its persisted spec) when it's created. Stop, relaunch, destroy and the
+reapers always follow that recorded mode, even if the default changes later. Workspaces
+from before this setting existed are `efs`.
+
+### EBS lifecycle
+
+ECS can't attach an existing EBS volume to a new task, because RunTask's managed-volume
+configuration has no volume id. So persistence goes through snapshots:
+
+- **First launch:** an empty, encrypted volume of `WARREN_ECS_EBS_SIZE_GIB` (default 20),
+  `gp3` and `ext4` by default. Both the workspace container and git-init mount it at
+  `/var/lib/warren`. The task definition only declares the volume `configuredAtLaunch`,
+  so it holds nothing workspace-specific and is shared and cached like a no-EFS
+  definition.
+- **Any stop that isn't a destroy:** this covers the idle reaper, a user stop, and a
+  task that died on its own (which the status reaper marks stopped). The volume is
+  retained (`deleteOnTermination: false`). Once it's `available`, the control plane
+  snapshots it, records the snapshot id, and deletes the volume. The snapshot finishes
+  on its own. If the volume hasn't detached within `WARREN_ECS_EBS_DETACH_WAIT_SECONDS`,
+  the stop still succeeds and the next launch or the sweep finishes the job.
+- **Relaunch:** the next launch first snapshots any volume that's still retained. It then
+  waits up to `WARREN_ECS_EBS_SNAPSHOT_WAIT_SECONDS` (default 45, below client timeouts)
+  for the newest snapshot to be `completed`, and launches from it with
+  `volumeInitializationRate` if `WARREN_ECS_EBS_VOLUME_INITIALIZATION_RATE` is set. Only
+  then are the older snapshots deleted, so the previous snapshot is kept until the new one
+  has completed. While the snapshot is still pending, `/connect` and `ensure_running`
+  answer `503 workspace_volume_not_ready` with `Retry-After` (the CLI retries), so a
+  restart right after a stop can take a few minutes for a large first snapshot.
+  If the newest snapshot failed, the previous one is used. If the workspace has a
+  recorded snapshot and none can be used, it answers `409 workspace_volume_lost`, and
+  never silently starts an empty volume.
+- **Explicit destroy:** this covers `DELETE /workspaces/{id}`, the MCP destroy tool, a
+  single-turn workspace completing, and the operator-configured `idle_destroy_seconds`.
+  Each of these makes the workspace terminal. The task is stopped, every snapshot of
+  the workspace is deleted immediately, and the volume is deleted once it detaches. A
+  volume still attached at the deadline is deleted by the sweep. There's no grace
+  period.
+- **Sweep** (`WARREN_ECS_EBS_SWEEP_INTERVAL_SECONDS`, default 900, 0 disables): this
+  catches anything the paths above couldn't finish:
+  - A volume that is `available` and older than `WARREN_ECS_ORPHAN_SWEEP_MIN_AGE_SECONDS`
+    is snapshotted and deleted if its workspace still exists, or just deleted if the
+    workspace is destroyed or gone. Examples are a crash between StopTask and the
+    snapshot, or a destroy that timed out.
+  - Superseded snapshots are pruned.
+  - Snapshots of workspaces that no longer exist are deleted.
+
+  Each workspace is handled under its lifecycle lock, so the sweep never races that
+  workspace's own stop, launch or destroy.
+
+Every volume and snapshot is tagged `warren=true` (the marker the IAM conditions below
+match), plus `warren.server_instance`, `warren.workspace_id`, `warren.storage=ebs`, and
+`warren.owner_id` when known. Snapshots also get `warren.created_at` and
+`warren.source_volume`. warren only ever lists and acts on resources carrying this
+server's `warren.server_instance`.
+
+Constraints:
+
+- Fargate platform 1.4.0 or later, and one EBS volume per task.
+- `WARREN_ECS_EBS_FILESYSTEM_TYPE` (`ext4` or `xfs`) must never change once snapshots
+  exist, because a restored volume is mounted with the filesystem type it was created
+  with.
+- The control plane can't read an EBS volume. So for EBS workspaces, the idle reaper
+  never sees harness-hook state (it falls back to egress activity), and a single-turn
+  workspace's git verdict isn't computed.
+
+### EBS secrets delivery (KMS envelope)
+
+There's no volume before the task starts, so the EFS secrets file can't be used.
+Instead, just before each RunTask the control plane:
+
+1. calls `kms:GenerateDataKey` on `WARREN_ECS_SECRETS_KMS_KEY_ID` with encryption
+   context `{"warren:workspace_id": <id>, "warren:container": "workspace" | "git-init"}`;
+2. encrypts that container's secrets (git-init gets only the clone credentials, the
+   workspace container gets the rest, the same split as the EFS files) with AES-256-GCM,
+   binding the same context as associated data;
+3. drops the plaintext data key, and passes only `WARREN_SECRETS_BLOB` (version, region,
+   wrapped key, nonce and ciphertext) in that container's overrides.
+
+The control plane never needs `kms:Decrypt`. DescribeTasks and CloudTrail record only the
+envelope. Opening it takes `kms:Decrypt` on the key under that workspace's context.
+
+The image's `warren-secrets-decrypt` (a static, stdlib-only Go binary in ecs-base 1.3+)
+does the unwrapping:
+
+- It runs in the entrypoint and in `warren-git-materialize`, before anything
+  workspace-controlled runs.
+- It unwraps the key with the task role (container credentials from the ECS endpoint),
+  decrypts, and prints `NAME=<base64>` lines.
+- Those lines are loaded with the same no-eval reader as the EFS file. As root they're
+  written straight to the root-only `/run/warren/secrets.env` that ECS Exec sessions
+  read.
+- The blob is unset before the entrypoint drops privileges.
+- A failure stops the container rather than starting it without its secrets.
+
+A custom `WARREN_ECS_GIT_INIT_IMAGE` must include the helper, or git-init fails closed for
+EBS workspaces with git credentials.
+
+ECS caps the RunTask overrides at 8192 characters. A workspace whose environment plus
+envelopes would exceed that fails with `422 template_denied` before RunTask.
+
+The tasks need a route to KMS: NAT (Template A), or a `com.amazonaws.<region>.kms`
+interface endpoint (Template C).
+
+Every workspace shares one task role, so IAM can't stop one workspace's role from
+decrypting another workspace's envelope. What protects an envelope is that it's only
+visible through `ecs:DescribeTasks` and CloudTrail, which the workspace task role doesn't
+have. Anyone who has those and also `kms:Decrypt` on the key can read workspace secrets.
+Keep that combination as narrow as the control plane's own SQLite store.
+
+### EBS settings
+
+| Variable | Default | |
+|---|---|---|
+| `WARREN_ECS_WORKSPACE_STORAGE` | `efs` | deployment default, `efs` or `ebs` |
+| `WARREN_ECS_EBS_INFRA_ROLE_ARN` | | ECS infrastructure role for volumes (required for ebs) |
+| `WARREN_ECS_SECRETS_KMS_KEY_ID` | | symmetric KMS key for secrets envelopes (required for ebs) |
+| `WARREN_ECS_EBS_SIZE_GIB` | `20` | size of a new, empty volume |
+| `WARREN_ECS_EBS_VOLUME_TYPE` | `gp3` | |
+| `WARREN_ECS_EBS_FILESYSTEM_TYPE` | `ext4` | `ext4` or `xfs`; never change it once snapshots exist |
+| `WARREN_ECS_EBS_KMS_KEY_ID` | | volume encryption key; empty is `aws/ebs` (volumes are always encrypted) |
+| `WARREN_ECS_EBS_VOLUME_INITIALIZATION_RATE` | | MiB/s (100-300) to hydrate a restored volume |
+| `WARREN_ECS_EBS_SNAPSHOT_WAIT_SECONDS` | `45` | relaunch wait for a pending snapshot before the retryable 503 |
+| `WARREN_ECS_EBS_DETACH_WAIT_SECONDS` | `180` | stop/destroy wait for the volume to detach |
+| `WARREN_ECS_EBS_POLL_INTERVAL_SECONDS` | `5` | |
+| `WARREN_ECS_EBS_SWEEP_INTERVAL_SECONDS` | `900` | 0 disables the sweep |
+
+With `WARREN_ECS_WORKSPACE_STORAGE=ebs`, startup fails unless the role ARN and the KMS key
+are set. EBS workspaces don't need a `WARREN_ECS_OWNER_STORAGE` entry. A user with an
+entry still gets their own security groups. A user without one gets
+`WARREN_ECS_SECURITY_GROUP_IDS` (a volume isn't network-reachable, so a shared group is
+fine for storage). EFS workspaces still need the entry, as before.
+
+### EBS IAM
+
+Terraform and CDK add all of this when EBS is enabled (`workspace_storage = "ebs"` or
+`enable_ebs_storage = true`; optional `ebs_kms_key_arn`, `secrets_kms_key_arn` (created
+with rotation when empty) and `ebs_size_gib`). They output the infrastructure role and
+secrets key ARNs. `setup.sh` doesn't set up EBS storage yet. For your own IaC:
+
+- **ECS infrastructure role** (`WARREN_ECS_EBS_INFRA_ROLE_ARN`):
+  - Trusted by `ecs.amazonaws.com`, with the AWS managed policy
+    `service-role/AmazonECSInfrastructureRolePolicyForVolumes`. That policy only lets ECS
+    create, attach, detach and delete volumes carrying its own `AmazonECSCreated` and
+    `AmazonECSManaged` tags. Tag-on-create of warren's tags is covered because they're
+    requested in the same CreateVolume call. Creating from a snapshot is covered too.
+  - With `WARREN_ECS_EBS_KMS_KEY_ID`, also `kms:CreateGrant`,
+    `kms:GenerateDataKeyWithoutPlaintext`, `kms:ReEncrypt*`, `kms:Decrypt` and
+    `kms:DescribeKey` on that key, with `kms:ViaService = ec2.<region>.amazonaws.com`.
+- **Control-plane task role:**
+  - `iam:PassRole` on the infrastructure role, with condition
+    `iam:PassedToService = ecs.amazonaws.com`.
+  - `ec2:DescribeVolumes` and `ec2:DescribeSnapshots` on `*`. These actions have no
+    resource-level permissions.
+  - `ec2:CreateSnapshot`:
+    - on `arn:aws:ec2:*:*:volume/*`, with `aws:ResourceTag/warren = true`;
+    - on `arn:aws:ec2:*::snapshot/*`, with `aws:RequestTag/warren = true`.
+  - `ec2:CreateTags` on `arn:aws:ec2:*::snapshot/*`, with
+    `ec2:CreateAction = CreateSnapshot`.
+  - `ec2:DeleteVolume` on `arn:aws:ec2:*:*:volume/*` and `ec2:DeleteSnapshot` on
+    `arn:aws:ec2:*::snapshot/*`, with `aws:ResourceTag/warren = true`.
+  - `kms:GenerateDataKey` on the secrets key, with conditions
+    `Null kms:EncryptionContext:warren:workspace_id = false` and `ForAllValues:StringEquals
+    kms:EncryptionContextKeys = [warren:workspace_id, warren:container]`. No `kms:Decrypt`.
+  - With `WARREN_ECS_EBS_KMS_KEY_ID`, the same volume-key KMS grants as the
+    infrastructure role, for snapshotting CMK-encrypted volumes.
+- **Workspace task role:** `kms:Decrypt` on the secrets key, with the same two
+  encryption-context conditions.
+
 ## Model access through a Bedrock gateway
 
 By default a bedrock-mode workspace (`model_access: bedrock`) calls Bedrock with its task
