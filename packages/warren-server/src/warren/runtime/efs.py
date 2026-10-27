@@ -380,6 +380,8 @@ class EFSMount:
             return
 
         local_mount_path = getattr(self._settings, "efs_local_mount_path", "") or ""
+        if not getattr(self._settings, "efs_purge_workspace_data", True):
+            local_mount_path = ""
         await purge_and_delete_access_point(efs, access_point_id, workspace_id, local_mount_path)
 
 

@@ -71,7 +71,7 @@ class BranchSource:
 # workspace ROW's own owner_id=user.user_id on that runtime). Without
 # persisting it, _reprovision_spec fell back to the row's owner_id, which is
 # the wrong identity for ECS secret resolution -- a reprovisioned ECS
-# workspace read the wrong SSM path and got no secrets at all.
+# workspace resolved the wrong owner and got no secrets at all.
 _SPEC_EXTRA_FIELDS = (
     "template_env",
     "secret_names",
@@ -966,8 +966,7 @@ class WorkspaceRegistry:
         # spec.env to that stale blob immediately, and the ECS branch below never
         # overwrites spec.env at all, so it would reach runtime.provision() as plaintext
         # task-environment overrides, visible via ecs:DescribeTasks/CloudTrail -- worse
-        # than the original R1 exposure, since SSM SecureString at least encrypts at
-        # rest).
+        # than the original R1 exposure).
         extra.pop("env", None)
         # Legacy rows (provisioned before R7) have no persisted owner_id extra;
         # fall back to the row's own owner_id, matching old behavior exactly.

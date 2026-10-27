@@ -34,10 +34,6 @@ def _spec(folders, secret_names=()):
     )
 
 
-def _secret(name):
-    return {"name": name, "valueFrom": f"arn:aws:ssm:us-east-1:123:parameter/warren/s/u/{name}"}
-
-
 APP = FolderSpec(name="app", type="git-worktree", mount="code/app",
                  url="https://github.com/org/app.git", branch="main")
 WIKI = FolderSpec(name="wiki", type="git-clone", mount="refs/wiki",
@@ -49,15 +45,15 @@ WIKI = FolderSpec(name="wiki", type="git-clone", mount="refs/wiki",
 
 def test_plan_none_without_git_folders():
     local = FolderSpec(name="v", type="local-path", mount="vault", path="/x")
-    assert build_git_init_plan(_spec([local]), [_secret("GITHUB_PAT")]) is None
+    assert build_git_init_plan(_spec([local]), {"GITHUB_PAT"}) is None
 
 
 def test_plan_moves_only_clone_credentials_to_init():
-    defs = [_secret("GITHUB_PAT"), _secret("WARREN_GIT_SSH_KEY"), _secret("ANTHROPIC_API_KEY")]
-    plan = build_git_init_plan(_spec([APP, WIKI]), defs)
+    plan = build_git_init_plan(
+        _spec([APP, WIKI]), {"GITHUB_PAT", "WARREN_GIT_SSH_KEY", "ANTHROPIC_API_KEY"}
+    )
 
     assert plan.init_secret_names == ("GITHUB_PAT", "WARREN_GIT_SSH_KEY")
-    assert [d["name"] for d in plan.workspace_secret_defs] == ["ANTHROPIC_API_KEY"]
     rows = [r.split("\t") for r in plan.folders_env.splitlines()]
     assert rows[0] == ["worktree", "app", "code/app", APP.url, "main",
                        workspace_branch(WS_ID, "dev", "code/app"), "pat", "GITHUB_PAT"]
@@ -66,13 +62,12 @@ def test_plan_moves_only_clone_credentials_to_init():
 
 def test_plan_per_folder_secret_override_and_missing_secret():
     f = APP.model_copy(update={"pat_secret": "ORG_PAT"})
-    plan = build_git_init_plan(_spec([f, WIKI]), [_secret("ORG_PAT"), _secret("GITHUB_PAT")])
+    plan = build_git_init_plan(_spec([f, WIKI]), {"ORG_PAT", "GITHUB_PAT"})
     rows = [r.split("\t") for r in plan.folders_env.splitlines()]
     assert rows[0][6:] == ["pat", "ORG_PAT"]
     # WARREN_GIT_SSH_KEY isn't available, so the wiki clone runs without a credential
     assert rows[1][6:] == ["none", "-"]
     assert plan.init_secret_names == ("ORG_PAT",)
-    assert [d["name"] for d in plan.workspace_secret_defs] == ["GITHUB_PAT"]
 
 
 @pytest.mark.parametrize("update", [
@@ -86,7 +81,7 @@ def test_plan_per_folder_secret_override_and_missing_secret():
 ])
 def test_plan_skips_unsafe_folders(update):
     bad = APP.model_copy(update=update)
-    plan = build_git_init_plan(_spec([bad, WIKI]), [])
+    plan = build_git_init_plan(_spec([bad, WIKI]), set())
     assert [r.split("\t")[1] for r in plan.folders_env.splitlines()] == ["wiki"]
 
 
@@ -97,15 +92,9 @@ def test_workspace_branch_matches_local_layout():
 # --- ECS task definition ---------------------------------------------------
 
 
-def _ssm_with(*names):
-    # Secret ARNs come from the spec's declared names, never an SSM listing;
-    # `names` only documents which secrets the test's owner has.
-    return _mock_ssm()
-
-
-def test_provision_adds_git_init_container_and_splits_secrets():
+def test_provision_adds_git_init_container_without_secrets_in_the_definition():
     ecs = _mock_ecs()
-    rt = _make_runtime(ecs, _ssm_with("GITHUB_PAT", "ANTHROPIC_API_KEY"))
+    rt = _make_runtime(ecs, _mock_ssm())
     spec = _spec([APP], secret_names=["GITHUB_PAT", "ANTHROPIC_API_KEY"])
 
     asyncio.run(rt.provision(spec))
@@ -114,8 +103,8 @@ def test_provision_adds_git_init_container_and_splits_secrets():
     ws, init = reg["containerDefinitions"]
     assert ws["name"] == "workspace" and init["name"] == "git-init"
     assert ws["dependsOn"] == [{"containerName": "git-init", "condition": "SUCCESS"}]
-    assert [s["name"] for s in ws["secrets"]] == ["ANTHROPIC_API_KEY"]
-    assert [s["name"] for s in init["secrets"]] == ["GITHUB_PAT"]
+    # Secrets reach the task as files on its volume (test_ecs_secrets.py), never here.
+    assert "secrets" not in ws and "secrets" not in init
     assert init["essential"] is False
     assert init["entryPoint"] == ["/usr/local/bin/warren-git-materialize"]
     assert init["image"] == spec.image
@@ -165,30 +154,33 @@ def test_provision_without_git_folders_is_unchanged():
     assert names == ["workspace"]
 
 
-def test_task_definition_cache_never_shares_one_owners_secrets_with_another():
-    # Audit BB2: same image, cpu/memory and secret names, no EFS -- only the owner differs.
+def test_task_definition_cache_carries_nothing_per_owner():
+    # Audit BB2: the cache key is the whole definition, and nothing in it differs per
+    # owner any more -- secrets, owner tags and env all go per launch -- so two owners
+    # sharing one (non-EFS) definition can't see each other's anything.
+    from unittest.mock import AsyncMock
+
     ecs = _mock_ecs()
     ecs.register_task_definition.side_effect = lambda **kw: {
         "taskDefinition": {"taskDefinitionArn": f"arn:td:{ecs.register_task_definition.call_count}"}
     }
-    ssm = _mock_ssm()
-    rt = _make_runtime(ecs, ssm)
+    rt = _make_runtime(ecs, _mock_ssm())
+    rt.secret_values = AsyncMock(side_effect=lambda owner, names: {})
     names = ["GITHUB_PAT", "ANTHROPIC_API_KEY"]
 
-    for owner in ("alice", "bob", "alice"):
+    for owner in ("alice", "bob"):
         spec = dataclasses.replace(_spec([APP], secret_names=names), owner_id=owner)
         asyncio.run(rt.provision(spec))
 
-    calls = ecs.register_task_definition.call_args_list
-    assert len(calls) == 2  # alice's second provision reuses alice's own definition
-    for call, owner in zip(calls, ("alice", "bob")):
-        ws, init = call.kwargs["containerDefinitions"]
-        assert [s["name"] for s in init["secrets"]] == ["GITHUB_PAT"]
-        assert [s["name"] for s in ws["secrets"]] == ["ANTHROPIC_API_KEY"]
-        for s in ws["secrets"] + init["secrets"]:
-            assert s["valueFrom"].endswith(f"/warren/test-server/{owner}/{s['name']}")
-    task_defs = [c.kwargs["taskDefinition"] for c in ecs.run_task.call_args_list]
-    assert task_defs == ["arn:td:1", "arn:td:2", "arn:td:1"]
+    assert ecs.register_task_definition.call_count == 1
+    definition = repr(ecs.register_task_definition.call_args.kwargs)
+    for leak in ("alice", "bob", "secrets", "valueFrom"):
+        assert leak not in definition
+    owners = [
+        {t["key"]: t["value"] for t in c.kwargs["tags"]}["warren.owner_id"]
+        for c in ecs.run_task.call_args_list
+    ]
+    assert owners == ["alice", "bob"]
 
 
 def test_git_init_image_setting_overrides_workspace_image():

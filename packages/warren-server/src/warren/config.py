@@ -228,12 +228,6 @@ class WarrenSettings(BaseSettings):
     # pinned in the image. An ssh host not listed in either is refused.
     ecs_git_known_hosts: str = ""
 
-    # WARREN_KMS_KEY_ID: customer-managed KMS key (ID, ARN or alias) for every SSM
-    # SecureString PutParameter the secret mirror makes on ECS -- empty means SSM's
-    # default `alias/aws/ssm` key. With a CMK the control plane needs only
-    # kms:Encrypt on it and the task execution role kms:Decrypt (resources/ecs/README.md).
-    kms_key_id: str = ""
-
     # EFS workspace persistence — only consulted when runtime_type == "ecs" and efs_id is non-empty
     efs_id: str = ""            # empty = ephemeral task storage only (D-10 opt-out)
     efs_retention_days: int = 7
@@ -255,7 +249,12 @@ class WarrenSettings(BaseSettings):
     # contents before deleting its access point. Empty (default): the reaper
     # still deletes the access point, but the data is orphaned until a mount
     # is wired up -- logged clearly rather than claimed as cleaned up.
+    # The same mount is how ECS workspaces get their secrets (runtime/ecs_secrets.py),
+    # so it is required whenever an ECS template declares secrets.
     efs_local_mount_path: str = ""
+    # Whether that mount is also used to delete a workspace's data when its access
+    # point is deleted. Off keeps the data (the reaper only removes the access point).
+    efs_purge_workspace_data: bool = True
 
     # Issue #11: `expires_at` existed in the tokens schema and in the query that resolves
     # a token to a user, but nothing ever wrote a value into it, so every minted token was

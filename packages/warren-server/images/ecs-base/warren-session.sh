@@ -28,6 +28,10 @@ if [ "$(/usr/bin/id -u)" = 0 ]; then
         echo "warren-session: no warren user in this image - refusing to open a root shell" >&2
         exit 1
     fi
+    # The workspace's secrets, as the entrypoint received them (root-only copy in the
+    # container's own filesystem, not the volume): ECS Exec doesn't carry PID 1's env.
+    . /usr/local/lib/warren/secrets.sh
+    warren_secrets_load /run/warren/secrets.env
     HOME=/home/warren
     export HOME
     exec /sbin/su-exec warren:warren /usr/local/bin/warren-session "$@"

@@ -100,21 +100,6 @@ CREATE TABLE IF NOT EXISTS secrets (
     UNIQUE(owner_id, name)
 );
 
--- SSM mirror outbox (ECS only, warren.secrets.ssm_store.SsmMirror): one row per
--- secret whose SSM parameter may not yet match the local `secrets` table. Written
--- before the local change, cleared once SSM has been brought in line. Never holds
--- a value -- the retry re-reads the encrypted local row, and `op` is informational.
-CREATE TABLE IF NOT EXISTS ssm_outbox (
-    owner_id    TEXT NOT NULL,
-    name        TEXT NOT NULL,
-    op          TEXT NOT NULL CHECK (op IN ('put', 'delete')),
-    op_id       TEXT NOT NULL,
-    created_at  TEXT NOT NULL,
-    attempts    INTEGER NOT NULL DEFAULT 0,
-    last_error  TEXT,
-    PRIMARY KEY (owner_id, name)
-);
-
 -- AI9: machine tokens scoped to exactly one workspace, for processes inside it
 -- calling back (supervisors, MCP callers). Always expiring; optionally bound to
 -- an Ed25519 public key (proof-of-possession on every request). Resolution joins

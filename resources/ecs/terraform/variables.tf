@@ -10,19 +10,12 @@ variable "create_efs" {
   default     = true
 }
 
-# R13: the reaper (registry/efs_reaper.py) only ever purges a workspace's actual data
-# directory (not just its access point) when WARREN_EFS_LOCAL_MOUNT_PATH is set on the
-# control-plane task to a path where the EFS filesystem's root is locally NFS-mounted
-# (config.py's efs_local_mount_path docstring). Before this variable, no IaC path ever
-# set that env var, so the opt-in "actually delete EFS data" feature coded in efs_reaper.py
-# was unreachable in every real deployment -- access points were deleted but their
-# directories under /workspaces/{id} were silently orphaned forever. Defaults to false
-# (orphan-on-delete, the existing/original behavior) since granting the control-plane task
-# root-of-filesystem NFS access is a deliberate trust expansion beyond its own
-# per-purpose /control-plane access point -- an operator who wants workspace data actually
-# reclaimed on destroy must opt in explicitly. Only meaningful when create_efs = true.
+# R13: with EFS the control plane always mounts the filesystem's /var/lib/warren (it writes
+# workspace secrets onto each workspace's volume through it). This only decides whether
+# the reaper also deletes a workspace's data directory when its access point expires
+# (WARREN_EFS_PURGE_WORKSPACE_DATA). Default false: data is kept (orphaned) on delete.
 variable "efs_delete_workspace_data_on_destroy" {
-  description = "Mount the EFS filesystem root into the control-plane task (via a dedicated, unrestricted access point) and set WARREN_EFS_LOCAL_MOUNT_PATH so the access-point-TTL reaper actually deletes a workspace's data directory, not just its access point. Default false: access points are still reaped, but the underlying data is orphaned (original behavior) -- this is a deliberate opt-in since it gives the control-plane task broader filesystem access than its own scoped /control-plane access point. Only meaningful when create_efs = true."
+  description = "Let the access-point-TTL reaper delete a workspace's data directory, not just its access point (WARREN_EFS_PURGE_WORKSPACE_DATA). Default false: the data is orphaned. Only meaningful when create_efs = true."
   type        = bool
   default     = false
 }
@@ -93,29 +86,11 @@ variable "ecs_resource_prefix" {
   default     = "warren"
 }
 
-# finding #17: when set, the control-plane role additionally gets conditional
-# kms:Encrypt/GenerateDataKey/Decrypt grants scoped to this key, for SSM SecureString
-# parameters encrypted with a customer-managed KMS key (WarrenSettings.kms_key_id).
-# Left empty (the default) when SSM's default AWS-managed key (alias/aws/ssm) is used,
-# which needs no explicit KMS grant on this role at all.
+# Customer-managed KMS key for the ECS Exec session/log encryption and the control plane's
+# own WARREN_SECRET_KEY SecureString. Empty uses AWS-managed keys. (Workspace secrets are
+# not in SSM at all.)
 variable "kms_key_id" {
-  description = "KMS key ID or ARN used to encrypt SSM SecureString parameters (WarrenSettings.kms_key_id). Empty (default) means the AWS-managed SSM key, which needs no explicit grant here."
-  type        = string
-  default     = ""
-}
-
-# KMS key for the per-workspace secrets warren-server mirrors to SSM (WARREN_KMS_KEY_ID).
-# create_ssm_kms_key makes a dedicated rotating key; otherwise ssm_kms_key_arn, falling back
-# to kms_key_id. A dedicated key keeps the control plane at kms:Encrypt only: kms_key_id
-# also encrypts ECS Exec logs and the control plane's own secret-key parameter.
-variable "create_ssm_kms_key" {
-  description = "Create a customer-managed KMS key for the workspace-secret SSM mirror."
-  type        = bool
-  default     = false
-}
-
-variable "ssm_kms_key_arn" {
-  description = "Existing KMS key ARN for the workspace-secret SSM mirror. Empty falls back to kms_key_id. Ignored when create_ssm_kms_key is true."
+  description = "KMS key ARN for ECS Exec session/log encryption and the control plane's WARREN_SECRET_KEY parameter. Empty (default) uses AWS-managed keys."
   type        = string
   default     = ""
 }

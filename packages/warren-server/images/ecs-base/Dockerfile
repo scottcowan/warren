@@ -71,10 +71,14 @@ COPY --chown=0:0 --chmod=0755 packages/warren-common/src/warren_common/assets/wa
 COPY --chown=0:0 --chmod=0755 packages/warren-common/src/warren_common/agent_supervisor.py /usr/local/bin/warren-agent-supervisor
 # AH1: run as the task's `git-init` container (runtime/ecs_git.py), never by the workspace.
 COPY --chown=0:0 --chmod=0755 packages/warren-server/images/ecs-base/git-materialize.sh /usr/local/bin/warren-git-materialize
+# Reader for the secrets file the control plane drops on the volume (runtime/ecs_secrets.py),
+# sourced by entrypoint.sh, warren-session and warren-git-materialize.
+COPY --chown=0:0 --chmod=0644 packages/warren-server/images/ecs-base/warren-secrets.sh /usr/local/lib/warren/secrets.sh
 # GitHub's published SSH host keys (api.github.com/meta "ssh_keys"), pinned for git-init's
 # ssh clones. Refresh the checked-in file when GitHub rotates a key.
 COPY --chown=0:0 --chmod=0444 packages/warren-server/images/ecs-base/ssh_known_hosts /etc/warren/ssh_known_hosts
-RUN chown 0:0 /usr /usr/local /usr/local/bin && chmod 0755 /usr /usr/local /usr/local/bin
+RUN chown 0:0 /usr /usr/local /usr/local/bin /usr/local/lib /usr/local/lib/warren \
+    && chmod 0755 /usr /usr/local /usr/local/bin /usr/local/lib /usr/local/lib/warren
 
 # The container starts as root so entrypoint.sh can take ownership of a fresh task volume
 # mount point, then it drops to warren (uid 1000) before running anything else. Extension

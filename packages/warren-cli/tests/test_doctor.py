@@ -292,10 +292,6 @@ def test_doctor_ecs_section(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(subprocess_mod, "run", lambda *a, **kw: _FakeResult())
 
     # Mock boto3 to avoid real AWS calls
-    class _FakeSsm:
-        def describe_parameters(self, **kwargs):
-            return {}
-
     class _FakeEcs:
         def describe_clusters(self, **kwargs):
             return {"clusters": [{"configuration": {"executeCommandConfiguration": {"logging": "ENABLED"}}}]}
@@ -303,19 +299,18 @@ def test_doctor_ecs_section(tmp_path, monkeypatch, capsys):
     class _FakeBoto3:
         @staticmethod
         def client(service):
-            if service == "ssm":
-                return _FakeSsm()
+            assert service != "ssm", "workspace secrets no longer live in SSM"
             return _FakeEcs()
 
     import sys
     monkeypatch.setitem(sys.modules, "boto3", _FakeBoto3)
 
-    # Pass cfg=None so server_id and ecs_cluster are None → SSM and cluster checks skipped
+    # Pass cfg=None so ecs_cluster is None → the cluster check is skipped
     _check_ecs(None)
     captured = capsys.readouterr()
     assert "ECS Runtime:" in captured.out
-    # When server_id is None, SSM check should say skipped
     assert "skipped" in captured.out
+    assert "SSM path" not in captured.out
 
 
 # --- AI6: harness minimum versions ------------------------------------------

@@ -25,14 +25,15 @@ will skip resources that already exist (or are already in state) and re-print th
 All three tools provision the same set of AWS resources:
 
 - **ECS cluster** — `warren-cluster-$ENV` with FARGATE and FARGATE_SPOT capacity providers
-- **IAM task role** — `warren-task-role-$ENV` with scoped ECS, SSM, ECS Exec, and CloudWatch
+- **IAM task role** — `warren-task-role-$ENV` with scoped ECS, EFS, ECS Exec, and CloudWatch
   Logs permissions (the role that warren-server itself assumes at runtime inside Fargate)
 - **IAM task execution role** — `warren-task-exec-role-$ENV` with
   `AmazonECSTaskExecutionRolePolicy` plus an inline `logs:CreateLogGroup` supplement
   (the role the ECS agent uses to pull the container image and ship logs)
 - **VPC** (optional, created unless you supply an existing VPC) — `warren-vpc-$ENV` with two
   private subnets across two AZs and a security group `warren-sg-$ENV`
-- **SSM path prefix** — `/warren/` (used by ECSRuntime for parameter retrieval at task launch)
+- **EFS root access point** (with EFS) — mounted by the control plane to deliver workspace
+  secrets onto each workspace's volume (see [Workspace secrets](#workspace-secrets-delivered-through-the-workspaces-efs-volume))
 - **ECS Exec access** — managed policy `warren-workspace-operator-$ENV` for humans and the
   break-glass role `warren-break-glass-$ENV` (see [ECS Exec access](#ecs-exec-access))
 
@@ -402,55 +403,72 @@ tasks on public subnets have no route to the internet.
 **Activating ECS runtime:** set `WARREN_RUNTIME_TYPE=ecs` to switch warren-server from the
 default Podman runtime to ECSRuntime.
 
-## Workspace secrets: SSM and KMS permissions
+## Workspace secrets: delivered through the workspace's EFS volume
 
-warren-server's local SQLite store (encrypted with `WARREN_SECRET_KEY`) is the source of
-truth for workspace secrets. On ECS each secret is also written to an SSM SecureString at
-`/<WARREN_ECS_RESOURCE_PREFIX>/<WARREN_SERVER_ID>/<owner_id>/<name>`, and the workspace
-task definition references it by ARN, so the ECS agent resolves the value at container
-start. The control plane builds those ARNs from its own store; it never lists or reads
-SSM. That keeps `ssm:GetParametersByPath` off the control plane: IAM can't force
-`WithDecryption=false` on it, so holding it would let a compromised control plane decrypt
-every secret. A write that can't reach SSM is kept in a durable outbox in SQLite (names and
-operations only, never values) and retried at startup, every 60s, on the next write, and
-before provisioning a workspace that needs it. The API answers `202 mirror_pending` until
-it lands, and such a workspace refuses to start rather than launch without it.
+Workspace secrets live only in warren-server's SQLite store, encrypted with
+`WARREN_SECRET_KEY`. They are not copied to SSM, Secrets Manager or anywhere else in AWS.
 
-Settings on the control-plane task:
+Immediately before each RunTask for a workspace (first provision and every relaunch), the
+control plane decrypts exactly the secrets the template declares that the owner has. It
+writes them into that workspace's access point through its own mount of the filesystem
+(`WARREN_EFS_LOCAL_MOUNT_PATH`), at `.warren/` in the access point root. In the task that's
+`/var/lib/warren/.warren/`, outside the git checkout at `/var/lib/warren/workspace`.
 
-| Env var | Meaning |
-|---------|---------|
-| `WARREN_ECS_RESOURCE_PREFIX` | Leading path segment and task-definition family prefix. Required non-empty, `[A-Za-z0-9][A-Za-z0-9_-]{0,31}`. |
-| `WARREN_SERVER_ID` | Second path segment. Set it to a stable value (e.g. the service name); no `/` or surrounding spaces. |
-| `WARREN_KMS_KEY_ID` | Optional customer-managed key (ARN, ID or alias) for every SecureString `PutParameter`. Empty uses `alias/aws/ssm`. |
+- `git-init.env` holds only the clone credentials a git folder uses (`GITHUB_PAT`,
+  `WARREN_GIT_SSH_KEY`, or a folder's own secret). `warren-git-materialize` reads it,
+  deletes it, then clones.
+- `workspace.env` holds everything else. The image's entrypoint exports it into the
+  workspace's environment and deletes it before starting anything. It also keeps a
+  root-only copy at `/run/warren/secrets.env` in the container's own filesystem (not the
+  volume), which `warren-session` loads for ECS Exec sessions. The entrypoint deletes a
+  leftover `git-init.env` unread, so the workspace never holds the clone credentials.
+- Format: one `NAME=<base64 value>` per line. It is parsed without any shell evaluation,
+  and names must be environment variable names; others are skipped with a warning.
+- The writer trusts nothing on the agent-writable volume. Every path component is opened
+  `O_NOFOLLOW`, a planted symlink or file at `.warren` is removed, and the file is written
+  to a fresh `O_EXCL` temp file (mode 0400, directory 0700) and renamed into place.
+- A definitive RunTask failure, `stop` and `destroy` delete any file left behind. Adopting
+  an already-running task writes nothing.
+- Values are never logged and never reach RunTask overrides (which DescribeTasks and
+  CloudTrail record) or the task definition. The task definition therefore holds nothing
+  per-owner, so its cache can safely share one between owners.
 
-**Control-plane task role**, with `PARAMS = arn:aws:ssm:<region>:<account>:parameter/<prefix>/<server_id>/*`:
+**Trade-offs.**
 
-| Actions | Resource | Condition |
-|---------|----------|-----------|
-| `ssm:PutParameter`, `ssm:DeleteParameter` | `PARAMS` | |
-| `kms:Encrypt` (only with `WARREN_KMS_KEY_ID`) | the key ARN | `kms:ViaService = ssm.<region>.amazonaws.com`, `kms:EncryptionContext:PARAMETER_ARN` like `PARAMS` |
+- The secret is at rest on the encrypted, per-workspace EFS volume between the write and
+  the container start. The access point maps every client to uid/gid 1000, the workspace
+  user, so file permissions can't hide it from that user. What protects it is that no
+  workspace process runs until the file has been consumed and deleted.
+- One edge case: a RunTask retry that ECS deduplicates onto an already-started task (same
+  client token) leaves the new file unconsumed until the next stop, destroy or relaunch.
+- Once in the environment, the secrets are readable by the workspace, same as before.
+- A running workspace keeps the value it started with; rotating a secret takes effect on
+  the next relaunch.
+- If the task starts as non-root (`WARREN_ECS_TASK_USER`), the entrypoint can't create the
+  root-only copy, so ECS Exec sessions don't get the secrets.
+- Only images built on `warren-ecs-base` (its entrypoint, or one that sources
+  `/usr/local/lib/warren/secrets.sh` and calls `warren_secrets_take` the same way) consume
+  the file. Any other image doesn't get its secrets, and the file stays on the volume
+  until the workspace is stopped or destroyed.
 
-It needs no `ssm:GetParameter`, `ssm:GetParameters`, `ssm:GetParametersByPath`,
-`ssm:DescribeParameters` and no `kms:Decrypt` for secrets. Parameters are always written
-as Standard tier, so SSM encrypts them with a direct `kms:Encrypt` call; Advanced tier
-would need `kms:GenerateDataKey`. `alias/aws/ssm` needs no KMS grant.
+**Requirements.** A template that declares secrets needs EFS (`WARREN_EFS_ID`) and the
+control plane's mount of the filesystem's `/var/lib/warren`: an access point with
+PosixUser 1000:1000 mounted at `WARREN_EFS_LOCAL_MOUNT_PATH`. Provisioning such a workspace
+without them fails before any AWS call. Terraform, CDK and setup.sh always create and
+mount that access point when EFS is enabled. Whether the same mount is also used to
+delete a workspace's data when its access point is reaped is a separate switch,
+`WARREN_EFS_PURGE_WORKSPACE_DATA` (Terraform/CDK `efs_delete_workspace_data_on_destroy`,
+default off).
 
-**Task execution role** (used by the ECS agent for workspace tasks):
+**IAM.**
 
-| Actions | Resource | Condition |
-|---------|----------|-----------|
-| `ssm:GetParameters` | `PARAMS` | |
-| `kms:Decrypt` (only with `WARREN_KMS_KEY_ID`) | the key ARN | `kms:ViaService = ssm.<region>.amazonaws.com` |
-
-A customer-managed key's policy must let these IAM grants apply, e.g. the standard
-"Enable IAM policies" statement for the account root. Prefer a key dedicated to these
-secrets. In Terraform/CDK, `kms_key_id` also encrypts ECS Exec sessions/logs, which gives
-the task roles `kms:Decrypt` on it. That alone can't expose a secret, because the control
-plane can't fetch SSM ciphertext, but a dedicated key keeps it clean. Terraform:
-`create_ssm_kms_key = true` (creates a rotating key and alias `alias/warren-ssm-<env>`) or
-`ssm_kms_key_arn`. CDK: context `create_ssm_kms_key=true` or `ssm_kms_key_arn`. Both fall
-back to `kms_key_id`.
+- The control-plane task role needs no SSM and no KMS actions for workspace secrets, only
+  `elasticfilesystem:ClientMount`/`ClientWrite` on the filesystem, which it already has.
+- The task execution role needs no SSM access for workspace tasks. The only SSM parameter
+  left in the Terraform stack is the control plane's own `WARREN_SECRET_KEY`, resolved by
+  the execution role (`ssm:GetParameters` on that one ARN, plus `kms:Decrypt` via SSM if
+  `kms_key_id` is set). The CDK stack keeps that key in Secrets Manager.
+- `WARREN_KMS_KEY_ID` is no longer read.
 
 **Task-definition families.** Workspace task definitions are registered as family
 `<prefix>-<image slug>`, where the slug is the image reference without its registry host,
@@ -617,12 +635,10 @@ Your AWS credentials need the following permissions to provision the infrastruct
 **VPC endpoints (Template C only):**
 - `ec2:CreateVpcEndpoint`, `ec2:DescribeVpcEndpoints`
 
-**SSM (none — the `/warren/` path prefix is used by the running task, not the provisioner).**
-
 All provisioned IAM roles follow least-privilege principles:
 - Task role ECS actions are scoped to `arn:aws:ecs:*:*:cluster/warren-*`
 - Task role `iam:PassRole` is scoped to the exact execution role ARN
-- Task role SSM access is scoped to `arn:aws:ssm:*:*:parameter/warren/*`
+- The task role has no SSM access; workspace secrets never leave warren-server's store
 - Avoid attaching `AdministratorAccess` to your provisioner credentials;
   the list above is the complete set of permissions needed.
 

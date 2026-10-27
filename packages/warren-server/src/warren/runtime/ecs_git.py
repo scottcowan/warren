@@ -7,8 +7,8 @@ images/ecs-base/git-materialize.sh against the same `/var/lib/warren` volume, an
 workspace container `dependsOn` it with condition SUCCESS.
 
 The clone credentials (GITHUB_PAT / WARREN_GIT_SSH_KEY / a folder's pat_secret or
-ssh_key_secret) are declared as `secrets` on the init container only and removed from
-the workspace container's, so the agent never holds the clone credential.
+ssh_key_secret) are delivered to the init container only (runtime/ecs_secrets.py's
+git-init.env) and withheld from the workspace's, so the agent never holds them.
 """
 from __future__ import annotations
 
@@ -42,12 +42,7 @@ _slug_non_alnum = re.compile(r"[^a-z0-9]+")
 @dataclass
 class GitInitPlan:
     folders_env: str
-    init_secret_defs: list[dict[str, str]] = field(default_factory=list)
-    workspace_secret_defs: list[dict[str, str]] = field(default_factory=list)
-
-    @property
-    def init_secret_names(self) -> tuple[str, ...]:
-        return tuple(sorted(d["name"] for d in self.init_secret_defs))
+    init_secret_names: tuple[str, ...] = field(default_factory=tuple)
 
 
 def workspace_branch(workspace_id: str, intent: str, mount: str) -> str:
@@ -67,15 +62,12 @@ def _validate_ref(ref: str) -> None:
         raise GitError(f"unsafe git ref: {ref!r}")
 
 
-def build_git_init_plan(
-    spec: WorkspaceSpec, secret_defs: list[dict[str, str]]
-) -> GitInitPlan | None:
+def build_git_init_plan(spec: WorkspaceSpec, available: set[str] | frozenset[str]) -> GitInitPlan | None:
     """Return the init-container plan for `spec`'s git folders, or None if it has none.
 
-    `secret_defs` is the workspace's full ECS `secrets` list; the credential entries a
-    folder needs move to the init container, everything else stays on the workspace.
+    `available` is the secret names this workspace will get; the credentials a folder
+    needs go to the init container instead, everything else stays on the workspace.
     """
-    available = {d["name"] for d in secret_defs}
     records: list[str] = []
     cred_names: set[str] = set()
 
@@ -118,8 +110,4 @@ def build_git_init_plan(
 
     if not records:
         return None
-    return GitInitPlan(
-        folders_env="\n".join(records),
-        init_secret_defs=[d for d in secret_defs if d["name"] in cred_names],
-        workspace_secret_defs=[d for d in secret_defs if d["name"] not in cred_names],
-    )
+    return GitInitPlan(folders_env="\n".join(records), init_secret_names=tuple(sorted(cred_names)))
