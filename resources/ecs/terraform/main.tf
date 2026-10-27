@@ -979,6 +979,9 @@ data "aws_iam_policy_document" "task_role_policy" {
         "elasticfilesystem:ClientMount",
         "elasticfilesystem:ClientWrite",
         "elasticfilesystem:DescribeMountTargets",
+        # efs.py resolves a workspace's access point (reattach) and the reaper lists
+        # them, both with DescribeAccessPoints(FileSystemId=...).
+        "elasticfilesystem:DescribeAccessPoints",
       ]
       resources = [local.efs_arn]
     }

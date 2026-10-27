@@ -1386,7 +1386,8 @@ EFS_TASK_POLICY=$(cat <<POLICY
       "Action": [
         "elasticfilesystem:ClientMount",
         "elasticfilesystem:ClientWrite",
-        "elasticfilesystem:DescribeMountTargets"
+        "elasticfilesystem:DescribeMountTargets",
+        "elasticfilesystem:DescribeAccessPoints"
       ],
       "Resource": "arn:aws:elasticfilesystem:*:$ACCOUNT_ID:file-system/$WARREN_EFS_ID"
     },

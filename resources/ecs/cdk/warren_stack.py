@@ -998,6 +998,8 @@ class WarrenECSStack(cdk.Stack):
                                     "elasticfilesystem:ClientMount",
                                     "elasticfilesystem:ClientWrite",
                                     "elasticfilesystem:DescribeMountTargets",
+                                    # efs.py's reattach and the reaper list access points.
+                                    "elasticfilesystem:DescribeAccessPoints",
                                 ],
                                 resources=[efs_fs.file_system_arn],
                             ),
