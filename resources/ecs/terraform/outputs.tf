@@ -72,3 +72,14 @@ output "warren_break_glass_role_arn" {
   description = "The only role with cluster-wide ECS Exec and SSM sessions into workspace tasks (AI1)"
   value       = aws_iam_role.break_glass.arn
 }
+
+# EBS workspace storage (runtime/ebs.py); empty when not enabled.
+output "warren_ecs_ebs_infra_role_arn" {
+  description = "ECS infrastructure role for workspace EBS volumes — set as WARREN_ECS_EBS_INFRA_ROLE_ARN. Empty when EBS storage isn't enabled."
+  value       = local.ebs_enabled ? aws_iam_role.ecs_infra[0].arn : ""
+}
+
+output "warren_ecs_secrets_kms_key_arn" {
+  description = "KMS key for EBS-mode secrets delivery — set as WARREN_ECS_SECRETS_KMS_KEY_ID. Empty when EBS storage isn't enabled."
+  value       = local.secrets_kms_key_arn
+}

@@ -136,3 +136,50 @@ variable "break_glass_require_mfa" {
   type        = bool
   default     = true
 }
+
+# ---------------------------------------------------------------------------
+# EBS workspace storage (warren-server runtime/ebs.py). Opt-in: each workspace launch gets
+# an ECS-managed EBS volume, snapshotted on stop and restored on the next launch, with
+# secrets delivered as KMS ciphertext (runtime/ecs_kms_secrets.py) instead of a file on EFS.
+# ---------------------------------------------------------------------------
+
+variable "workspace_storage" {
+  description = "Deployment default for a new ECS workspace's volume (WARREN_ECS_WORKSPACE_STORAGE): \"efs\" (default, per-workspace EFS access point) or \"ebs\" (ECS-managed EBS volume persisted through snapshots). \"ebs\" implies enable_ebs_storage."
+  type        = string
+  default     = "efs"
+
+  validation {
+    condition     = contains(["efs", "ebs"], var.workspace_storage)
+    error_message = "workspace_storage must be \"efs\" or \"ebs\"."
+  }
+}
+
+variable "enable_ebs_storage" {
+  description = "Provision EBS workspace storage (the ECS infrastructure role, secrets KMS key and control-plane grants) so templates can pick `ecs_storage: ebs` while the default stays efs. Implied true when workspace_storage = \"ebs\"."
+  type        = bool
+  default     = false
+}
+
+# Volumes and their snapshots are always encrypted; this only picks the key. Must be an ARN.
+variable "ebs_kms_key_arn" {
+  description = "KMS key ARN for EBS volume/snapshot encryption (WARREN_ECS_EBS_KMS_KEY_ID). Empty (default) uses the AWS-managed aws/ebs key."
+  type        = string
+  default     = ""
+}
+
+variable "secrets_kms_key_arn" {
+  description = "Symmetric KMS key ARN for EBS-mode secrets delivery (WARREN_ECS_SECRETS_KMS_KEY_ID). Empty (default) with EBS enabled creates a dedicated key with rotation."
+  type        = string
+  default     = ""
+}
+
+variable "ebs_size_gib" {
+  description = "Size of a new workspace's EBS volume in GiB (WARREN_ECS_EBS_SIZE_GIB)."
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.ebs_size_gib >= 1 && var.ebs_size_gib <= 16384
+    error_message = "ebs_size_gib must be between 1 and 16384."
+  }
+}
