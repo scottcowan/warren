@@ -20,6 +20,7 @@ class WorkspaceSpec:
     secret_names: list[str] = field(default_factory=list)  # resolved template's declared secret names (warren.secrets) — the ECS path's by-name allow-list; podman/docker already got decrypted values straight into `env` above, this is what runtime/ecs.py filters SSM param names against
     owner_id: str = ""                  # creating user's id — isolates warren.secrets lookups to this workspace's own owner, never another user's secrets
     storage_key: str = ""               # ECS per-user storage entry (WARREN_ECS_OWNER_STORAGE key, the owner's AWS principal name); "" = the shared filesystem
+    ecs_storage: str = ""               # ECS workspace volume mode, "efs" | "ebs", fixed at creation (WARREN_ECS_WORKSPACE_STORAGE or the template's ecs_storage); "" = efs
     ssh_key_paths: list[str] = field(default_factory=list)   # specific key files declared by intent
     ssh_agent_sock: str | None = None                        # SSH_AUTH_SOCK forwarded if intent.ssh.agent=true
     bind_mounts: list[tuple[str, str, str]] = field(default_factory=list)  # (host, container, mode)

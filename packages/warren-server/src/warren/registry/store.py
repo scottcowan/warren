@@ -51,6 +51,9 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         # itself is not implemented yet -- a reasonable follow-up, not blocking.
         "created_by_token_id": "TEXT",
     },
+    "ecs_launch_attempts": {
+        "secrets_blobs": "TEXT",
+    },
     "workspace_tokens": {
         # AI8/AJ2: a reservation token may provision its (not yet existing) workspace once.
         "provision_grant": "INTEGER NOT NULL DEFAULT 0",
@@ -486,7 +489,7 @@ class LaunchAttemptStore:
     async def get(self, workspace_id: str) -> dict[str, str] | None:
         async with self._db.execute(
             """
-            SELECT generation, fingerprint, task_definition_arn, client_token
+            SELECT generation, fingerprint, task_definition_arn, client_token, secrets_blobs
             FROM ecs_launch_attempts WHERE workspace_id = ?
             """,
             (workspace_id,),
@@ -494,21 +497,24 @@ class LaunchAttemptStore:
             row = await cur.fetchone()
         if row is None:
             return None
-        generation, fingerprint, task_definition_arn, client_token = row
-        return {
+        generation, fingerprint, task_definition_arn, client_token, secrets_blobs = row
+        attempt = {
             "generation": generation,
             "fingerprint": fingerprint,
             "task_definition_arn": task_definition_arn,
             "client_token": client_token,
         }
+        if secrets_blobs:
+            attempt["secrets_blobs"] = secrets_blobs
+        return attempt
 
     async def put(self, workspace_id: str, attempt: dict[str, str]) -> None:
         await self._db.execute(
             """
             INSERT OR REPLACE INTO ecs_launch_attempts (
                 workspace_id, generation, fingerprint, task_definition_arn,
-                client_token, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                client_token, created_at, secrets_blobs
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 workspace_id,
@@ -517,6 +523,7 @@ class LaunchAttemptStore:
                 attempt["task_definition_arn"],
                 attempt["client_token"],
                 _utcnow_iso(),
+                attempt.get("secrets_blobs") or None,
             ),
         )
 
@@ -524,6 +531,30 @@ class LaunchAttemptStore:
         await self._db.execute(
             "DELETE FROM ecs_launch_attempts WHERE workspace_id = ?", (workspace_id,)
         )
+
+
+class EbsSnapshotStore:
+    """EBS storage: each workspace's restore-point snapshot id (ecs_ebs_snapshots)."""
+
+    def __init__(self, db: aiosqlite.Connection) -> None:
+        self._db = db
+
+    async def get(self, workspace_id: str) -> str | None:
+        async with self._db.execute(
+            "SELECT snapshot_id FROM ecs_ebs_snapshots WHERE workspace_id = ?", (workspace_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
+
+    async def put(self, workspace_id: str, snapshot_id: str) -> None:
+        await self._db.execute(
+            "INSERT OR REPLACE INTO ecs_ebs_snapshots (workspace_id, snapshot_id, updated_at) "
+            "VALUES (?, ?, ?)",
+            (workspace_id, snapshot_id, _utcnow_iso()),
+        )
+
+    async def delete(self, workspace_id: str) -> None:
+        await self._db.execute("DELETE FROM ecs_ebs_snapshots WHERE workspace_id = ?", (workspace_id,))
 
 
 class OperationStore:

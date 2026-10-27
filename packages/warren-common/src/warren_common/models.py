@@ -324,6 +324,10 @@ class ProjectConfig(BaseModel):
     ssh: SshConfig | None = None
     ecs_cpu: str | None = None    # per-node Fargate CPU override (D-02)
     ecs_memory: str | None = None  # per-node Fargate memory override (D-02)
+    # ECS workspace volume: an EFS access point or an ECS-managed EBS volume persisted
+    # through snapshots (warren-server runtime/ebs.py). None: the deployment's default
+    # (WARREN_ECS_WORKSPACE_STORAGE). Only a mode the deployment has configured is accepted.
+    ecs_storage: Literal["efs", "ebs"] | None = None
     idle_ttl_seconds: float | None = None  # per-project/template idle-reaper TTL override; None falls back to the server's global WarrenSettings.idle_ttl_seconds
     # AK2: git-crypt policy for this template's checkouts (warren_common.git_crypt).
     # `none` never delivers the key; `unlock_and_drop` decrypts at materialization
