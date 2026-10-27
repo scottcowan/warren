@@ -160,8 +160,12 @@ class EFSMount:
         retention_days: int = 7,
         settings: Any = None,
         efs_client: Any = None,
+        local_mount_path: str | None = None,
     ) -> None:
         self._efs_id = efs_id
+        # The control plane's mount of THIS filesystem (per-user storage gives each
+        # filesystem its own); None falls back to settings.efs_local_mount_path.
+        self._local_mount_path = local_mount_path
         self._server_id = server_id
         self._retention_days = retention_days
         self._settings = settings
@@ -379,7 +383,9 @@ class EFSMount:
             log.debug("efs_delete_noop_not_found", workspace_id=workspace_id)
             return
 
-        local_mount_path = getattr(self._settings, "efs_local_mount_path", "") or ""
+        local_mount_path = self._local_mount_path
+        if local_mount_path is None:
+            local_mount_path = getattr(self._settings, "efs_local_mount_path", "") or ""
         if not getattr(self._settings, "efs_purge_workspace_data", True):
             local_mount_path = ""
         await purge_and_delete_access_point(efs, access_point_id, workspace_id, local_mount_path)

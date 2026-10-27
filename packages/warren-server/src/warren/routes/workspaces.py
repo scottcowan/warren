@@ -73,6 +73,8 @@ _PROVISION_ERROR_STATUS: dict[str, int] = {
     "git_pull_failed": 502,
     # BB4: task still in PROVISIONING/PENDING/ACTIVATING after the wait.
     "workspace_starting": 503,
+    # A workspace from before per-user ECS storage, or an owner no longer configured.
+    "workspace_storage_unavailable": 409,
 }
 
 
@@ -299,6 +301,16 @@ async def _provision_workspace(
             _deny_scoped_provision(request, scoped_to)
         workspace_id = scoped_to
 
+    # warren.secrets: resolve_owner_id is warren's bearer-token user_id on
+    # podman/docker, or the caller's verified AWS IAM identity on ECS
+    # (warren.auth.deps.resolve_owner_id) -- NOT necessarily the same as
+    # `user.user_id` above, which keeps stamping the WORKSPACE RECORD's
+    # owner_id (D-11, unaffected by this). Only secret ownership moves to the
+    # AWS identity on ECS, so it lines up with who can actually
+    # ecs:ExecuteCommand/SSM-tunnel into the resulting task.
+    secret_owner_id = await resolve_owner_id(request)
+    storage_key = _require_owner_storage(request, settings)
+
     # Resolve image from settings/project config if available, else use placeholder
     image = await _resolve_image(body, request)
     template_cfg = await _resolve_template_cfg(body, request)
@@ -398,15 +410,6 @@ async def _provision_workspace(
         ) from exc
     scope_cfg = template_cfg.scope if template_cfg is not None else None
 
-    # warren.secrets: resolve_owner_id is warren's bearer-token user_id on
-    # podman/docker, or the caller's verified AWS IAM identity on ECS
-    # (warren.auth.deps.resolve_owner_id) -- NOT necessarily the same as
-    # `user.user_id` above, which keeps stamping the WORKSPACE RECORD's
-    # owner_id (D-11, unaffected by this). Only secret ownership moves to the
-    # AWS identity on ECS, so it lines up with who can actually
-    # ecs:ExecuteCommand/SSM-tunnel into the resulting task.
-    secret_owner_id = await resolve_owner_id(request)
-
     # For podman/docker, decrypt and inject this workspace OWNER's (never
     # another user's — isolation is per-owner, routes/secrets.py) visible
     # secret tier directly into spec.env. ECS does NOT go through this path:
@@ -433,6 +436,7 @@ async def _provision_workspace(
         seed_prompt=template_cfg.seed_prompt if template_cfg is not None else None,
         secret_names=secret_names,
         owner_id=secret_owner_id,
+        storage_key=storage_key,
         folders=folders,
         app=app_cmd,
         harnesses=harnesses,
@@ -544,6 +548,25 @@ async def _provision_workspace(
         )
 
     return WorkspaceView.from_workspace(ws)
+
+
+def _require_owner_storage(request: Request, settings) -> str:
+    """The caller's WARREN_ECS_OWNER_STORAGE key, or 403 before anything is provisioned.
+    "" when per-user storage isn't configured (or this isn't ECS)."""
+    if settings is None or getattr(settings, "runtime_type", "podman") != "ecs":
+        return ""
+    storage = getattr(settings, "ecs_owner_storage", None) or {}
+    if not storage:
+        return ""
+    from warren.runtime.ecs_storage import NOT_SET_UP  # noqa: PLC0415
+
+    key = getattr(request.state, "aws_principal", "") or ""
+    if key not in storage:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "workspace_storage_not_configured", "detail": NOT_SET_UP, "user": key},
+        )
+    return key
 
 
 def _raise_capacity_exhausted(exc: CapacityExhausted) -> NoReturn:

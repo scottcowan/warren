@@ -209,7 +209,7 @@ async def test_a_failing_state_reader_is_unverifiable(monkeypatch):
 async def test_registry_reads_hook_state_then_osc_without_following_links(tmp_path):
     base = tmp_path / "harness" / "ws-1"
     (base / ".session").mkdir(parents=True)
-    reg = SimpleNamespace(_agent_state_dir=lambda wid: base)
+    reg = SimpleNamespace(_agent_state_dir=lambda ws: base)
     ws = _ws()
     assert await Registry.agent_state(reg, ws) is None
     (base / ".session" / "osc-state.json").write_text(json.dumps({"state": "working", "ts": 3}))
@@ -224,13 +224,14 @@ async def test_registry_reads_hook_state_then_osc_without_following_links(tmp_pa
     (tmp_path / "elsewhere.json").write_text(json.dumps({"state": "working", "ts": 9}))
     (base / ".session" / "state.json").symlink_to(tmp_path / "elsewhere.json")
     assert await Registry.agent_state(reg, ws) is None
-    assert await Registry.agent_state(SimpleNamespace(_agent_state_dir=lambda wid: None), ws) is None
+    assert await Registry.agent_state(SimpleNamespace(_agent_state_dir=lambda ws: None), ws) is None
 
 
 def _ecs_registry(mount: str):
     reg = SimpleNamespace(settings=SimpleNamespace(runtime_type="ecs", efs_local_mount_path=mount))
     reg._harness_state_dir = lambda wid: None
-    reg._agent_state_dir = lambda wid: Registry._agent_state_dir(reg, wid)
+    reg._ecs_mount = lambda ws: Registry._ecs_mount(reg, ws)
+    reg._agent_state_dir = lambda ws: Registry._agent_state_dir(reg, ws)
     return reg
 
 

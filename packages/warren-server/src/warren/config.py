@@ -10,6 +10,7 @@ from typing import Annotated, Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from warren.runtime.ecs_storage import OwnerStorage, parse_owner_storage
 
 # Audit 2026-10-16 P2 #44: both secret_key and bootstrap_token are used as raw key
 # material (secret_key.encode() feeds auth/tokens.py's HMAC pepper derivation and
@@ -255,6 +256,16 @@ class WarrenSettings(BaseSettings):
     # Whether that mount is also used to delete a workspace's data when its access
     # point is deleted. Off keeps the data (the reaper only removes the access point).
     efs_purge_workspace_data: bool = True
+    # WARREN_ECS_OWNER_STORAGE: per-user EFS filesystem, workspace security groups and
+    # control-plane mount path, keyed by AWS principal name (runtime/ecs_storage.py).
+    # When set it replaces efs_id / ecs_security_group_ids / efs_local_mount_path for
+    # workspaces, and users without an entry can't create ECS workspaces.
+    ecs_owner_storage: Annotated[dict[str, OwnerStorage], NoDecode] = Field(default_factory=dict)
+
+    @field_validator("ecs_owner_storage", mode="before")
+    @classmethod
+    def _parse_owner_storage(cls, v: object) -> object:
+        return parse_owner_storage(v)
 
     # Issue #11: `expires_at` existed in the tokens schema and in the query that resolves
     # a token to a user, but nothing ever wrote a value into it, so every minted token was

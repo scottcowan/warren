@@ -64,19 +64,36 @@ async def lifespan(app: FastAPI):
 @asynccontextmanager
 async def _lifespan(app: FastAPI, settings: WarrenSettings):
     _efs_volume = None  # set below when runtime_type == "ecs" and efs_id is configured
+    _owner_volumes: dict = {}  # WARREN_ECS_OWNER_STORAGE: one EFSMount per user filesystem
 
     if settings.runtime_type == "ecs":
         from warren.runtime.ecs import ECSRuntime  # noqa: PLC0415
-        # D-10: EFS is opt-in — only wire EFSMount when efs_id is configured.
-        if settings.efs_id:
-            from warren.runtime.efs import EFSMount  # noqa: PLC0415
+        from warren.runtime.efs import EFSMount  # noqa: PLC0415
+
+        if settings.ecs_owner_storage:
+            # Per-user storage: every workspace lives on its owner's filesystem; the
+            # shared WARREN_EFS_ID is no longer used for workspaces.
+            _owner_volumes = {
+                key: EFSMount(
+                    efs_id=cfg.efs_id,
+                    server_id=settings.server_id,
+                    retention_days=settings.efs_retention_days,
+                    settings=settings,
+                    local_mount_path=cfg.local_mount_path,
+                )
+                for key, cfg in settings.ecs_owner_storage.items()
+            }
+        elif settings.efs_id:
+            # D-10: EFS is opt-in — only wire EFSMount when efs_id is configured.
             _efs_volume = EFSMount(
                 efs_id=settings.efs_id,
                 server_id=settings.server_id,
                 retention_days=settings.efs_retention_days,
                 settings=settings,
             )
-        runtime = ECSRuntime(server_id=settings.server_id, settings=settings, volume=_efs_volume)
+        runtime = ECSRuntime(
+            server_id=settings.server_id, settings=settings, volume=_efs_volume, volumes=_owner_volumes
+        )
     elif settings.runtime_type == "docker":
         from warren_common.runtime.docker import DockerRuntime  # noqa: PLC0415
         runtime = DockerRuntime(server_id=settings.server_id)
@@ -101,6 +118,15 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
     store = WorkspaceStore(db)
     if settings.runtime_type == "ecs":
         runtime.launch_store = LaunchAttemptStore(db)
+
+        async def _storage_key_of(workspace_id: str) -> str | None:
+            from warren.registry.registry import deserialize_spec_extra  # noqa: PLC0415
+            from warren.runtime.ecs_storage import storage_key_from_extra  # noqa: PLC0415
+
+            ws = await store.get(workspace_id)
+            return storage_key_from_extra(deserialize_spec_extra(ws.spec_json)) if ws else None
+
+        runtime.storage_key_of = _storage_key_of
         from warren.secrets import store as secret_store  # noqa: PLC0415
         from warren.secrets.cipher import LocalCipher  # noqa: PLC0415
 
@@ -238,30 +264,43 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
         log.exception("rate_limiter_pruner_spawn_failed")
 
     app.state.efs_reaper_task = None
-    efs_id = getattr(settings, "efs_id", "") or ""
-    if efs_id:
+    app.state.efs_reaper_tasks = []
+    # One reaper per filesystem, each purging only through that filesystem's own mount:
+    # the shared WARREN_EFS_ID (also still reaped in per-user mode, for the expired access
+    # points of workspaces created before it) and every per-user filesystem.
+    reap: list[tuple[str, str]] = []
+    if getattr(settings, "efs_id", ""):
+        reap.append((settings.efs_id, settings.efs_local_mount_path))
+    if settings.runtime_type == "ecs":
+        reap += [(cfg.efs_id, cfg.local_mount_path) for cfg in settings.ecs_owner_storage.values()]
+    if reap:
         try:
             from warren.registry.efs_reaper import run_efs_reaper  # noqa: PLC0415
             efs_interval_s = float(getattr(settings, "efs_reaper_interval_hours", 6)) * 3600.0
-            # Get EFS client from the EFSMount instance wired into ECSRuntime.
-            # _efs_volume is set above when efs_id is configured; warm the client now
-            # so the reaper has a session immediately rather than waiting for first provision.
-            efs_client = None
-            if _efs_volume is not None:
-                efs_client = _efs_volume._ensure_client()
+            # Warm one EFS client now so the reapers have a session before first provision.
+            any_volume = _efs_volume or next(iter(_owner_volumes.values()), None)
+            if any_volume is None:
+                from warren.runtime.efs import EFSMount  # noqa: PLC0415
+
+                any_volume = EFSMount(efs_id=reap[0][0], server_id=settings.server_id, settings=settings)
+            efs_client = any_volume._ensure_client()
             if efs_client is None:
                 log.warning("efs_reaper_no_client_skipping")
             else:
-                app.state.efs_reaper_task = asyncio.create_task(
-                    run_efs_reaper(
-                        efs_client,
-                        efs_id,
-                        settings.server_id,
-                        interval_seconds=efs_interval_s,
-                        local_mount_path=(settings.efs_local_mount_path if settings.efs_purge_workspace_data else ""),
+                for efs_id, mount in reap:
+                    app.state.efs_reaper_tasks.append(
+                        asyncio.create_task(
+                            run_efs_reaper(
+                                efs_client,
+                                efs_id,
+                                settings.server_id,
+                                interval_seconds=efs_interval_s,
+                                local_mount_path=(mount if settings.efs_purge_workspace_data else ""),
+                            )
+                        )
                     )
-                )
-                log.info("efs_reaper_started", efs_id=efs_id, interval_s=efs_interval_s)
+                    log.info("efs_reaper_started", efs_id=efs_id, interval_s=efs_interval_s)
+                app.state.efs_reaper_task = app.state.efs_reaper_tasks[0]
         except Exception:
             log.exception("efs_reaper_spawn_failed")
 
@@ -308,8 +347,7 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
                 pass
             except Exception:
                 log.exception("reaper_shutdown_error")
-        efs_task = getattr(app.state, "efs_reaper_task", None)
-        if efs_task is not None:
+        for efs_task in getattr(app.state, "efs_reaper_tasks", None) or []:
             efs_task.cancel()
             try:
                 await efs_task

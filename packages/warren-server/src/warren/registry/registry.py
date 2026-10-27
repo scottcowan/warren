@@ -76,6 +76,7 @@ _SPEC_EXTRA_FIELDS = (
     "template_env",
     "secret_names",
     "owner_id",
+    "storage_key",
     "ssh_key_paths",
     "ssh_agent_sock",
     "app",
@@ -379,7 +380,7 @@ class WorkspaceRegistry:
 
         from warren.registry.completion import read_nofollow  # noqa: PLC0415
 
-        base = self._agent_state_dir(ws.workspace_id)
+        base = self._agent_state_dir(ws)
         if base is None:
             return None
 
@@ -399,12 +400,31 @@ class WorkspaceRegistry:
         )
         return st.busiest(hook or osc, agent)
 
-    def _agent_state_dir(self, workspace_id: str) -> "Path | None":
+    def _ecs_mount(self, ws: "Workspace") -> str:
+        """The control plane's mount of the filesystem `ws` lives on: its owner's entry
+        in WARREN_ECS_OWNER_STORAGE, else WARREN_EFS_LOCAL_MOUNT_PATH. "" when unknown
+        (a workspace from before per-user storage, or an owner since removed), so no
+        workspace is ever reached through another user's filesystem."""
+        storage = getattr(self.settings, "ecs_owner_storage", None) or {}
+        if isinstance(storage, dict) and storage:
+            from warren.runtime.ecs_storage import storage_key_from_extra  # noqa: PLC0415
+
+            try:
+                key = storage_key_from_extra(deserialize_spec_extra(ws.spec_json))
+            except Exception:
+                return ""
+            entry = storage.get(key) if key else None
+            return entry.local_mount_path if entry is not None else ""
+        mount = getattr(self.settings, "efs_local_mount_path", "") or ""
+        return mount if isinstance(mount, str) else ""
+
+    def _agent_state_dir(self, ws: "Workspace") -> "Path | None":
         """Host-side harness dir the hooks report under: podman's bind-mounted dir, or
         on ECS the workspace's EFS dir (`/var/lib/warren` in the task) through the
-        control plane's own mount of the filesystem (WARREN_EFS_LOCAL_MOUNT_PATH)."""
+        control plane's own mount of its filesystem (_ecs_mount)."""
+        workspace_id = ws.workspace_id
         if self.settings is not None and getattr(self.settings, "runtime_type", "podman") == "ecs":
-            mount = getattr(self.settings, "efs_local_mount_path", "") or ""
+            mount = self._ecs_mount(ws)
             if not mount or not re.fullmatch(r"[A-Za-z0-9-]+", workspace_id):
                 return None
             return Path(mount) / "workspaces" / workspace_id / "harness"
@@ -1266,11 +1286,11 @@ class WorkspaceRegistry:
         targets: list = []
         shadow_root: Path | None = None
         if getattr(self.settings, "runtime_type", "podman") == "ecs":
-            mount = getattr(self.settings, "efs_local_mount_path", "") or ""
+            mount = self._ecs_mount(ws)
             if not mount:
                 errors.append(
                     "git/verdict: the workspace volume isn't mounted on the control plane "
-                    "(WARREN_EFS_LOCAL_MOUNT_PATH unset)"
+                    "(WARREN_EFS_LOCAL_MOUNT_PATH unset, or no per-user storage entry)"
                 )
             else:
                 volume_root = Path(mount) / "workspaces" / ws.workspace_id

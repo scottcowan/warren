@@ -74,10 +74,18 @@ async def _aws_identity_resolver(request: Request) -> str:
         )
     settings = request.app.state.settings
     try:
+        from warren.runtime.ecs_storage import principal_name
+
+        def _record(arn: str) -> None:
+            # The per-user ECS storage key (WARREN_ECS_OWNER_STORAGE), from the same
+            # verified, trusted ARN as the owner_id.
+            request.state.aws_principal = principal_name(arn)
+
         return await verify_signed_caller_identity(
             signed_request,
             settings.server_id,
             settings.aws_trusted_assumed_role_patterns,
+            on_verified_arn=_record,
         )
     except AwsIdentityError as exc:
         raise HTTPException(
