@@ -480,6 +480,117 @@ matches any other family starting with `<prefix>-`, including this stack's own
 `warren-server-control-plane-<env>` with the default prefix. Keep the explicit Deny on the
 control plane's own family, and give each deployment in an account its own prefix.
 
+## Per-user storage and network isolation (`WARREN_ECS_OWNER_STORAGE`)
+
+By default all workspaces share one EFS filesystem (`WARREN_EFS_ID`) and one set of
+security groups (`WARREN_ECS_SECURITY_GROUP_IDS`). Access points keep workspaces apart
+inside that filesystem; nothing at the network layer does.
+
+Per-user mode gives every user their own EFS filesystem and their own workspace security
+group(s), defined statically by your IaC from a list of users. The workspace task role
+stays shared; the network is the boundary between users. warren places each workspace on
+its owner's entry:
+- the access point is created, tagged, resolved and deleted on the owner's filesystem;
+- RunTask uses the owner's security groups;
+- secret delivery, data purges, agent state and the git verdict go through the control
+  plane's mount of the owner's filesystem.
+
+Every per-user filesystem gets its own access-point reaper, which purges only through
+that filesystem's mount. Nothing reaches one user's workspace through another user's
+filesystem or mount. This repo's Terraform/CDK/setup.sh stay on the shared-filesystem
+mode; the requirements for a stack that uses per-user mode are listed below.
+
+**The user key** is the AWS principal name of the caller's verified identity:
+- for an IAM user, the user name;
+- for an assumed role matched by `WARREN_AWS_TRUSTED_ASSUMED_ROLE_PATTERNS`, the
+  RoleSessionName. With IAM Identity Center that is the SSO user name, e.g. `scowan` in
+  `arn:aws:sts::123456789012:assumed-role/AWSReservedSSO_Dev_0123abcd/scowan`.
+
+It's taken only from an ARN that has already passed warren's trust check, so an untrusted
+role can't pick a name. One person keeps the same key across permission sets. Key format:
+`[\w+=,.@-]{1,64}`.
+
+```bash
+WARREN_ECS_OWNER_STORAGE='{
+  "scowan": {"efs_id": "fs-0123456789abcdef0",
+             "security_group_ids": ["sg-0123456789abcdef0"],
+             "local_mount_path": "/mnt/warren-efs/scowan"},
+  "alice":  {"efs_id": "fs-0fedcba9876543210",
+             "security_group_ids": ["sg-0fedcba9876543210"],
+             "local_mount_path": "/mnt/warren-efs/alice"}
+}'
+```
+
+**Validation.** It's validated strictly at startup, and the server won't start if any
+check fails:
+- `fs-`/`sg-` id formats;
+- non-empty security group lists;
+- absolute, normalised mount paths;
+- no unknown fields;
+- no filesystem, mount path or security group shared between users;
+- no mount path nested inside another.
+
+**Behaviour.**
+- When set, it replaces `WARREN_EFS_ID`, `WARREN_ECS_SECURITY_GROUP_IDS` and
+  `WARREN_EFS_LOCAL_MOUNT_PATH` for workspaces.
+- `WARREN_EFS_PURGE_WORKSPACE_DATA` still decides whether reapers delete data.
+- A user with no entry gets `403 workspace_storage_not_configured` ("you're not set up
+  for workspaces on this deployment; ask to be added to the workspace user list") before
+  anything is provisioned or any AWS call is made.
+- When it's absent or empty, nothing changes.
+
+**Existing workspaces.** Workspaces created on the shared filesystem before you enable
+this must be destroyed and recreated; there is no migration. Relaunching one answers
+`409 workspace_storage_unavailable` ("...destroy and recreate it"). Destroying one stops
+its task and touches no filesystem. If `WARREN_EFS_ID` is still set, the shared
+filesystem keeps its reaper, so those workspaces' expired access points are still cleaned
+up. The same 409 applies to a workspace whose owner has been removed from the map.
+
+**What your IaC needs, per user U:**
+- **Filesystem.** An EFS filesystem `FS_U`: encrypted, with a file system policy that
+  denies `aws:SecureTransport=false` and denies mounts without an access point (as
+  `aws_efs_file_system_policy.warren` here).
+- **Security groups:**
+  - Workspace SG `SG_U` (the value in `security_group_ids`): no ingress needed. Egress:
+    TCP 2049 to `EFS_SG_U`, plus whatever workspaces need (HTTPS to the internet or VPC
+    endpoints for ECR, logs and SSM/ECS Exec).
+  - Mount-target SG `EFS_SG_U`: ingress TCP 2049 from `SG_U` and from the control-plane
+    SG only.
+  - Never allow 2049 (or anything else) from another user's `SG_V`.
+- **Mount targets** for `FS_U` in every workspace subnet, using `EFS_SG_U`.
+- **A root access point on `FS_U`** for the control plane: path `/var/lib/warren`,
+  PosixUser 1000:1000, created 1000:1000 0755. warren creates the per-workspace access
+  points under `/var/lib/warren/workspaces/<id>` itself.
+- **A control-plane task-definition volume per user:**
+  `efsVolumeConfiguration {fileSystemId = FS_U, transitEncryption = ENABLED,
+  authorizationConfig {accessPointId = <root AP of FS_U>, iam = ENABLED}}`, mounted at
+  `local_mount_path`.
+- **Control-plane SG:** egress TCP 2049 to every `EFS_SG_U`.
+- **Control-plane task role**, with `FS_ARNS` = every `arn:aws:elasticfilesystem:<region>:<acct>:file-system/FS_U`
+  and `AP_ARNS` = `arn:aws:elasticfilesystem:<region>:<acct>:access-point/*`. These are
+  the statements `terraform/main.tf` uses, with `FS_ARNS` in place of the single
+  filesystem:
+  - `elasticfilesystem:ClientMount`, `ClientWrite`, `DescribeMountTargets`,
+    `DescribeAccessPoints` on `FS_ARNS`.
+  - `elasticfilesystem:CreateAccessPoint` on `FS_ARNS`, condition
+    `aws:RequestTag/warren = true`.
+  - `elasticfilesystem:TagResource` on `AP_ARNS`, conditions
+    `elasticfilesystem:CreateAction = CreateAccessPoint` and `aws:RequestTag/warren = true`.
+  - `elasticfilesystem:DeleteAccessPoint` on `AP_ARNS`, condition
+    `elasticfilesystem:AccessPointTag/warren = true`.
+  - `elasticfilesystem:TagResource`, `UntagResource` on `AP_ARNS`, conditions
+    `aws:TagKeys` (ForAllValues) = `warren.expires_at`,
+    `elasticfilesystem:AccessPointTag/warren = true`, and
+    `elasticfilesystem:AccessPointTag/warren.server_instance = <WARREN_SERVER_ID>`.
+- **Shared workspace task role:** `elasticfilesystem:ClientMount`, `ClientWrite` on
+  `FS_ARNS`. The network, not IAM, keeps U's tasks off V's filesystem.
+- **The control plane's own state** (`/var/lib/warren`, its SQLite database) on a
+  separate filesystem: an access point for the control plane only, and mount targets whose
+  SG allows 2049 only from the control-plane SG. No workspace SG may reach it.
+- **Settings:** `WARREN_ECS_OWNER_STORAGE` as above, and
+  `WARREN_AWS_TRUSTED_ASSUMED_ROLE_PATTERNS` covering your users' roles (the key only
+  exists for trusted ARNs).
+
 ## Model access through a Bedrock gateway
 
 By default a bedrock-mode workspace (`model_access: bedrock`) calls Bedrock with its task
