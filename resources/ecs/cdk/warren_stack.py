@@ -998,6 +998,8 @@ class WarrenECSStack(cdk.Stack):
                                     "elasticfilesystem:ClientMount",
                                     "elasticfilesystem:ClientWrite",
                                     "elasticfilesystem:DescribeMountTargets",
+                                    # efs.py's reattach and the reaper list access points.
+                                    "elasticfilesystem:DescribeAccessPoints",
                                 ],
                                 resources=[efs_fs.file_system_arn],
                             ),
@@ -1045,7 +1047,7 @@ class WarrenECSStack(cdk.Stack):
                                 ],
                                 conditions={
                                     "StringEquals": {
-                                        "elasticfilesystem:AccessPointTag/warren": "true"
+                                        "aws:ResourceTag/warren": "true"
                                     }
                                 },
                             ),
@@ -1063,7 +1065,7 @@ class WarrenECSStack(cdk.Stack):
                             # actually sets/removes, narrower than the filesystem-wide access
                             # already granted for creation. Mirrors terraform/main.tf's
                             # EFSLifecycleTagging statement.
-                            # R18: scoped with AccessPointTag conditions — the bare
+                            # R18: scoped with aws:ResourceTag conditions — the bare
                             # "warren" tag (set by efs.py's attach() on every access
                             # point this role creates, same tag EFSDeleteTaggedAccessPoints
                             # above already checks) and warren.server_instance (set to
@@ -1092,8 +1094,8 @@ class WarrenECSStack(cdk.Stack):
                                         "aws:TagKeys": ["warren.expires_at"]
                                     },
                                     "StringEquals": {
-                                        "elasticfilesystem:AccessPointTag/warren": "true",
-                                        "elasticfilesystem:AccessPointTag/warren.server_instance": (
+                                        "aws:ResourceTag/warren": "true",
+                                        "aws:ResourceTag/warren.server_instance": (
                                             f"warren-server-control-plane-{env_suffix}"
                                         ),
                                     },

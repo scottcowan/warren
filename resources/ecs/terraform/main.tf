@@ -979,6 +979,9 @@ data "aws_iam_policy_document" "task_role_policy" {
         "elasticfilesystem:ClientMount",
         "elasticfilesystem:ClientWrite",
         "elasticfilesystem:DescribeMountTargets",
+        # efs.py resolves a workspace's access point (reattach) and the reaper lists
+        # them, both with DescribeAccessPoints(FileSystemId=...).
+        "elasticfilesystem:DescribeAccessPoints",
       ]
       resources = [local.efs_arn]
     }
@@ -1044,7 +1047,7 @@ data "aws_iam_policy_document" "task_role_policy" {
 
       condition {
         test     = "StringEquals"
-        variable = "elasticfilesystem:AccessPointTag/warren"
+        variable = "aws:ResourceTag/warren"
         values   = ["true"]
       }
     }
@@ -1062,7 +1065,7 @@ data "aws_iam_policy_document" "task_role_policy" {
   #
   # R18: this previously had no ownership scoping at all — it allowed Tag/UntagResource
   # against ANY access point in the account, not just ones this warren deployment
-  # created. Two AccessPointTag conditions close that: the bare "warren" tag
+  # created. Two aws:ResourceTag conditions close that: the bare "warren" tag
   # (TAG_MANAGED, set by efs.py's attach() on every access point this role creates —
   # same tag EFSDeleteTaggedAccessPoints above already checks), and warren.server_instance
   # (TAG_SERVER_INSTANCE, set to this server's own WARREN_SERVER_ID at creation) so one
@@ -1089,13 +1092,13 @@ data "aws_iam_policy_document" "task_role_policy" {
 
       condition {
         test     = "StringEquals"
-        variable = "elasticfilesystem:AccessPointTag/warren"
+        variable = "aws:ResourceTag/warren"
         values   = ["true"]
       }
 
       condition {
         test     = "StringEquals"
-        variable = "elasticfilesystem:AccessPointTag/warren.server_instance"
+        variable = "aws:ResourceTag/warren.server_instance"
         values   = ["warren-server-control-plane-${var.env_suffix}"]
       }
     }

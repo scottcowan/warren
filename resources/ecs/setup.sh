@@ -1386,7 +1386,8 @@ EFS_TASK_POLICY=$(cat <<POLICY
       "Action": [
         "elasticfilesystem:ClientMount",
         "elasticfilesystem:ClientWrite",
-        "elasticfilesystem:DescribeMountTargets"
+        "elasticfilesystem:DescribeMountTargets",
+        "elasticfilesystem:DescribeAccessPoints"
       ],
       "Resource": "arn:aws:elasticfilesystem:*:$ACCOUNT_ID:file-system/$WARREN_EFS_ID"
     },
@@ -1424,7 +1425,7 @@ EFS_TASK_POLICY=$(cat <<POLICY
           "aws:TagKeys": ["warren.expires_at"]
         },
         "StringEquals": {
-          "elasticfilesystem:AccessPointTag/warren": "true"
+          "aws:ResourceTag/warren": "true"
         }
       }
     },
@@ -1435,7 +1436,7 @@ EFS_TASK_POLICY=$(cat <<POLICY
       "Resource": "arn:aws:elasticfilesystem:*:$ACCOUNT_ID:access-point/*",
       "Condition": {
         "StringEquals": {
-          "elasticfilesystem:AccessPointTag/warren": "true"
+          "aws:ResourceTag/warren": "true"
         }
       }
     }

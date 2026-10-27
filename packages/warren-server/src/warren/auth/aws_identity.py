@@ -48,6 +48,7 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
+from typing import Callable
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -207,6 +208,7 @@ async def verify_signed_caller_identity(
     signed_request_json: str,
     expected_audience: str,
     trusted_assumed_role_patterns: list[str] | None = None,
+    on_verified_arn: Callable[[str], None] | None = None,
 ) -> str:
     """Replay a client-signed STS GetCallerIdentity request and return the owner_id
     derived from the caller's ARN (see `derive_owner_id`).
@@ -219,7 +221,8 @@ async def verify_signed_caller_identity(
     header must itself be covered by the signature's `SignedHeaders=` list,
     or the request is rejected. `trusted_assumed_role_patterns` is
     `settings.aws_trusted_assumed_role_patterns`, forwarded to
-    `derive_owner_id`.
+    `derive_owner_id`. `on_verified_arn`, if given, is called with the caller's ARN
+    once it has been verified and trusted (the per-user storage key derives from it).
 
     Raises AwsIdentityError on any validation failure, non-2xx STS response,
     an untrusted ARN shape, or a response we can't parse an Arn out of.
@@ -270,4 +273,7 @@ async def verify_signed_caller_identity(
     if not match:
         raise AwsIdentityError("AWS STS response did not contain an Arn")
 
-    return derive_owner_id(match.group(1), trusted_assumed_role_patterns)
+    owner_id = derive_owner_id(match.group(1), trusted_assumed_role_patterns)
+    if on_verified_arn is not None:
+        on_verified_arn(match.group(1))
+    return owner_id

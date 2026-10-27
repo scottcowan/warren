@@ -30,6 +30,7 @@ import secrets
 import shlex
 import shutil
 import uuid
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Literal
 
 import structlog
@@ -40,6 +41,13 @@ from warren.runtime.ecs_git import (
     WORKSPACE_DIR,
     GitInitPlan,
     build_git_init_plan,
+)
+from warren.runtime.ecs_storage import (
+    LEGACY,
+    NOT_SET_UP,
+    OwnerStorage,
+    StorageUnavailable,
+    WorkspaceStorageUnavailable,
 )
 from warren.runtime.ecs_secrets import (
     GIT_INIT_FILE,
@@ -98,6 +106,16 @@ class _MemoryLaunchStore:
         self._rows.pop(workspace_id, None)
 
 
+@dataclass(frozen=True)
+class Placement:
+    """Which filesystem, control-plane mount and security groups a workspace uses."""
+
+    volume: Any
+    efs_id: str
+    local_mount: str
+    security_group_ids: list[str]
+
+
 class ECSRuntime:
     """ContainerRuntime backed by AWS Fargate via boto3."""
 
@@ -109,6 +127,7 @@ class ECSRuntime:
         ecs_cpu: str | None = None,
         ecs_memory: str | None = None,
         volume: WorkspaceVolume | None = None,
+        volumes: dict[str, WorkspaceVolume] | None = None,
         launch_store: Any = None,
     ) -> None:
         self.server_id = server_id
@@ -133,6 +152,14 @@ class ECSRuntime:
         self._preflight_ok = False
         self._task_def_cache: dict[str, str] = {}  # canonical task-definition JSON → task_def_arn
         self._volume: WorkspaceVolume | None = volume
+        # WARREN_ECS_OWNER_STORAGE (runtime/ecs_storage.py): per-user filesystem, security
+        # groups and mount, with one EFSMount per user in `volumes`. Empty: shared mode.
+        storage = getattr(settings, "ecs_owner_storage", None)
+        self._owner_storage: dict[str, OwnerStorage] = storage if isinstance(storage, dict) else {}
+        self._volumes: dict[str, WorkspaceVolume] = dict(volumes or {})
+        # async (workspace_id) -> storage key or None, wired by app.py from the
+        # workspace's persisted spec; how stop/destroy find a workspace's filesystem.
+        self.storage_key_of: Any = None
 
     @property
     def started_by(self) -> str:
@@ -185,9 +212,47 @@ class ECSRuntime:
             self._logs = session.client("logs")
         return self._ecs
 
-    def _local_mount(self) -> str:
-        path = getattr(self._settings, "efs_local_mount_path", "")
-        return path if isinstance(path, str) else ""
+    def _shared_placement(self) -> Placement:
+        mount = getattr(self._settings, "efs_local_mount_path", "")
+        efs_id = getattr(self._settings, "efs_id", "")
+        return Placement(
+            volume=self._volume,
+            efs_id=efs_id if isinstance(efs_id, str) else "",
+            local_mount=mount if isinstance(mount, str) else "",
+            security_group_ids=list(getattr(self._settings, "ecs_security_group_ids", None) or []),
+        )
+
+    def _placement_for_key(self, key: str) -> Placement:
+        cfg = self._owner_storage[key]
+        return Placement(
+            volume=self._volumes.get(key),
+            efs_id=cfg.efs_id,
+            local_mount=cfg.local_mount_path,
+            security_group_ids=list(cfg.security_group_ids),
+        )
+
+    def _placement_for_spec(self, spec: WorkspaceSpec) -> Placement:
+        """Where this workspace lives. Raises StorageUnavailable (before any AWS call)
+        for a legacy shared-filesystem workspace or an owner with no entry."""
+        if not self._owner_storage:
+            return self._shared_placement()
+        key = getattr(spec, "storage_key", "") or ""
+        if not key:
+            raise StorageUnavailable(LEGACY)
+        if key not in self._owner_storage or key not in self._volumes:
+            raise StorageUnavailable(NOT_SET_UP)
+        return self._placement_for_key(key)
+
+    async def _placement_for_workspace(self, workspace_id: str) -> Placement | None:
+        """For stop/destroy: the workspace's own placement, or None when it can't be
+        known (legacy row, owner since removed) -- then nothing touches any filesystem."""
+        if not self._owner_storage:
+            return self._shared_placement()
+        key = await self.storage_key_of(workspace_id) if self.storage_key_of is not None else None
+        if not key or key not in self._owner_storage or key not in self._volumes:
+            log.warning("ecs_workspace_storage_unknown", workspace_id=workspace_id)
+            return None
+        return self._placement_for_key(key)
 
     async def _resolve_secrets(self, spec: WorkspaceSpec) -> dict[str, str]:
         owner_id = getattr(spec, "owner_id", "") or ""
@@ -206,12 +271,16 @@ class ECSRuntime:
         return out
 
     async def _deliver_secrets(
-        self, workspace_id: str, delivered: dict[str, str], git_plan: GitInitPlan | None
+        self,
+        workspace_id: str,
+        delivered: dict[str, str],
+        git_plan: GitInitPlan | None,
+        placement: Placement,
     ) -> None:
         """Write this launch's secrets files on the workspace's volume (or clear stale
         ones). The git-init credentials go only to git-init's file."""
-        local_mount = self._local_mount()
-        if not local_mount or self._volume is None:
+        local_mount = placement.local_mount
+        if not local_mount or placement.volume is None:
             return
         init_names = set(git_plan.init_secret_names) if git_plan is not None else set()
         files = {
@@ -225,10 +294,10 @@ class ECSRuntime:
                 f"cannot write secrets onto workspace {workspace_id}'s volume: {type(exc).__name__}"
             ) from exc
 
-    async def _remove_secrets(self, workspace_id: str) -> None:
-        local_mount = self._local_mount()
-        if not local_mount or self._volume is None:
+    async def _remove_secrets(self, workspace_id: str, placement: Placement | None) -> None:
+        if placement is None or not placement.local_mount or placement.volume is None:
             return
+        local_mount = placement.local_mount
         try:
             await asyncio.to_thread(remove_secrets, local_mount, workspace_id)
         except (OSError, ProvisionError):
@@ -294,6 +363,10 @@ class ECSRuntime:
 
     async def provision(self, spec: WorkspaceSpec) -> WorkspaceHandle:
         """Register Fargate task definition (cached), launch task, return handle."""
+        try:
+            placement = self._placement_for_spec(spec)
+        except StorageUnavailable as exc:
+            raise WorkspaceStorageUnavailable(str(exc)) from exc
         # Preflight guard — same pattern as DockerRuntime.
         if not self._preflight_ok:
             await self.preflight()
@@ -309,7 +382,7 @@ class ECSRuntime:
         # from warren's own store. They reach the task only as a file on its EFS volume
         # (runtime/ecs_secrets.py), written just before RunTask.
         delivered = await self._resolve_secrets(spec)
-        if delivered and not (self._volume is not None and self._local_mount()):
+        if delivered and not (placement.volume is not None and placement.local_mount):
             raise ProvisionError(
                 "this workspace declares secrets, and ECS delivers them through its EFS "
                 "volume: set WARREN_EFS_ID and WARREN_EFS_LOCAL_MOUNT_PATH"
@@ -320,9 +393,10 @@ class ECSRuntime:
 
         # D-10: EFS is opt-in — only activate when a volume is wired in
         access_point_id: str | None = None
-        if self._volume is not None:
-            await self._volume.attach(spec.workspace_id, owner_id=getattr(spec, "owner_id", "") or None)
-            access_point_id = getattr(self._volume, "last_access_point_id", None)
+        volume = placement.volume
+        if volume is not None:
+            await volume.attach(spec.workspace_id, owner_id=getattr(spec, "owner_id", "") or None)
+            access_point_id = getattr(volume, "last_access_point_id", None)
 
         # Issue #30b: everything below can fail (RegisterTaskDefinition,
         # RunTask) after attach() above already created the access point. On
@@ -332,11 +406,12 @@ class ECSRuntime:
         try:
             return await self._register_and_run(
                 spec, access_point_id, resolved_cpu, resolved_memory, family, delivered, git_plan,
+                placement,
             )
         except Exception:
-            if self._volume is not None:
+            if volume is not None:
                 try:
-                    await self._volume.detach(spec.workspace_id)
+                    await volume.detach(spec.workspace_id)
                 except Exception:
                     log.warning(
                         "efs_cleanup_after_failed_provision_failed",
@@ -353,7 +428,9 @@ class ECSRuntime:
         family: str,
         delivered: dict[str, str],
         git_plan: GitInitPlan | None = None,
+        placement: Placement | None = None,
     ) -> WorkspaceHandle:
+        placement = placement or self._shared_placement()
         ecs = self._ensure_clients()
         await self._ensure_log_group(f"/{self._resource_prefix}/{self.server_id}")
 
@@ -412,7 +489,7 @@ class ECSRuntime:
             }
         ]
         if access_point_id:
-            efs_id_val = getattr(self._settings, "efs_id", "") or ""
+            efs_id_val = placement.efs_id
             register_kwargs["volumes"] = [
                 {
                     "name": "warren-workspace",
@@ -581,7 +658,7 @@ class ECSRuntime:
         # Launch Fargate task.
         cluster = getattr(self._settings, "ecs_cluster", "") or ""
         subnet_ids = list(getattr(self._settings, "ecs_subnet_ids", None) or [])
-        sg_ids = list(getattr(self._settings, "ecs_security_group_ids", None) or [])
+        sg_ids = list(placement.security_group_ids)
         assign_public_ip = (
             "ENABLED"
             if getattr(self._settings, "ecs_assign_public_ip", False)
@@ -591,7 +668,7 @@ class ECSRuntime:
         # Immediately before every RunTask, so a relaunch always gets current values and
         # never a stale file. (An exception from RunTask itself may still have launched
         # a task that needs the file, so only a definitive failure below removes it.)
-        await self._deliver_secrets(spec.workspace_id, delivered, git_plan)
+        await self._deliver_secrets(spec.workspace_id, delivered, git_plan, placement)
 
         run_resp = await asyncio.to_thread(
             ecs.run_task,
@@ -616,14 +693,14 @@ class ECSRuntime:
         failures = run_resp.get("failures", [])
         if failures:
             await self.launch_store.delete(spec.workspace_id)
-            await self._remove_secrets(spec.workspace_id)
+            await self._remove_secrets(spec.workspace_id, placement)
             reason = failures[0].get("reason", "unknown")
             raise ProvisionError(f"ECS run_task failed: {reason}")
 
         tasks = run_resp.get("tasks", [])
         if not tasks:
             await self.launch_store.delete(spec.workspace_id)
-            await self._remove_secrets(spec.workspace_id)
+            await self._remove_secrets(spec.workspace_id, placement)
             raise ProvisionError("ECS run_task returned no tasks and no failures (unexpected empty response)")
 
         task_arn: str = tasks[0]["taskArn"]
@@ -730,7 +807,7 @@ class ECSRuntime:
         stay reconnectable via `ensure_running()`, which launches a fresh
         task against the SAME access point (D-04)."""
         await self._stop_task(handle, reason="warren stop (idle)")
-        await self._remove_secrets(handle.workspace_id)
+        await self._remove_secrets(handle.workspace_id, await self._placement_for_workspace(handle.workspace_id))
 
     async def destroy(self, handle: WorkspaceHandle) -> None:
         """Stop Fargate task; idempotent (already stopped is acceptable)."""
@@ -739,8 +816,10 @@ class ECSRuntime:
         # since each access point ARN is unique), so its revision would
         # otherwise accumulate forever. Resolve it from the still-running
         # task before stopping it, then deregister after cleanup below.
+        placement = await self._placement_for_workspace(handle.workspace_id)
+        volume = placement.volume if placement is not None else None
         task_def_arn: str | None = None
-        if self._volume is not None and handle.runtime_id:
+        if volume is not None and handle.runtime_id:
             try:
                 ecs = self._ensure_clients()
                 cluster = getattr(self._settings, "ecs_cluster", "") or ""
@@ -758,12 +837,12 @@ class ECSRuntime:
 
         await self._stop_task(handle, reason="warren destroy")
         await self.launch_store.delete(handle.workspace_id)
-        await self._remove_secrets(handle.workspace_id)
+        await self._remove_secrets(handle.workspace_id, placement)
 
         # D-04: detach sets warren.expires_at tag; does NOT delete the access point
-        if self._volume is not None:
+        if volume is not None:
             try:
-                await self._volume.detach(handle.workspace_id)
+                await volume.detach(handle.workspace_id)
             except Exception:
                 log.warning("efs_detach_failed", workspace_id=handle.workspace_id)
 
