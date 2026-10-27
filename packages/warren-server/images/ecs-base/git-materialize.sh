@@ -12,7 +12,8 @@
 #
 # Re-runs on every task launch against the same volume, so everything already on it is
 # agent-written and untrusted. Credentials never meet it:
-#   1. Copy the credentials from git-init.env (then deleted) into 0600 files in a container-local private dir,
+#   1. Copy the credentials from git-init.env (then deleted), or in EBS mode from the
+#      decrypted WARREN_SECRETS_BLOB, into 0600 files in a container-local private dir,
 #      then re-exec with an empty environment (and, if started as root, as uid 1000 via
 #      su-exec). After execve /proc/1/environ no longer holds them.
 #   2. Clone over the network into fresh repos in that private dir (no checkout, so no
@@ -91,9 +92,26 @@ if [ "${1:-}" != --scrubbed ]; then
     # The clone credentials arrive as $ROOT/.warren/git-init.env, written by the control
     # plane just before RunTask (runtime/ecs_secrets.py). Load and delete it first, so it
     # is gone before the workspace container (dependsOn this one) starts.
+    # EBS mode (runtime/ecs_kms_secrets.py): they arrive instead as KMS-wrapped
+    # ciphertext in WARREN_SECRETS_BLOB, encrypted for this container only. Decrypt into
+    # the private dir, load, delete. Fails closed. `env -i` below drops the blob too.
     if [ -r "$SECRETS_LIB" ]; then
         . "$SECRETS_LIB"
-        warren_secrets_take "$ROOT/.warren" git-init.env
+        if [ -n "${WARREN_SECRETS_BLOB:-}" ]; then
+            /usr/local/bin/warren-secrets-decrypt git-init > "$PRIV/secrets.env" \
+                || { log "cannot decrypt git-init secrets"; rm -rf "$PRIV"; exit 1; }
+            unset WARREN_SECRETS_BLOB
+            warren_secrets_load "$PRIV/secrets.env"
+            rm -f "$PRIV/secrets.env"
+            # The control plane never writes an EBS volume: a file there is planted.
+            if [ -d "$ROOT/.warren" ] && [ ! -L "$ROOT/.warren" ]; then
+                rm -f "$ROOT/.warren/git-init.env"
+            fi
+        else
+            warren_secrets_take "$ROOT/.warren" git-init.env
+        fi
+    elif [ -n "${WARREN_SECRETS_BLOB:-}" ]; then
+        log "$SECRETS_LIB missing; cannot load git-init secrets"; rm -rf "$PRIV"; exit 1
     fi
     each_record stash_cred
     printf '%s\n' "${WARREN_GIT_KNOWN_HOSTS:-}" > "$PRIV/known_hosts_extra"

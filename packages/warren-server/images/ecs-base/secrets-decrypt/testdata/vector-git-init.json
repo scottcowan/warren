@@ -1,0 +1,9 @@
+{
+  "workspace_id": "ws-0123abcd",
+  "container": "git-init",
+  "region": "eu-west-1",
+  "data_key": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",
+  "wrapped_key": "Z2l0LWluaXQtd3JhcHBlZC1rZXk=",
+  "blob": "v1:eu-west-1:Z2l0LWluaXQtd3JhcHBlZC1rZXk=:AAECAwQFBgcICQoL:J3Aa7h59vq7jrYaNYz18BjEXgRQ1csp+SmiM1dXtsrpRkI+Gq3NE1Q3fZgML/kE+1w==",
+  "output": "GITHUB_TOKEN=Z2hwX2Nsb25lX29ubHk=\n"
+}

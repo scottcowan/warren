@@ -150,3 +150,83 @@ jobs:
             WARREN_APP_CMD=/tmp/app.sh /usr/local/bin/entrypoint.sh')"
           echo "$out" | sed 's/s3cret/<value>/'
           test "$out" = "$(printf 's3cret\n||none|unreadable')"
+
+      - name: EBS-mode secrets (KMS envelope)
+        # runtime/ecs_kms_secrets.py: in EBS mode the secrets arrive as WARREN_SECRETS_BLOB,
+        # which warren-secrets-decrypt unwraps via KMS with the task role. A fake KMS on the
+        # runner answers Decrypt for the control-plane-generated test vectors (the Go tests
+        # in the image build cover the crypto; this covers the entrypoint/git-init wiring).
+        env:
+          IMG: warren-ecs-base:smoke
+          VECTORS: packages/warren-server/images/ecs-base/secrets-decrypt/testdata
+        run: |
+          set -eu
+          fail() { echo "$*" >&2; exit 1; }
+          test "$(docker run --rm --entrypoint stat "$IMG" -c '%u:%g:%a' /usr/local/bin/warren-secrets-decrypt)" = "0:0:755"
+          # Fails closed with nothing on stdout: no blob, a malformed blob; the app never runs.
+          if out="$(docker run --rm --entrypoint /usr/local/bin/warren-secrets-decrypt "$IMG" workspace 2>/dev/null)"; then fail "decrypt without a blob succeeded"; fi
+          test -z "$out"
+          if out="$(docker run --rm -e WARREN_SECRETS_BLOB=v1:junk -e WARREN_WORKSPACE_ID=ws-1 --entrypoint /usr/local/bin/warren-secrets-decrypt "$IMG" workspace 2>/dev/null)"; then fail "decrypt of a junk blob succeeded"; fi
+          test -z "$out"
+          if docker run --rm -e WARREN_SECRETS_BLOB=v1:junk -e WARREN_WORKSPACE_ID=ws-1 -e WARREN_APP_CMD='echo RAN' "$IMG" 2>/dev/null | grep -q RAN; then fail "app ran after a failed decrypt"; fi
+
+          cat > "$RUNNER_TEMP/fake_kms.py" <<'PY'
+          import json, sys
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          vs = [json.load(open(p)) for p in sys.argv[1:]]
+          class H(BaseHTTPRequestHandler):
+              def log_message(self, *a): pass
+              def do_POST(self):
+                  body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                  ctx = body.get("EncryptionContext", {})
+                  v = next((v for v in vs if v["wrapped_key"] == body.get("CiphertextBlob")
+                            and ctx == {"warren:workspace_id": v["workspace_id"], "warren:container": v["container"]}), None)
+                  ok = (v is not None and self.headers.get("X-Amz-Target") == "TrentService.Decrypt"
+                        and self.headers.get("Authorization", "").startswith("AWS4-HMAC-SHA256 "))
+                  out = json.dumps({"Plaintext": v["data_key"]} if ok else {"__type": "InvalidCiphertextException"}).encode()
+                  self.send_response(200 if ok else 400); self.send_header("Content-Length", str(len(out)))
+                  self.end_headers(); self.wfile.write(out)
+          HTTPServer(("127.0.0.1", 18080), H).serve_forever()
+          PY
+          python3 "$RUNNER_TEMP/fake_kms.py" "$VECTORS/vector.json" "$VECTORS/vector-git-init.json" &
+          sleep 1
+          ws_blob="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["blob"])' "$VECTORS/vector.json")"
+          git_blob="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["blob"])' "$VECTORS/vector-git-init.json")"
+          kms="-e AWS_ENDPOINT_URL_KMS=http://127.0.0.1:18080 -e AWS_ACCESS_KEY_ID=AKIDEXAMPLE -e AWS_SECRET_ACCESS_KEY=x -e AWS_SESSION_TOKEN=t -e WARREN_WORKSPACE_ID=ws-0123abcd"
+
+          # Workspace container: secrets exported, the blob gone from the app's env, the
+          # root-only copy unreadable to the workspace user, a file planted on the volume
+          # deleted unread.
+          # shellcheck disable=SC2086
+          out="$(docker run --rm --network host $kms -e WARREN_SECRETS_BLOB="$ws_blob" --user 0 \
+            --mount type=tmpfs,destination=/var/lib/warren,tmpfs-mode=0755 --entrypoint sh "$IMG" -c '
+            set -e
+            mkdir -p /var/lib/warren/.warren
+            printf "PLANTED=%s\n" "$(printf x | base64)" > /var/lib/warren/.warren/workspace.env
+            cat > /tmp/app.sh <<"EOF"
+          printf "%s|%s|" "$GITHUB_TOKEN" "${PLANTED:-none}"
+          printf "%s|" "${WARREN_SECRETS_BLOB:-unset}"
+          ls -A /var/lib/warren/.warren | tr "\n" " "; printf "|"
+          cat /run/warren/secrets.env >/dev/null 2>&1 && echo readable || echo unreadable
+          EOF
+            chmod 755 /tmp/app.sh
+            WARREN_APP_CMD=/tmp/app.sh /usr/local/bin/entrypoint.sh')"
+          echo "$out" | sed 's/ghp_example/<value>/'
+          test "$out" = "ghp_example|none|unset||unreadable"
+          # The workspace context can't open git-init's blob: fails closed, app never runs.
+          # shellcheck disable=SC2086
+          if docker run --rm --network host $kms -e WARREN_SECRETS_BLOB="$git_blob" -e WARREN_APP_CMD='echo RAN' "$IMG" 2>/dev/null | grep -q RAN; then fail "workspace opened git-init's blob"; fi
+
+          # git-init: its blob decrypts into the private dir and reaches the clone as the
+          # credential (no "not set" warning); a planted git-init.env is deleted unread.
+          # shellcheck disable=SC2086
+          out="$(docker run --rm --network host $kms -e WARREN_SECRETS_BLOB="$git_blob" --user 0 \
+            --mount type=tmpfs,destination=/var/lib/warren,tmpfs-mode=0755 --entrypoint sh "$IMG" -c '
+            mkdir -p /var/lib/warren/.warren
+            printf "GITHUB_TOKEN=%s\n" "$(printf planted | base64)" > /var/lib/warren/.warren/git-init.env
+            WARREN_GIT_FOLDERS="$(printf "clone\trepo\trepo\thttps://127.0.0.1:1/x.git\t-\t-\tpat\tGITHUB_TOKEN")" \
+              /usr/local/bin/warren-git-materialize 2>&1
+            ls -A /var/lib/warren/.warren')"
+          echo "$out"
+          case "$out" in *"not set"*|*"cannot decrypt"*|*git-init.env*) fail "git-init did not load its blob" ;; esac
+          case "$out" in *"clone failed"*) ;; *) fail "git-init did not reach the clone" ;; esac

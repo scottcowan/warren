@@ -25,7 +25,22 @@
 # ECR Public pulls from shared GitHub runner IPs intermittently fail with
 # "toomanyrequests: Data limit exceeded". Local and default builds are unchanged.
 ARG BASE_REGISTRY=public.ecr.aws/docker/library
-FROM ${BASE_REGISTRY}/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+FROM ${BASE_REGISTRY}/alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS base
+
+# warren-secrets-decrypt (secrets-decrypt/): unwraps the KMS-encrypted secrets an
+# EBS-backed task is launched with (src/warren/runtime/ecs_kms_secrets.py). Stdlib-only
+# Go, static, so the runtime image gains one small binary and no interpreter or AWS CLI.
+# Its tests (incl. a vector produced by the control plane's own encrypt code) run here,
+# so a broken helper fails the image build. This stage stays after the alpine FROM so
+# .github/scripts/resolve-base-registry.sh still finds that one first.
+FROM ${BASE_REGISTRY}/golang:1.27-alpine@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS secrets-decrypt
+WORKDIR /src
+COPY packages/warren-server/images/ecs-base/secrets-decrypt/ ./
+RUN go vet ./... \
+    && go test ./... \
+    && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags='-s -w' -o /out/warren-secrets-decrypt .
+
+FROM base
 
 # su-exec: privilege drop for entrypoint.sh, warren-session and git-init (AD3/AH1).
 # openssh-client: git-init's ssh clones (AH1).
@@ -71,9 +86,11 @@ COPY --chown=0:0 --chmod=0755 packages/warren-common/src/warren_common/assets/wa
 COPY --chown=0:0 --chmod=0755 packages/warren-common/src/warren_common/agent_supervisor.py /usr/local/bin/warren-agent-supervisor
 # AH1: run as the task's `git-init` container (runtime/ecs_git.py), never by the workspace.
 COPY --chown=0:0 --chmod=0755 packages/warren-server/images/ecs-base/git-materialize.sh /usr/local/bin/warren-git-materialize
-# Reader for the secrets file the control plane drops on the volume (runtime/ecs_secrets.py),
-# sourced by entrypoint.sh, warren-session and warren-git-materialize.
+# Reader for the secrets file the control plane drops on the EFS volume (runtime/ecs_secrets.py),
+# and for warren-secrets-decrypt's output in EBS mode, sourced by entrypoint.sh, warren-session and warren-git-materialize.
 COPY --chown=0:0 --chmod=0644 packages/warren-server/images/ecs-base/warren-secrets.sh /usr/local/lib/warren/secrets.sh
+# EBS mode: decrypts WARREN_SECRETS_BLOB for entrypoint.sh / warren-git-materialize.
+COPY --from=secrets-decrypt --chown=0:0 --chmod=0755 /out/warren-secrets-decrypt /usr/local/bin/warren-secrets-decrypt
 # GitHub's published SSH host keys (api.github.com/meta "ssh_keys"), pinned for git-init's
 # ssh clones. Refresh the checked-in file when GitHub rotates a key.
 COPY --chown=0:0 --chmod=0444 packages/warren-server/images/ecs-base/ssh_known_hosts /etc/warren/ssh_known_hosts
