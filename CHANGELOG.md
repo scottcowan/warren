@@ -2,6 +2,10 @@
 
 Image releases, newest first. Written by scripts/release.py.
 
+## warren-server 1.4.0 (2026-10-27)
+
+- feat: per-user ECS storage and network isolation (WARREN_ECS_OWNER_STORAGE) (#46) (3cf23fa)
+
 ## warren-server 1.3.0 (2026-10-27)
 
 - feat: ECS workspace secrets only in warren's store, delivered through the workspace's EFS volume (no SSM) (#44) (71280c2)
