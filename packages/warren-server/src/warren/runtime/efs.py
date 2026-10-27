@@ -44,7 +44,7 @@ _WORKSPACE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
 # Tag key constants — the canonical keys written to every warren-managed AP.
 # TAG_MANAGED is a bare marker tag (key "warren", value "true") distinct from the
 # namespaced warren.* keys below — it exists purely so IAM conditions
-# (aws:RequestTag/warren, elasticfilesystem:AccessPointTag/warren in both
+# (aws:RequestTag/warren, aws:ResourceTag/warren in both
 # terraform/main.tf and cdk/warren_stack.py) have an exact tag key to match.
 # IAM's RequestTag/ResourceTag conditions match a tag key verbatim, not by
 # prefix, so a namespaced key like warren.workspace_id can never satisfy a

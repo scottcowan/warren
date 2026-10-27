@@ -577,11 +577,11 @@ up. The same 409 applies to a workspace whose owner has been removed from the ma
   - `elasticfilesystem:TagResource` on `AP_ARNS`, conditions
     `elasticfilesystem:CreateAction = CreateAccessPoint` and `aws:RequestTag/warren = true`.
   - `elasticfilesystem:DeleteAccessPoint` on `AP_ARNS`, condition
-    `elasticfilesystem:AccessPointTag/warren = true`.
+    `aws:ResourceTag/warren = true`.
   - `elasticfilesystem:TagResource`, `UntagResource` on `AP_ARNS`, conditions
     `aws:TagKeys` (ForAllValues) = `warren.expires_at`,
-    `elasticfilesystem:AccessPointTag/warren = true`, and
-    `elasticfilesystem:AccessPointTag/warren.server_instance = <WARREN_SERVER_ID>`.
+    `aws:ResourceTag/warren = true`, and
+    `aws:ResourceTag/warren.server_instance = <WARREN_SERVER_ID>`.
 - **Shared workspace task role:** `elasticfilesystem:ClientMount`, `ClientWrite` on
   `FS_ARNS`. The network, not IAM, keeps U's tasks off V's filesystem.
 - **The control plane's own state** (`/var/lib/warren`, its SQLite database) on a

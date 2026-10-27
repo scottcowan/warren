@@ -370,3 +370,7 @@ def test_control_plane_may_list_access_points(path):
     # efs.py's reattach and every per-filesystem reaper call DescribeAccessPoints.
     text = (Path(__file__).parents[5] / "resources" / "ecs" / path).read_text()
     assert '"elasticfilesystem:DescribeAccessPoints"' in text
+    # EFS access-point ABAC is aws:ResourceTag/<key>; elasticfilesystem:AccessPointTag
+    # isn't a condition key for any action (Service Authorization Reference).
+    assert "AccessPointTag" not in text
+    assert "aws:ResourceTag/warren" in text
