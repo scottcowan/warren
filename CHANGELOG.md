@@ -2,6 +2,14 @@
 
 Image releases, newest first. Written by scripts/release.py.
 
+## warren-server 1.3.0 (2026-10-27)
+
+- feat: ECS workspace secrets only in warren's store, delivered through the workspace's EFS volume (no SSM) (#44) (71280c2)
+
+## warren-ecs-base 1.2.0 (2026-10-27)
+
+- feat: ECS workspace secrets only in warren's store, delivered through the workspace's EFS volume (no SSM) (#44) (71280c2)
+
 ## warren-server 1.2.0 (2026-10-26)
 
 - feat(server): route bedrock-mode workspaces through a configured Bedrock gateway (#41) (225434d)
