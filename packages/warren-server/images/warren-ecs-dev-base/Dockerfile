@@ -29,10 +29,17 @@ FROM ghcr.io/scottcowan/warren-ecs-base:latest@sha256:c1b5c590fce9b127d94bb5632d
 # bash already present from ecs-base.
 # gnupg: verifies Anthropic's signed release manifest for the Claude Code binary
 # (R26/S12 below), not needed by anything else in this image.
+# aws-cli: tasks run on AWS with a task role (e.g. `aws codeartifact login` for npm/pip);
+# it uses the ECS container credentials endpoint, no keys in the image. It brings its own
+# system python3 under /usr/bin; pyenv's shims stay first on PATH.
 RUN apk add --no-cache \
-        curl jq gnupg ripgrep build-base nodejs npm \
+        curl jq gnupg ripgrep build-base nodejs npm aws-cli \
         openssl-dev zlib-dev bzip2 bzip2-dev readline-dev sqlite-dev ncurses-dev \
         xz-dev tk-dev libxml2-dev xmlsec-dev libffi-dev
+
+# uv: Astral's static musl binaries from their image, pinned by tag and digest (not in
+# Alpine 3.20's repositories).
+COPY --from=ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 /uv /uvx /usr/local/bin/
 
 ENV PYENV_ROOT=/usr/local/pyenv
 ENV PATH="${PYENV_ROOT}/bin:${PYENV_ROOT}/shims:${PATH}"
