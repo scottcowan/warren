@@ -47,6 +47,11 @@ log = structlog.get_logger(__name__)
 VOLUME_NAME = "warren-workspace"
 STORAGE_MODES = ("efs", "ebs")
 TAG_STORAGE = "warren.storage"
+# warren.storage values: a workspace's volumes/snapshots, and an owner's bare-repo seed
+# (runtime/ebs_seeds.py). Every lookup filters on one of them, so the workspace lifecycle
+# and its sweep never see a seed, and the seed code never sees a workspace's data.
+STORAGE_WORKSPACE = "ebs"
+STORAGE_SEED = "ebs-seed"
 TAG_CREATED_AT = "warren.created_at"
 TAG_SOURCE_VOLUME = "warren.source_volume"
 # ECS's own reserved tag on the volumes it creates: the creating task's ARN.
@@ -167,16 +172,28 @@ class EBSVolumes:
             (TAG_MANAGED, "true"),
             (TAG_WORKSPACE_ID, workspace_id),
             (TAG_SERVER_INSTANCE, self._server_id),
-            (TAG_STORAGE, "ebs"),
+            (TAG_STORAGE, STORAGE_WORKSPACE),
         ]
         if owner_id:
             tags.append((TAG_OWNER_ID, owner_id))
         return tags
 
     def volume_configuration(
-        self, workspace_id: str, *, owner_id: str | None, snapshot_id: str | None
+        self,
+        workspace_id: str,
+        *,
+        owner_id: str | None,
+        snapshot_id: str | None,
+        size_gib: int | None = None,
+        tags: list[tuple[str, str]] | None = None,
     ) -> dict[str, Any]:
-        """The RunTask volumeConfigurations entry: empty volume, or one from snapshot_id."""
+        """The RunTask volumeConfigurations entry: empty volume, or one from snapshot_id.
+
+        `size_gib` with a snapshot: at least that size (a volume restored from a bare
+        seed, runtime/ebs_seeds.py, is never smaller than the seed). `tags` replaces the
+        workspace tags (the seed-refresh task's volume)."""
+        if tags is None:
+            tags = self._base_tags(workspace_id, owner_id)
         managed: dict[str, Any] = {
             "roleArn": self._setting("ecs_ebs_infra_role_arn", ""),
             "encrypted": True,
@@ -187,7 +204,7 @@ class EBSVolumes:
             "tagSpecifications": [
                 {
                     "resourceType": "volume",
-                    "tags": [{"key": k, "value": v} for k, v in self._base_tags(workspace_id, owner_id)],
+                    "tags": [{"key": k, "value": v} for k, v in tags],
                     "propagateTags": "NONE",
                 }
             ],
@@ -200,50 +217,54 @@ class EBSVolumes:
             rate = getattr(self._settings, "ecs_ebs_volume_initialization_rate", None)
             if isinstance(rate, int) and rate > 0:
                 managed["volumeInitializationRate"] = rate
+            if size_gib:
+                managed["sizeInGiB"] = int(size_gib)
         else:
-            managed["sizeInGiB"] = int(self._setting("ecs_ebs_size_gib", 20))
+            managed["sizeInGiB"] = int(size_gib or self._setting("ecs_ebs_size_gib", 20))
         return {"name": VOLUME_NAME, "managedEBSVolume": managed}
 
     # ------------------------------------------------------------------
     # Lookups
     # ------------------------------------------------------------------
 
-    def _filters(self, workspace_id: str | None) -> list[dict[str, Any]]:
+    def _filters(self, workspace_id: str | None, storage: str = STORAGE_WORKSPACE) -> list[dict[str, Any]]:
         filters = [
             {"Name": f"tag:{TAG_MANAGED}", "Values": ["true"]},
             {"Name": f"tag:{TAG_SERVER_INSTANCE}", "Values": [self._server_id]},
-            {"Name": f"tag:{TAG_STORAGE}", "Values": ["ebs"]},
+            {"Name": f"tag:{TAG_STORAGE}", "Values": [storage]},
         ]
         if workspace_id is not None:
             filters.append({"Name": f"tag:{TAG_WORKSPACE_ID}", "Values": [workspace_id]})
         return filters
 
-    def _owned(self, resource: dict, workspace_id: str | None) -> bool:
+    def _owned(self, resource: dict, workspace_id: str | None, storage: str = STORAGE_WORKSPACE) -> bool:
         # Re-check the filter client-side: never act on anything not provably ours.
         tags = _tags(resource)
         if tags.get(TAG_MANAGED) != "true" or tags.get(TAG_SERVER_INSTANCE) != self._server_id:
             return False
+        if tags.get(TAG_STORAGE) != storage:
+            return False
         return workspace_id is None or tags.get(TAG_WORKSPACE_ID) == workspace_id
 
-    async def volumes(self, workspace_id: str | None = None) -> list[dict]:
+    async def volumes(self, workspace_id: str | None = None, *, storage: str = STORAGE_WORKSPACE) -> list[dict]:
         ec2 = self._ensure_client()
-        kwargs: dict[str, Any] = {"Filters": self._filters(workspace_id)}
+        kwargs: dict[str, Any] = {"Filters": self._filters(workspace_id, storage)}
         out: list[dict] = []
         while True:
             resp = await asyncio.to_thread(ec2.describe_volumes, **kwargs)
-            out.extend(v for v in resp.get("Volumes", []) if self._owned(v, workspace_id))
+            out.extend(v for v in resp.get("Volumes", []) if self._owned(v, workspace_id, storage))
             token = resp.get("NextToken")
             if not token:
                 return out
             kwargs["NextToken"] = token
 
-    async def snapshots(self, workspace_id: str | None = None) -> list[dict]:
+    async def snapshots(self, workspace_id: str | None = None, *, storage: str = STORAGE_WORKSPACE) -> list[dict]:
         ec2 = self._ensure_client()
-        kwargs: dict[str, Any] = {"OwnerIds": ["self"], "Filters": self._filters(workspace_id)}
+        kwargs: dict[str, Any] = {"OwnerIds": ["self"], "Filters": self._filters(workspace_id, storage)}
         out: list[dict] = []
         while True:
             resp = await asyncio.to_thread(ec2.describe_snapshots, **kwargs)
-            out.extend(s for s in resp.get("Snapshots", []) if self._owned(s, workspace_id))
+            out.extend(s for s in resp.get("Snapshots", []) if self._owned(s, workspace_id, storage))
             token = resp.get("NextToken")
             if not token:
                 return out
@@ -289,15 +310,14 @@ class EBSVolumes:
             raise
         log.info("ebs_snapshot_deleted", snapshot_id=snapshot_id)
 
-    async def snapshot_and_delete(self, volume: dict) -> str | None:
-        """Snapshot a detached volume, record the snapshot, delete the volume."""
+    async def create_tagged_snapshot(
+        self, volume_id: str, tags: list[tuple[str, str]], description: str
+    ) -> str | None:
+        """CreateSnapshot of `volume_id` tagged with `tags` (plus created_at and
+        source_volume); None when the volume is already gone."""
         ec2 = self._ensure_client()
-        tags = _tags(volume)
-        workspace_id = tags.get(TAG_WORKSPACE_ID, "")
-        _validate_workspace_id(workspace_id)
-        volume_id = volume["VolumeId"]
         snap_tags = [
-            *self._base_tags(workspace_id, tags.get(TAG_OWNER_ID) or None),
+            *tags,
             (TAG_CREATED_AT, datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")),
             (TAG_SOURCE_VOLUME, volume_id),
         ]
@@ -305,16 +325,30 @@ class EBSVolumes:
             resp = await asyncio.to_thread(
                 ec2.create_snapshot,
                 VolumeId=volume_id,
-                Description=f"warren workspace {workspace_id}",
+                Description=description,
                 TagSpecifications=[
                     {"ResourceType": "snapshot", "Tags": [{"Key": k, "Value": v} for k, v in snap_tags]}
                 ],
             )
         except Exception as exc:
             if _code(exc) == "InvalidVolume.NotFound":
-                return None  # someone else (stop vs sweep) already handled it
+                return None
             raise
-        snapshot_id = resp["SnapshotId"]
+        return resp["SnapshotId"]
+
+    async def snapshot_and_delete(self, volume: dict) -> str | None:
+        """Snapshot a detached volume, record the snapshot, delete the volume."""
+        tags = _tags(volume)
+        workspace_id = tags.get(TAG_WORKSPACE_ID, "")
+        _validate_workspace_id(workspace_id)
+        volume_id = volume["VolumeId"]
+        snapshot_id = await self.create_tagged_snapshot(
+            volume_id,
+            self._base_tags(workspace_id, tags.get(TAG_OWNER_ID) or None),
+            f"warren workspace {workspace_id}",
+        )
+        if snapshot_id is None:
+            return None  # someone else (stop vs sweep) already handled it
         await self.snapshot_store.put(workspace_id, snapshot_id)
         log.info("ebs_snapshot_started", workspace_id=workspace_id, volume_id=volume_id, snapshot_id=snapshot_id)
         await self._delete_volume(volume_id)

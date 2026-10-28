@@ -779,6 +779,150 @@ secrets key ARNs. `setup.sh` doesn't set up EBS storage yet. For your own IaC:
 - **Workspace task role:** `kms:Decrypt` on the secrets key, with the same two
   encryption-context conditions.
 
+### EBS bare seeds (`WARREN_ECS_EBS_BARE_SEEDS`)
+
+Off by default, and EBS storage only (startup fails if it's set without the EBS
+settings). Each owner gets one EBS **seed snapshot** holding bare mirrors of the repos
+their EBS workspaces use. A new EBS workspace's volume is created from its owner's seed
+instead of empty, so git-init clones each folder locally and fetches only what changed,
+instead of cloning over the network. Fargate attaches one EBS volume per task, so the seed
+can't be a second volume.
+
+**Which repos.** The union of the git folders of the owner's non-destroyed EBS workspaces
+(running or stopped), taken from the registry. The `ecs_ebs_seed_repos` table caches that
+union, the secret names that fetch each repo, the branches workspaces asked for, and the
+ref SHAs the seed was last refreshed at. When the last workspace using a repo is
+destroyed, the repo stays for `WARREN_ECS_EBS_SEED_REPO_TTL_DAYS` (default 30, measured
+from when the sweep notices), so a quick recreate is still warm. It's then dropped at the
+next refresh. A seed whose union is empty is deleted.
+
+**Create.** For a new EBS workspace with git folders (never a relaunch, which restores
+the workspace's own snapshot):
+
+1. Its repos are recorded in the owner's union.
+2. If the owner has a completed seed snapshot, the volume is created from it, with
+   `sizeInGiB = max(WARREN_ECS_EBS_SIZE_GIB, seed size)`, and git-init gets
+   `WARREN_GIT_SEEDED=1`. Otherwise the volume starts empty, as before.
+3. If the seed is missing, lacks one of this workspace's repos, or is older than
+   `WARREN_ECS_EBS_SEED_REFRESH_INTERVAL_SECONDS` (default 86400), a background refresh is
+   queued for the owner. The create never waits for it, and a seed lookup error never
+   fails the create.
+
+**git-init on a seeded volume.** The seed lives at
+`/var/lib/warren/.warren-bares/<host>/<path>.git` (lowercased, no scheme, userinfo or
+`.git`; a URL with a port has no seed). git-init uses it only when `WARREN_GIT_SEEDED=1`
+and the volume holds nothing but the seed, which is true only before any workspace process
+has run on it. For each folder whose seed bare passes the checks (a plain bare repo, no
+symlinks, no alternates, its recorded remote is this URL), git-init does this:
+
+- It rewrites the bare's config from scratch, like a reused bare store.
+- A clone folder: `git clone --local --no-checkout` from the bare (objects are hardlinked),
+  origin set to the real URL, `git fetch` of the delta with the credentials, check out.
+  The result matches a network clone of the branch.
+- A worktree folder: the bare store `git/<name>.git-store` is a `--bare --local` clone of
+  the seed bare plus the fetched delta, then the usual worktree.
+
+A bad bare, or a failed delta fetch, falls back to a normal network clone. The workspace
+never fails because of its seed. Afterwards git-init deletes the whole seed directory. The
+hardlinked objects live on in the checkouts, the workspace container never sees the
+owner's other mirrors, and the workspace's own snapshots don't carry the seed. On any
+other launch, a seed directory on the volume is planted or left over, and is deleted
+unread.
+
+**Refresh.** Single-flight per owner (`refreshing_since` in `ecs_ebs_seeds`, plus one
+in-process task per owner):
+
+1. **SHA check.** The control plane runs `git ls-remote` for each https repo (HEAD and
+   the branches asked for) with the owner's own PAT. Its image has git, and the PAT
+   reaches git only through `GIT_ASKPASS` in the child's environment (never argv, a URL
+   or a log), with warren's pinned safe config and `GIT_ALLOW_PROTOCOL=https`. If every
+   recorded SHA still matches and the seed holds exactly the wanted repos, the seed is
+   marked current and no task runs. ssh repos, and any ls-remote failure, always refresh.
+2. **Seed-refresh task.** A Fargate task with only a `git-init` container (image
+   `WARREN_ECS_GIT_INIT_IMAGE`, else the image of the owner's latest workspace) runs
+   `warren-git-materialize` with `WARREN_GIT_MODE=refresh-seed`. Its volume is created
+   from the owner's current seed, or empty at `WARREN_ECS_EBS_SIZE_GIB`. It gets
+   `WARREN_GIT_SEED_REPOS` (tab-separated `key url cred_kind cred_env` records; git-init
+   rejects a key that isn't its URL's) and a KMS envelope with only that owner's
+   credentials for the listed repos. The envelope's context is
+   `warren:workspace_id = seed-<hash of server and owner>`, `warren:container = git-init`.
+   For each repo the task creates, or `git fetch --prune`s, a bare mirror (heads and tags,
+   no hooks, `gc.auto 0` plus an explicit `gc --auto`). It deletes anything not listed,
+   and exits 0, or 3 when some repos failed (the rest are kept).
+3. **Snapshot.** Once the task is STOPPED, the control plane snapshots the retained
+   volume (`warren=true`, `warren.server_instance`, `warren.storage=ebs-seed`,
+   `warren.owner_id`), deletes the volume, and makes the snapshot the owner's seed once
+   it's `completed`. The SHAs it recorded are the pre-launch ls-remote ones, and none
+   after a partial refresh. The replaced snapshot is kept for an hour, because a RunTask
+   may still be creating a volume from it, then deleted. A refresh that runs past
+   `WARREN_ECS_EBS_SEED_REFRESH_TIMEOUT_SECONDS` (default 1800) has its task stopped; the
+   volume is deleted and the old seed kept.
+
+Refresh tasks use their own `startedBy` (`warren-seed-…`) and the tag
+`warren.task_kind=seed-refresh`, with no `warren.workspace_id`. So the orphan sweep, the
+status and idle reapers, and the workspace volume sweep (`warren.storage=ebs`) never treat
+them, their volumes or their snapshots as a workspace's.
+
+**Sweep.** It runs with the EBS sweep (`WARREN_ECS_EBS_SWEEP_INTERVAL_SECONDS`), each owner
+under its lock:
+
+- reconciles the union, and starts or expires the TTL;
+- promotes completed seed snapshots, and deletes replaced ones after the grace period;
+- deletes seeds with no repos;
+- queues refreshes for stale or incomplete seeds;
+- deletes this server's orphaned `ebs-seed` volumes (`available`, older than
+  `WARREN_ECS_ORPHAN_SWEEP_MIN_AGE_SECONDS`, no refresh running) and unreferenced
+  `ebs-seed` snapshots.
+
+**Security properties.**
+
+- Only the control plane picks `snapshotId`, and only from the seed row of the
+  workspace's authenticated owner (`spec.owner_id`, never the request body). It
+  re-checks that the snapshot's own tags name that owner, this server and
+  `ebs-seed`, and that it is completed. A workspace never gets another owner's seed, even
+  with a crafted or corrupted row. Workspace tasks have no EC2 permissions.
+- A seed is only ever written by its owner's seed-refresh task, never captured from a
+  workspace volume. A workspace's stop snapshots stay workspace snapshots.
+- Each seed holds only what that owner's own credentials could fetch. Nothing is shared
+  across owners.
+- No new IAM. The refresh task reuses the workspace task role (`kms:Decrypt` under a
+  `warren:workspace_id` context), the `warren-*` task-definition family, and the control
+  plane's existing `warren=true`-scoped snapshot, volume and KMS grants from the EBS IAM
+  above.
+
+**Costs.**
+
+- One snapshot per owner. It's incremental against the previous seed's blocks, plus one
+  short Fargate task per refresh.
+- A volume restored from a snapshot loads lazily from S3, so first reads are slower.
+  git-init reads the bares it clones from right away, so for large seeds set
+  `WARREN_ECS_EBS_VOLUME_INITIALIZATION_RATE`. Note that it hydrates the whole volume,
+  not just the repos the workspace uses.
+
+**Image.** This needs the ecs-base `git-materialize.sh` (refresh-seed mode, seeded clones,
+`WARREN_GIT_CLONE_FILTER`) and `entrypoint.sh` (drops a leftover seed directory, as the
+workspace user) from this release. Rebuild ecs-base and any image built on it, and re-sync
+any downstream copies of these scripts vendored into another repo. An older git-init
+ignores `WARREN_GIT_MODE` and `WARREN_GIT_SEEDED`: its "seed" holds no mirrors (and an
+empty `workspace/`, so a new git-init refuses it as not pristine), and it clones over the
+network. That's correct, but you pay for seed snapshots without any benefit.
+
+| Variable | Default | |
+|---|---|---|
+| `WARREN_ECS_EBS_BARE_SEEDS` | `false` | per-owner bare seeds (EBS storage only) |
+| `WARREN_ECS_EBS_SEED_REPO_TTL_DAYS` | `30` | how long a repo no workspace uses stays in the seed |
+| `WARREN_ECS_EBS_SEED_REFRESH_INTERVAL_SECONDS` | `86400` | seed age before a refresh (skipped if no ref moved) |
+| `WARREN_ECS_EBS_SEED_REFRESH_TIMEOUT_SECONDS` | `1800` | hard limit on one seed-refresh task |
+
+### Partial clones (`WARREN_GIT_CLONE_FILTER`)
+
+`blob:none` or `tree:0` makes git-init's network clones partial. git-init fetches the
+blobs the first checkout needs while it still has the credentials. It's off by default
+(empty), and it's best left off for private repos. The workspace container never has the
+clone credentials, so any later lazy fetch inside it fails: checking out another commit,
+`git log -p`, `blame`, or a diff against history. It's reasonable for public repos, or
+with a bare seed, which already makes a full clone cheap.
+
 ## Model access through a Bedrock gateway
 
 By default a bedrock-mode workspace (`model_access: bedrock`) calls Bedrock with its task

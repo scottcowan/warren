@@ -150,6 +150,16 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
         runtime.storage_of = _storage_of
         if runtime.ebs is not None:
             runtime.ebs.snapshot_store = EbsSnapshotStore(db)
+            if getattr(settings, "ecs_ebs_bare_seeds", False):
+                from warren.registry.store import EbsSeedStore  # noqa: PLC0415
+                from warren.runtime.ebs_seeds import BareSeeds, live_union  # noqa: PLC0415
+
+                runtime.seeds = BareSeeds(runtime, runtime.ebs, settings, EbsSeedStore(db))
+
+                async def _live_seed_repos():
+                    return live_union(await store.list_all())
+
+                runtime.seeds.live_repos = _live_seed_repos
         from warren.secrets import store as secret_store  # noqa: PLC0415
         from warren.secrets.cipher import LocalCipher  # noqa: PLC0415
 
@@ -369,6 +379,12 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
         async with app.state.mcp_session_manager.run():
             yield
     finally:
+        seeds = getattr(runtime, "seeds", None)
+        if seeds is not None:
+            try:
+                await seeds.aclose()
+            except Exception:
+                log.exception("ebs_seed_shutdown_error")
         ebs_task = getattr(app.state, "ebs_sweep_task", None)
         if ebs_task is not None:
             ebs_task.cancel()

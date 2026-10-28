@@ -130,6 +130,25 @@ jobs:
               /usr/local/bin/entrypoint.sh')"
           echo "$out"
           test "$out" = "$(printf '1000:1000\n/var/lib/warren/workspace\n/workspace\n1000\nwarren/dev/abcdef12/code-app')"
+          # EBS bare seeds (runtime/ebs_seeds.py) with the image's busybox tools: the
+          # seed-refresh task mirrors a repo into an empty volume, then a seeded git-init on
+          # that volume clones from the mirror, fetches the delta and removes the seed.
+          out="$(docker run --rm --user 0 --mount type=tmpfs,destination=/var/lib/warren,tmpfs-mode=0755 --entrypoint sh "$IMG" -c '
+            set -e
+            git init -q -b main /tmp/up
+            git -C /tmp/up -c user.email=ci@example.invalid -c user.name=ci commit -q --allow-empty -m init
+            chown -R 1000:1000 /tmp/up
+            key=$(/usr/local/bin/warren-git-materialize --seed-key file:///tmp/up)
+            WARREN_GIT_ALLOW_PROTOCOL=file WARREN_GIT_MODE=refresh-seed \
+              WARREN_GIT_SEED_REPOS="$(printf "%s\tfile:///tmp/up\tnone\t-" "$key")" /usr/local/bin/warren-git-materialize >&2
+            HOME=/tmp su-exec 1000:1000 git -C /tmp/up -c user.email=ci@example.invalid -c user.name=ci commit -q --allow-empty -m after
+            WARREN_GIT_ALLOW_PROTOCOL=file WARREN_GIT_SEEDED=1 \
+              WARREN_GIT_FOLDERS="$(printf "worktree\tapp\tcode/app\tfile:///tmp/up\tmain\twarren/dev/abcdef12/code-app\tnone\t-")" \
+              /usr/local/bin/warren-git-materialize 2>&1 | grep -c "cloned from the seed"
+            ls -A /var/lib/warren | tr "\n" " "
+            HOME=/tmp su-exec 1000:1000 git -C /var/lib/warren/workspace/code/app log --format=%s -1')"
+          echo "$out"
+          test "$out" = "$(printf '1\ngit workspace after')"
           # Secrets arrive as files on the volume (runtime/ecs_secrets.py): the entrypoint
           # exports workspace.env, deletes both files (git-init.env unread) before the app
           # starts, and keeps a copy the workspace user can't read for ECS Exec sessions.
