@@ -22,11 +22,40 @@
 #      store's config from scratch (dropping filter drivers, includes, sshCommand, ...)
 #      and run local git with hooks, fsmonitor, attributes files and all transports off.
 # An existing checkout is never touched and an existing bare store is never fetched.
+#
+# EBS bare seeds (runtime/ebs_seeds.py, WARREN_ECS_EBS_BARE_SEEDS):
+#   .warren-bares/<host>/<path>.git   bare mirrors of the owner's repos (seed_key below)
+# A new EBS workspace's volume may be created from its owner's seed snapshot; the control
+# plane then sets WARREN_GIT_SEEDED=1. Only on such a launch, and only if the volume
+# holds nothing but the seed (the workspace container has never run on it), git-init
+# clones each folder from its seed bare (hardlinks, same filesystem) into a staging dir
+# whose config it wrote, fetches just the delta with the credentials, and then
+# materializes as usual. A seed bare that looks wrong (not a bare repo, symlinks,
+# alternates, another remote) is discarded and the folder is cloned over the network.
+# Afterwards the whole seed directory is deleted, so the workspace never holds it and
+# its own snapshots don't carry it. On any other launch a seed directory is planted or
+# left over and is deleted unread.
+#
+# WARREN_GIT_MODE=refresh-seed: run by the seed-refresh task instead (git-init container
+# only, a volume from the owner's previous seed or empty, never mounted by a workspace).
+# WARREN_GIT_SEED_REPOS: one tab-separated record per line: key url cred_kind cred_env.
+# Creates or `fetch --prune`s each listed bare mirror, deletes everything else on the
+# volume, exits 0 (all fetched) or 3 (some failed; the rest are still kept).
+#
+# WARREN_GIT_CLONE_FILTER (blob:none|tree:0): partial network clones. The workspace never
+# holds the clone credentials, so for a private repo every later lazy fetch (checking
+# out another commit, log -p, blame) fails inside it; off unless the operator opts in.
 set -u
 
 ROOT="${WARREN_GIT_ROOT:-/var/lib/warren}"
 STORE="$ROOT/git"
 WS_DIR="$ROOT/workspace"
+SEEDS="$ROOT/.warren-bares"
+STAGE="$ROOT/.warren-stage"
+MODE="${WARREN_GIT_MODE:-materialize}"
+SEEDED="${WARREN_GIT_SEEDED:-}"
+CLONE_FILTER="${WARREN_GIT_CLONE_FILTER:-}"
+case "$CLONE_FILTER" in blob:none|tree:0) ;; *) CLONE_FILTER= ;; esac
 ALLOW_PROTOCOL="${WARREN_GIT_ALLOW_PROTOCOL:-https:ssh}"
 # SSH host keys: GitHub's published keys baked into the image (images/ecs-base/ssh_known_hosts),
 # plus any extra known_hosts lines the operator supplies in WARREN_GIT_KNOWN_HOSTS
@@ -71,14 +100,72 @@ each_record() {
     IFS=$old_ifs
 }
 
+# Calls "$1 <index> <4 record fields>" for each WARREN_GIT_SEED_REPOS record.
+each_seed() {
+    cb=$1
+    idx=0
+    old_ifs=$IFS
+    IFS=$NL
+    for rec in ${WARREN_GIT_SEED_REPOS:-}; do
+        idx=$((idx + 1))
+        IFS=$TAB
+        # shellcheck disable=SC2086
+        set -- $rec
+        IFS=$old_ifs
+        if [ $# -ne 4 ]; then
+            [ "$cb" = refresh_one ] && { log "skipping malformed seed record"; failed=$((failed + 1)); }
+            continue
+        fi
+        "$cb" "$idx" "$@"
+    done
+    IFS=$old_ifs
+}
+
 valid_cred_name() {
     case "$1" in ''|-|*[!A-Za-z0-9_]*|[0-9]*) return 1 ;; esac
 }
 
+# A repo's seed path under $SEEDS: <host>/<path>, lowercased, without userinfo, port,
+# scheme or a trailing .git. Must match runtime/ebs_seeds.seed_key (a unit test runs
+# both). Prints nothing and fails for anything else.
+seed_key() {
+    k=$1
+    case "$k" in ''|*[!A-Za-z0-9._~:/@+-]*) return 1 ;; esac
+    case "$k" in
+        https://*|ssh://*|file://*)
+            k=${k#*://}
+            first=${k%%/*}
+            rest=${k#"$first"}
+            k=${first##*@}$rest
+            ;;
+        *://*) return 1 ;;
+        *:*)
+            first=${k%%:*}
+            k=${first##*@}/${k#*:}
+            ;;
+        *) return 1 ;;
+    esac
+    while :; do case "$k" in /*) k=${k#/} ;; *) break ;; esac; done
+    k=${k%/}
+    k=${k%.git}
+    k=$(printf '%s' "$k" | tr 'A-Z' 'a-z')
+    case "$k" in ''|*[!a-z0-9._/-]*|*//*|*/) return 1 ;; esac
+    # No component may start with . or -, or end in .git (a bare inside a bare).
+    case "/$k/" in */.*|*/-*|*.git/*) return 1 ;; esac
+    case "$k" in */*) ;; *) return 1 ;; esac
+    printf '%s\n' "$k"
+}
+
+# Test hook (no environment, no volume): print the seed key of a URL.
+if [ "${1:-}" = --seed-key ]; then
+    seed_key "${2:-}"
+    exit $?
+fi
+
 # --- stage 1: capture credentials, scrub the environment, drop root -------------------
 
 stash_cred() {
-    cenv=$9
+    eval "cenv=\${$#}"
     valid_cred_name "$cenv" || return 0
     eval "val=\${$cenv:-}"
     [ -n "$val" ] && printf '%s\n' "$val" > "$PRIV/creds/$cenv"
@@ -113,7 +200,7 @@ if [ "${1:-}" != --scrubbed ]; then
     elif [ -n "${WARREN_SECRETS_BLOB:-}" ]; then
         log "$SECRETS_LIB missing; cannot load git-init secrets"; rm -rf "$PRIV"; exit 1
     fi
-    each_record stash_cred
+    if [ "$MODE" = refresh-seed ]; then each_seed stash_cred; else each_record stash_cred; fi
     printf '%s\n' "${WARREN_GIT_KNOWN_HOSTS:-}" > "$PRIV/known_hosts_extra"
     drop=
     if [ "$(id -u)" = 0 ]; then
@@ -130,6 +217,8 @@ if [ "${1:-}" != --scrubbed ]; then
     # shellcheck disable=SC2086
     exec env -i PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}" WARREN_GIT_ROOT="$ROOT" \
         WARREN_GIT_ALLOW_PROTOCOL="$ALLOW_PROTOCOL" WARREN_GIT_FOLDERS="${WARREN_GIT_FOLDERS:-}" \
+        WARREN_GIT_MODE="$MODE" WARREN_GIT_SEEDED="$SEEDED" WARREN_GIT_CLONE_FILTER="$CLONE_FILTER" \
+        WARREN_GIT_SEED_REPOS="${WARREN_GIT_SEED_REPOS:-}" \
         WARREN_GIT_PRIV="$PRIV" $drop /bin/sh "$SELF" --scrubbed
 fi
 
@@ -140,14 +229,12 @@ trap 'rm -rf "$PRIV"' EXIT
 umask 022
 cd "$PRIV" || exit 1
 
-for d in "$WS_DIR" "$STORE"; do
-    if [ -L "$d" ] || ! mkdir -p "$d" 2>/dev/null || [ ! -w "$d" ]; then
-        owner=$(ls -ldn "$ROOT" 2>/dev/null | awk '{print $3}')
-        log "$d is not writable by uid $(id -u) ($ROOT is owned by uid ${owner:-?});" \
-            "start git-init as root or give the volume to uid $WARREN_UID. Nothing materialized."
-        exit 1
-    fi
-done
+not_writable() {
+    owner=$(ls -ldn "$ROOT" 2>/dev/null | awk '{print $3}')
+    log "$1 is not writable by uid $(id -u) ($ROOT is owned by uid ${owner:-?});" \
+        "start git-init as root or give the volume to uid $WARREN_UID. Nothing materialized."
+    exit 1
+}
 
 git_env() {
     env -i PATH="$PATH" HOME=/nonexistent GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
@@ -170,40 +257,220 @@ ssh_command() {
     [ -n "${1:-}" ] && printf ' -o IdentitiesOnly=yes -i %s' "$1"
 }
 
-# Network clone into a fresh dir under $PRIV: no existing repo config to trust.
-git_clone() {
-    url=$1; ckind=$2; cenv=$3; dest=$4; shift 4
-    cred="$PRIV/creds/$cenv"
-    if [ "$ckind" != none ] && [ ! -s "$cred" ]; then
-        log "credential $cenv not set, cloning without it"
-        ckind=none
+# net_git URL CRED_KIND CRED_ENV GIT_ARGS...: `git <pins> GIT_ARGS` with URL's transport
+# credentials; the argument @URL@ stands for URL (with the PAT username for https). Only
+# ever run on repos whose config git-init wrote: fresh clones, seed-refresh mirrors, or
+# (bare seeds) repos git-init itself cloned locally from a seed bare it validated.
+net_git() {
+    n_url=$1; n_kind=$2; n_cred="$PRIV/creds/$3"; shift 3
+    if [ "$n_kind" != none ] && [ ! -s "$n_cred" ]; then
+        log "credential ${n_cred##*/} not set, cloning without it"
+        n_kind=none
     fi
-    if is_ssh "$url" && [ ! -s "$PINNED_KNOWN_HOSTS" ] && ! grep -q '[^[:space:]]' "$PRIV/known_hosts_extra"; then
-        log "no pinned ssh known_hosts ($PINNED_KNOWN_HOSTS missing, WARREN_GIT_KNOWN_HOSTS unset); refusing to clone $url"
+    if is_ssh "$n_url" && [ ! -s "$PINNED_KNOWN_HOSTS" ] && ! grep -q '[^[:space:]]' "$PRIV/known_hosts_extra"; then
+        log "no pinned ssh known_hosts ($PINNED_KNOWN_HOSTS missing, WARREN_GIT_KNOWN_HOSTS unset); refusing to clone $n_url"
         return 1
     fi
+    n_use=$n_url
+    [ "$n_kind" = pat ] && n_use=$(printf '%s' "$n_url" | sed 's#^https://#https://x-access-token@#')
+    for n_arg; do
+        shift
+        [ "$n_arg" = @URL@ ] && n_arg=$n_use
+        set -- "$@" "$n_arg"
+    done
     # GIT_SSH_COMMAND / GIT_ASKPASS below take precedence over the core.sshCommand /
-    # core.askPass pins. --upload-pack matches host-side fetches (safe_git).
+    # core.askPass pins. No auto gc or maintenance after a fetch.
     # shellcheck disable=SC2086
-    set -- $SAFE_GIT_PINS clone --upload-pack=git-upload-pack "$@"
-    case "$ckind" in
+    set -- $SAFE_GIT_PINS -c gc.auto=0 -c maintenance.auto=false "$@"
+    case "$n_kind" in
         pat)
-            printf '#!/bin/sh\nexec cat "%s"\n' "$cred" > "$PRIV/creds/askpass"
+            printf '#!/bin/sh\nexec cat "%s"\n' "$n_cred" > "$PRIV/creds/askpass"
             chmod 0700 "$PRIV/creds/askpass"
-            auth_url=$(printf '%s' "$url" | sed 's#^https://#https://x-access-token@#')
-            git_env GIT_ALLOW_PROTOCOL="$ALLOW_PROTOCOL" GIT_ASKPASS="$PRIV/creds/askpass" \
-                git "$@" -- "$auth_url" "$dest"
+            git_env GIT_ALLOW_PROTOCOL="$ALLOW_PROTOCOL" GIT_ASKPASS="$PRIV/creds/askpass" git "$@"
             ;;
         ssh)
-            git_env GIT_ALLOW_PROTOCOL="$ALLOW_PROTOCOL" GIT_SSH_COMMAND="$(ssh_command "$cred")" \
-                git "$@" -- "$url" "$dest"
+            git_env GIT_ALLOW_PROTOCOL="$ALLOW_PROTOCOL" GIT_SSH_COMMAND="$(ssh_command "$n_cred")" git "$@"
             ;;
         *)
-            git_env GIT_ALLOW_PROTOCOL="$ALLOW_PROTOCOL" GIT_SSH_COMMAND="$(ssh_command)" \
-                git "$@" -- "$url" "$dest"
+            git_env GIT_ALLOW_PROTOCOL="$ALLOW_PROTOCOL" GIT_SSH_COMMAND="$(ssh_command)" git "$@"
             ;;
     esac
 }
+
+# Network clone into a fresh dir (no existing repo config to trust). --upload-pack
+# matches host-side fetches (safe_git).
+git_clone() {
+    c_url=$1; c_kind=$2; c_env=$3; c_dest=$4; shift 4
+    net_git "$c_url" "$c_kind" "$c_env" clone --upload-pack=git-upload-pack "$@" -- @URL@ "$c_dest"
+}
+
+# git_fetch_into DIR HEADS_DST: fetch $url's heads (to HEADS_DST) and tags into DIR, a
+# repo git-init created and configured itself.
+git_fetch_into() {
+    net_git "$url" "$ckind" "$cenv" -C "$1" fetch -q --prune --no-write-fetch-head \
+        --upload-pack=git-upload-pack -- @URL@ "+refs/heads/*:$2" '+refs/tags/*:refs/tags/*'
+}
+
+# WARREN_GIT_CLONE_FILTER: a partial clone lacks the blobs its first checkout needs, and
+# materialize() runs with no transport. Fetch exactly those now, with the credentials.
+prefetch_blobs() {
+    [ -n "$CLONE_FILTER" ] || return 0
+    p_missing=$(git_local -C "$1" rev-list --objects --missing=print "$2^{tree}" 2>/dev/null | sed -n 's/^?//p')
+    [ -n "$p_missing" ] || return 0
+    printf '%s\n' "$p_missing" | net_git "$url" "$ckind" "$cenv" -C "$1" \
+        -c fetch.negotiationAlgorithm=noop fetch -q --no-tags --no-write-fetch-head \
+        --recurse-submodules=no --filter="$CLONE_FILTER" --upload-pack=git-upload-pack --stdin -- @URL@
+}
+
+# A bare repository with nothing git would follow elsewhere: no symlinks anywhere in it,
+# no alternates, no commondir.
+plain_bare() {
+    [ -d "$1" ] && [ ! -L "$1" ] && [ -f "$1/config" ] && [ ! -L "$1/config" ] && [ -f "$1/HEAD" ] \
+        && [ -d "$1/objects" ] && [ -d "$1/refs" ] && [ ! -e "$1/objects/info/alternates" ] \
+        && [ ! -e "$1/objects/info/http-alternates" ] && [ ! -e "$1/commondir" ] \
+        && [ -z "$(find "$1" -type l -print 2>/dev/null | head -n 1)" ]
+}
+
+# Replace a bare repo's config with one warren wrote: nothing in it can name a program
+# (filter drivers, sshCommand, include.path, uploadpack, ...). Keeps only the object and
+# ref formats, and a partial clone's promisor filter (WARREN_GIT_CLONE_FILTER).
+write_bare_config() {
+    w_old="$1/config"
+    fmt=$(git_env git config --file "$w_old" --get extensions.objectformat 2>/dev/null)
+    refs=$(git_env git config --file "$w_old" --get extensions.refstorage 2>/dev/null)
+    promisor=$(git_env git config --file "$w_old" --get remote.origin.promisor 2>/dev/null)
+    pfilter=$(git_env git config --file "$w_old" --get remote.origin.partialclonefilter 2>/dev/null)
+    case "$fmt" in sha1|sha256) ;; *) fmt= ;; esac
+    case "$refs" in files|reftable) ;; *) refs= ;; esac
+    case "$promisor:$pfilter" in true:blob:none|true:tree:0) ;; *) pfilter= ;; esac
+    w_new="$PRIV/config.new"
+    : > "$w_new"
+    set_cfg() { git_env git config --file "$w_new" "$@"; }
+    set_cfg core.repositoryformatversion "$([ -n "$fmt$refs$pfilter" ] && echo 1 || echo 0)"
+    set_cfg core.bare true
+    set_cfg core.hooksPath /dev/null
+    set_cfg core.fsmonitor false
+    set_cfg core.attributesFile /dev/null
+    set_cfg gc.auto 0
+    set_cfg remote.origin.url "$2"
+    [ -n "$fmt" ] && set_cfg extensions.objectformat "$fmt"
+    [ -n "$refs" ] && set_cfg extensions.refstorage "$refs"
+    if [ -n "$pfilter" ]; then
+        set_cfg remote.origin.promisor true
+        set_cfg remote.origin.partialclonefilter "$pfilter"
+        set_cfg extensions.partialclone origin
+    fi
+    rm -f "$1/commondir" "$1/config.worktree"
+    mv -f "$w_new" "$w_old"
+}
+
+# --- refresh-seed mode (the owner's seed-refresh task, never a workspace) -------------
+
+refresh_one() {
+    idx=$1; key=$2; url=$3; ckind=$4; cenv=$5
+    case "$ckind" in pat|ssh) valid_cred_name "$cenv" || ckind=none ;; *) ckind=none ;; esac
+    if [ "$(seed_key "$url")" != "$key" ]; then
+        log "seed record $idx: key does not match its url, skipping"
+        failed=$((failed + 1))
+        return 0
+    fi
+    sb="$SEEDS/$key.git"
+    if [ -e "$sb" ] || [ -L "$sb" ]; then
+        if plain_bare "$sb" && write_bare_config "$sb" "$url"; then
+            if ! git_fetch_into "$sb" 'refs/heads/*'; then
+                log "$key: fetch failed, keeping the previous mirror"
+                failed=$((failed + 1))
+                printf '%s\n' "$key" >> "$PRIV/keep"
+                return 0
+            fi
+        else
+            log "$key: not a plain bare repository, recloning"
+            rm -rf "$sb"
+        fi
+    fi
+    if [ ! -d "$sb" ]; then
+        new="$SEEDS/.new/$idx"
+        rm -rf "$new"
+        if ! { mkdir -p "$SEEDS/.new" "${sb%/*}" && git_clone "$url" "$ckind" "$cenv" "$new" -q --bare \
+            && write_bare_config "$new" "$url" && mv "$new" "$sb"; }; then
+            log "$key: clone failed"
+            rm -rf "$new"
+            failed=$((failed + 1))
+            return 0
+        fi
+    fi
+    git_local --git-dir="$sb" -c gc.auto=6700 -c gc.autoDetach=false gc --auto --quiet || true
+    printf '%s\n' "$key" >> "$PRIV/keep"
+    log "$key: mirror up to date"
+}
+
+refresh_seed() {
+    # Only seed-refresh tasks ever mount this volume: anything but the seed is dropped.
+    for e in "$ROOT"/* "$ROOT"/.[!.]* "$ROOT"/..?*; do
+        [ -e "$e" ] || [ -L "$e" ] || continue
+        case "${e##*/}" in .warren-bares|lost+found) ;; *) rm -rf "$e" ;; esac
+    done
+    if [ -L "$SEEDS" ] || [ -n "$(find "$SEEDS" -type l -print 2>/dev/null | head -n 1)" ]; then
+        log "the seed holds symlinks; starting it over"
+        rm -rf "$SEEDS"
+    fi
+    { mkdir -p "$SEEDS" && [ -w "$SEEDS" ]; } || not_writable "$SEEDS"
+    : > "$PRIV/keep"
+    failed=0
+    each_seed refresh_one
+    rm -rf "$PRIV/creds" "$SEEDS/.new"
+    # Drop every mirror that wasn't listed, then anything that isn't a mirror.
+    find "$SEEDS" -mindepth 1 -type d -name '*.git' -prune -print | while IFS= read -r d; do
+        rel=${d#"$SEEDS"/}
+        grep -qxF -- "${rel%.git}" "$PRIV/keep" || { rm -rf "$d"; log "${rel%.git}: dropped from the seed"; }
+    done
+    find "$SEEDS" -mindepth 1 \( -type d -name '*.git' -prune \) -o \( ! -type d -print \) \
+        | while IFS= read -r f; do rm -f "$f"; done
+    # Empty directories left between mirrors (never inside one), innermost first.
+    n=0
+    while [ "$n" -lt 64 ]; do
+        empties=$(find "$SEEDS" -mindepth 1 \( -type d -name '*.git' -prune \) -o \( -type d -empty -print \))
+        [ -n "$empties" ] || break
+        printf '%s\n' "$empties" | while IFS= read -r e; do rmdir "$e" 2>/dev/null; done
+        n=$((n + 1))
+    done
+    log "seed refreshed ($failed failed)"
+    [ "$failed" = 0 ] || exit 3
+    exit 0
+}
+
+if [ "$MODE" = refresh-seed ]; then
+    refresh_seed
+fi
+
+# --- materialize mode (the workspace's git-init) --------------------------------------
+
+# Whether the volume is exactly what an owner's seed snapshot restores: the seed and
+# ext4's lost+found, nothing else, no symlinks. Anything more means something other than
+# the seed-refresh task has written it, and the seed is not used.
+pristine_seed_volume() {
+    [ -d "$SEEDS" ] && [ ! -L "$SEEDS" ] || return 1
+    for e in "$ROOT"/* "$ROOT"/.[!.]* "$ROOT"/..?*; do
+        [ -e "$e" ] || [ -L "$e" ] || continue
+        case "${e##*/}" in .warren-bares|lost+found) ;; *) return 1 ;; esac
+    done
+    [ -z "$(find "$SEEDS" -type l -print 2>/dev/null | head -n 1)" ]
+}
+
+use_seed=
+if [ "$SEEDED" = 1 ] && pristine_seed_volume; then
+    use_seed=1
+elif [ -e "$SEEDS" ] || [ -L "$SEEDS" ]; then
+    [ "$SEEDED" = 1 ] && log "the volume holds more than its seed; not using the seed"
+    rm -rf "$SEEDS"
+fi
+rm -rf "$STAGE"
+
+for d in "$WS_DIR" "$STORE"; do
+    if [ -L "$d" ] || ! mkdir -p "$d" 2>/dev/null || [ ! -w "$d" ]; then
+        not_writable "$d"
+    fi
+done
 
 # Sets target/bare. Returns 0 if the folder needs work, 2 if its checkout already exists.
 precheck() {
@@ -223,16 +490,73 @@ precheck() {
     return 0
 }
 
+# Sets sb to this folder's seed bare when it is safe to clone from (its config rewritten);
+# a seed bare that looks wrong is deleted, and the folder is cloned over the network.
+seed_bare() {
+    sb=
+    [ -n "$use_seed" ] || return 1
+    key=$(seed_key "$url") || return 1
+    cand="$SEEDS/$key.git"
+    [ -e "$cand" ] || [ -L "$cand" ] || return 1
+    s_url=$(git_env git config --file "$cand/config" --get remote.origin.url 2>/dev/null)
+    if ! plain_bare "$cand" || [ "$(seed_key "$s_url")" != "$key" ] || ! write_bare_config "$cand" "$url" \
+        || [ "$(git_local --git-dir="$cand" rev-parse --is-bare-repository 2>/dev/null)" != true ]; then
+        log "$name: the seed for $key is not a plain bare mirror of its url; not using it"
+        rm -rf "$cand"
+        return 1
+    fi
+    sb=$cand
+}
+
+# Clone the folder from its seed bare into $STAGE/<idx> (same filesystem: objects are
+# hardlinked), then fetch only what the seed is missing, with the credentials.
+seed_fetch() {
+    dest="$STAGE/$idx"
+    rm -rf "$dest"
+    mkdir -p "$STAGE" || return 1
+    if [ "$1" = clone ]; then
+        git_local -c protocol.file.allow=always clone -q --local --no-checkout -- "$sb" "$dest" &&
+            git_local -C "$dest" remote set-url origin "$url" &&
+            git_fetch_into "$dest" 'refs/remotes/origin/*' &&
+            git_local -C "$dest" rev-parse -q --verify "refs/remotes/origin/$branch^{commit}" >/dev/null &&
+            git_local -C "$dest" update-ref "refs/heads/$branch" "refs/remotes/origin/$branch" &&
+            git_local -C "$dest" symbolic-ref HEAD "refs/heads/$branch" &&
+            git_local -C "$dest" config "branch.$branch.remote" origin &&
+            git_local -C "$dest" config "branch.$branch.merge" "refs/heads/$branch" || return 1
+        # Like a network clone of $branch: no other local branch.
+        git_local -C "$dest" for-each-ref --format='%(refname)' refs/heads/ | while IFS= read -r r; do
+            [ "$r" = "refs/heads/$branch" ] || git_local -C "$dest" update-ref -d "$r"
+        done
+    else
+        git_local -c protocol.file.allow=always clone -q --bare --local -- "$sb" "$dest" &&
+            git_fetch_into "$dest" 'refs/heads/*' &&
+            git_local -C "$dest" rev-parse -q --verify "refs/heads/$branch^{commit}" >/dev/null || return 1
+    fi
+    log "$name: cloned from the seed, fetched what it was missing"
+}
+
 fetch() {
     idx=$1; shift
     precheck "$@" || return 0
     url=$4; branch=$5
-    if [ "$1" = clone ]; then
-        git_clone "$url" "$ckind" "$cenv" "$PRIV/$idx" --no-checkout --branch "$branch"
-    elif [ ! -d "$bare" ]; then
-        git_clone "$url" "$ckind" "$cenv" "$PRIV/$idx" --bare
-    else
+    if [ "$1" = worktree ] && [ -d "$bare" ]; then
         return 0
+    fi
+    if seed_bare; then
+        seed_fetch "$1" && return 0
+        rm -rf "${STAGE:?}/$idx"
+        log "$2: seeded clone failed, cloning over the network"
+    fi
+    filter=
+    [ -n "$CLONE_FILTER" ] && filter="--filter=$CLONE_FILTER"
+    if [ "$1" = clone ]; then
+        # shellcheck disable=SC2086
+        git_clone "$url" "$ckind" "$cenv" "$PRIV/$idx" --no-checkout --branch "$branch" $filter &&
+            prefetch_blobs "$PRIV/$idx" HEAD
+    else
+        # shellcheck disable=SC2086
+        git_clone "$url" "$ckind" "$cenv" "$PRIV/$idx" --bare $filter &&
+            prefetch_blobs "$PRIV/$idx" "refs/heads/$branch"
     fi || {
         rm -rf "${PRIV:?}/$idx"
         if is_ssh "$url"; then
@@ -243,32 +567,13 @@ fetch() {
     }
 }
 
-# Replace an agent-writable bare store's config with one warren wrote: nothing in it can
-# name a program (filter drivers, sshCommand, include.path, uploadpack, ...).
+# An agent-writable bare store: rewrite its config before any git runs on it.
 sanitize_store() {
     if [ -L "$bare" ] || [ -L "$bare/config" ] || [ ! -f "$bare/config" ] || [ ! -f "$bare/HEAD" ]; then
         log "$name: $bare is not a bare repository"
         return 1
     fi
-    old="$bare/config"
-    fmt=$(git_env git config --file "$old" --get extensions.objectformat 2>/dev/null)
-    refs=$(git_env git config --file "$old" --get extensions.refstorage 2>/dev/null)
-    case "$fmt" in sha1|sha256) ;; *) fmt= ;; esac
-    case "$refs" in files|reftable) ;; *) refs= ;; esac
-    new="$PRIV/config.$name"
-    : > "$new"
-    set_cfg() { git_env git config --file "$new" "$@"; }
-    set_cfg core.repositoryformatversion "$([ -n "$fmt$refs" ] && echo 1 || echo 0)"
-    set_cfg core.bare true
-    set_cfg core.hooksPath /dev/null
-    set_cfg core.fsmonitor false
-    set_cfg core.attributesFile /dev/null
-    set_cfg gc.auto 0
-    set_cfg remote.origin.url "$url"
-    [ -n "$fmt" ] && set_cfg extensions.objectformat "$fmt"
-    [ -n "$refs" ] && set_cfg extensions.refstorage "$refs"
-    rm -f "$bare/commondir" "$bare/config.worktree"
-    mv -f "$new" "$old"
+    write_bare_config "$bare" "$url"
 }
 
 materialize() {
@@ -280,6 +585,7 @@ materialize() {
     esac
     kind=$1; url=$4; branch=$5; ws_branch=$6
     src="$PRIV/$idx"
+    [ -d "$src" ] || src="$STAGE/$idx"
     mkdir -p "$(dirname "$target")" || return 1
 
     if [ "$kind" = clone ]; then
@@ -322,5 +628,8 @@ materialize_one() {
 
 failed=0
 each_record materialize_one
+# The seed served its purpose: its objects live on in the checkouts as hardlinks, and the
+# workspace (and its snapshots) never hold the owner's other mirrors.
+rm -rf "$SEEDS" "$STAGE"
 log "done ($failed failed)"
 exit 0

@@ -300,6 +300,33 @@ class WarrenSettings(BaseSettings):
     # Symmetric KMS key for EBS-mode secrets delivery (runtime/ecs_kms_secrets.py): the
     # control plane only calls kms:GenerateDataKey, the task role kms:Decrypt.
     ecs_secrets_kms_key_id: str = ""
+    # EBS bare seeds (runtime/ebs_seeds.py), EBS storage only: each owner gets one seed
+    # snapshot holding bare mirrors of the repos their EBS workspaces use, refreshed by
+    # a seed-refresh task with that owner's own credentials. A new workspace's volume is
+    # created from its owner's seed, so git-init clones locally and fetches only the delta.
+    ecs_ebs_bare_seeds: bool = False
+    # A repo no workspace of the owner uses any more stays in the seed this long after the
+    # last such workspace is destroyed; a seed left with no repos is deleted.
+    ecs_ebs_seed_repo_ttl_days: float = Field(default=30.0, ge=0)
+    # How old a seed may get before it is refreshed (skipped when every recorded ref SHA
+    # still matches `git ls-remote`).
+    ecs_ebs_seed_refresh_interval_seconds: float = Field(default=86400.0, gt=0)
+    # Hard limit on one seed-refresh task; past it the task is stopped and the old seed kept.
+    ecs_ebs_seed_refresh_timeout_seconds: float = Field(default=1800.0, gt=0)
+    # WARREN_GIT_CLONE_FILTER: partial clone filter for git-init's network clones on ECS
+    # (`blob:none` or `tree:0`; empty = full clones). The workspace container never holds
+    # the clone credentials, so for a private repo any later lazy fetch inside it
+    # (checking out another commit, `git log -p`, blame) fails. Off by default.
+    git_clone_filter: Literal["", "blob:none", "tree:0"] = ""
+
+    @model_validator(mode="after")
+    def _check_bare_seeds(self) -> "WarrenSettings":
+        if self.ecs_ebs_bare_seeds and not (self.ecs_ebs_infra_role_arn and self.ecs_secrets_kms_key_id):
+            raise ValueError(
+                "WARREN_ECS_EBS_BARE_SEEDS needs EBS workspace storage: set "
+                "WARREN_ECS_EBS_INFRA_ROLE_ARN and WARREN_ECS_SECRETS_KMS_KEY_ID"
+            )
+        return self
 
     # Issue #11: `expires_at` existed in the tokens schema and in the query that resolves
     # a token to a user, but nothing ever wrote a value into it, so every minted token was

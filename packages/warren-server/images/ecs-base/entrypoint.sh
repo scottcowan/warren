@@ -71,6 +71,13 @@ if [ "$(/usr/bin/id -u)" = 0 ]; then
     exec /sbin/su-exec warren:warren /usr/local/bin/entrypoint.sh "$@"
 fi
 
+# EBS bare seeds (runtime/ebs_seeds.py): git-init deletes the owner's seed mirrors after
+# cloning from them. If an older or custom git-init left them, drop them here, as warren
+# (never as root on the agent-writable volume), so the workspace's snapshots don't keep them.
+if [ -d /var/lib/warren/.warren-bares ] && [ ! -L /var/lib/warren/.warren-bares ]; then
+    /bin/rm -rf /var/lib/warren/.warren-bares /var/lib/warren/.warren-stage 2>/dev/null || true
+fi
+
 # AB1/AG3: harness dirs on the volume keep only their declared persist paths (minus
 # credential files), and warren rewrites its own generated config (e.g. a minimal
 # .claude.json) from the image's profile data. Runs as warren; never follows a link.

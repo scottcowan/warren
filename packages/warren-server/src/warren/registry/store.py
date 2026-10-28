@@ -557,6 +557,130 @@ class EbsSnapshotStore:
         await self._db.execute("DELETE FROM ecs_ebs_snapshots WHERE workspace_id = ?", (workspace_id,))
 
 
+_SEED_COLUMNS = (
+    "owner_id", "snapshot_id", "size_gib", "created_at", "repo_keys", "verified_at",
+    "pending_snapshot_id", "pending_size_gib", "pending_repo_keys", "pending_ref_shas",
+    "previous_snapshot_id", "superseded_at", "refreshing_since", "last_error", "image",
+    "storage_key", "updated_at",
+)
+_SEED_REPO_COLUMNS = (
+    "owner_id", "repo_key", "url", "kind", "cred_kind", "cred_secret", "branches",
+    "ref_shas", "last_used_at", "released_at",
+)
+
+
+class EbsSeedStore:
+    """EBS bare seeds (runtime/ebs_seeds.py): ecs_ebs_seeds and ecs_ebs_seed_repos. Every
+    query is keyed by owner_id; nothing here ever returns another owner's rows."""
+
+    def __init__(self, db: aiosqlite.Connection) -> None:
+        self._db = db
+
+    async def get_seed(self, owner_id: str) -> dict | None:
+        async with self._db.execute(
+            f"SELECT {', '.join(_SEED_COLUMNS)} FROM ecs_ebs_seeds WHERE owner_id = ?", (owner_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        return dict(zip(_SEED_COLUMNS, row, strict=True)) if row else None
+
+    async def list_seeds(self) -> list[dict]:
+        async with self._db.execute(f"SELECT {', '.join(_SEED_COLUMNS)} FROM ecs_ebs_seeds") as cur:
+            rows = await cur.fetchall()
+        return [dict(zip(_SEED_COLUMNS, r, strict=True)) for r in rows]
+
+    async def update_seed(self, owner_id: str, **fields: object) -> None:
+        """Upsert the owner's seed row, setting only `fields`."""
+        bad = set(fields) - set(_SEED_COLUMNS[1:])
+        if bad:
+            raise ValueError(f"unknown seed columns: {sorted(bad)}")
+        await self._db.execute(
+            "INSERT OR IGNORE INTO ecs_ebs_seeds (owner_id, updated_at) VALUES (?, ?)",
+            (owner_id, _utcnow_iso()),
+        )
+        fields = {**fields, "updated_at": _utcnow_iso()}
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        await self._db.execute(
+            f"UPDATE ecs_ebs_seeds SET {sets} WHERE owner_id = ?", (*fields.values(), owner_id)
+        )
+
+    async def delete_seed(self, owner_id: str) -> None:
+        await self._db.execute("DELETE FROM ecs_ebs_seeds WHERE owner_id = ?", (owner_id,))
+
+    async def claim_refresh(self, owner_id: str, now: str, stale_before: str) -> bool:
+        """Single-flight: set refreshing_since unless a refresh newer than stale_before
+        holds it. True when this caller now owns the owner's refresh."""
+        await self._db.execute(
+            "INSERT OR IGNORE INTO ecs_ebs_seeds (owner_id, updated_at) VALUES (?, ?)",
+            (owner_id, _utcnow_iso()),
+        )
+        cur = await self._db.execute(
+            "UPDATE ecs_ebs_seeds SET refreshing_since = ?, updated_at = ? WHERE owner_id = ? "
+            "AND (refreshing_since IS NULL OR refreshing_since < ?)",
+            (now, _utcnow_iso(), owner_id, stale_before),
+        )
+        claimed = cur.rowcount == 1
+        await cur.close()
+        return claimed
+
+    async def repos(self, owner_id: str) -> list[dict]:
+        async with self._db.execute(
+            f"SELECT {', '.join(_SEED_REPO_COLUMNS)} FROM ecs_ebs_seed_repos WHERE owner_id = ? "
+            "ORDER BY last_used_at DESC, repo_key",
+            (owner_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        out = []
+        for r in rows:
+            row = dict(zip(_SEED_REPO_COLUMNS, r, strict=True))
+            row["branches"] = _json_list(row["branches"])
+            row["ref_shas"] = _json_dict(row["ref_shas"])
+            out.append(row)
+        return out
+
+    async def repo_owners(self) -> list[str]:
+        async with self._db.execute("SELECT DISTINCT owner_id FROM ecs_ebs_seed_repos") as cur:
+            return [r[0] for r in await cur.fetchall()]
+
+    async def put_repo(self, owner_id: str, row: dict) -> None:
+        await self._db.execute(
+            f"INSERT OR REPLACE INTO ecs_ebs_seed_repos ({', '.join(_SEED_REPO_COLUMNS)}) "
+            f"VALUES ({', '.join('?' for _ in _SEED_REPO_COLUMNS)})",
+            (
+                owner_id, row["repo_key"], row["url"], row["kind"], row["cred_kind"],
+                row["cred_secret"], json.dumps(sorted(set(row.get("branches") or []))),
+                json.dumps(row["ref_shas"], sort_keys=True) if row.get("ref_shas") else None,
+                row["last_used_at"], row.get("released_at"),
+            ),
+        )
+
+    async def delete_repo(self, owner_id: str, repo_key: str) -> None:
+        await self._db.execute(
+            "DELETE FROM ecs_ebs_seed_repos WHERE owner_id = ? AND repo_key = ?", (owner_id, repo_key)
+        )
+
+    async def set_ref_shas(self, owner_id: str, repo_key: str, shas: dict | None) -> None:
+        await self._db.execute(
+            "UPDATE ecs_ebs_seed_repos SET ref_shas = ? WHERE owner_id = ? AND repo_key = ?",
+            (json.dumps(shas, sort_keys=True) if shas else None, owner_id, repo_key),
+        )
+
+
+def _json_list(raw: object) -> list:
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else []
+    except ValueError:
+        return []
+    return [x for x in data if isinstance(x, str)] if isinstance(data, list) else []
+
+
+def _json_dict(raw: object) -> dict:
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else {}
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 class OperationStore:
     """AM2: client operation receipts (operations), one per principal + operation id."""
 

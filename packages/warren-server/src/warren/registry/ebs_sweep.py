@@ -34,6 +34,18 @@ async def sweep_ebs(registry: "WorkspaceRegistry", *, min_age_seconds: float = 9
     stats = await ebs.sweep(exists, registry._lock_for, min_age_seconds=min_age_seconds)
     if any(stats.values()):
         log.info("ebs_sweep_done", **stats)
+    # EBS bare seeds (runtime/ebs_seeds.py): stale refreshes, the repo TTL, empty seeds and
+    # orphaned seed volumes/snapshots, each owner under its own lock.
+    seeds: Any = getattr(registry.runtime, "seeds", None)
+    if seeds is not None:
+        try:
+            seed_stats = await seeds.sweep(min_age_seconds=min_age_seconds)
+        except Exception:
+            log.exception("ebs_seed_sweep_failed")
+        else:
+            if any(seed_stats.values()):
+                log.info("ebs_seed_sweep_done", **seed_stats)
+            stats = {**stats, **{f"seed_{k}": v for k, v in seed_stats.items()}}
     return stats
 
 
