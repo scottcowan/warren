@@ -44,7 +44,9 @@ FROM base
 
 # su-exec: privilege drop for entrypoint.sh, warren-session and git-init (AD3/AH1).
 # openssh-client: git-init's ssh clones (AH1).
-RUN apk add --no-cache ca-certificates git openssh-client bash zsh tmux su-exec
+# aws-cli: tasks run on AWS with a task role (e.g. `aws codeartifact login`); it uses the
+# ECS container credentials endpoint, no keys in the image.
+RUN apk add --no-cache ca-certificates git openssh-client bash zsh tmux su-exec aws-cli
 
 # AD3: non-root workspace user. uid/gid 1000 matches the EFS access point's PosixUser
 # (src/warren/runtime/efs.py), so files under /var/lib/warren are owned by it.
