@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 from .errors import ProjectNotFoundError
 from .models import ProjectConfig
-from .templates import merge_projects
+from .templates import list_template_paths, merge_projects
 
 log = structlog.get_logger(__name__)
 
@@ -36,7 +36,22 @@ class ProjectLoader:
             raise ValidationError.from_exception_data(
                 "ProjectConfig", [{"type": "missing", "loc": ("name",), "input": data}]
             )
-        return ProjectConfig.model_validate(data)
+        cfg = ProjectConfig.model_validate(data)
+        # A project file that parses cleanly but ends up with zero templates is
+        # never useful -- nothing can provision from it (list_template_paths
+        # returning empty means every `warren new <project>` call has no
+        # template to resolve). This is near-silent otherwise: ProjectConfig's
+        # `extra="ignore"` means a renamed/removed field (e.g. the old
+        # `intents:`/`base_image:` shape, superseded by `templates:`/
+        # `docker_image:`) parses without a single error, just drops the
+        # content -- the same code path a genuinely-new, harmless optional
+        # field takes. Only load_all() (every *.yaml at startup) hits this
+        # warning in practice; load_optional()/load_effective() calls for a
+        # single named project surface the same emptiness to the caller
+        # directly via list_template_paths() instead.
+        if not list_template_paths(cfg):
+            log.warning("project_has_no_templates", path=str(path), name=cfg.name)
+        return cfg
 
     @staticmethod
     def load_all(projects_dir: Path) -> dict[str, ProjectConfig]:

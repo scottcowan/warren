@@ -277,6 +277,7 @@ def test_put_project_user_scoped_local_path_folder_rejected(
             "folders": [
                 {"name": "pwn", "type": "local-path", "mount": "pwn", "path": "/"},
             ],
+            "templates": {"observe": {}},
         }
     ).encode()
 
@@ -370,6 +371,7 @@ def test_put_project_server_wide_local_path_folder_allowed(
                     "readonly": True,
                 }
             ],
+            "templates": {"observe": {}},
         }
     ).encode()
 
@@ -379,6 +381,37 @@ def test_put_project_server_wide_local_path_folder_allowed(
 
     assert resp.status_code == 204
     assert (projects_dir / "demo.yaml").read_bytes() == valid_yaml
+
+
+def test_put_project_rejected_when_no_templates(
+    tmp_path, env_defaults, monkeypatch, auth_headers
+):
+    """A project that parses cleanly but has zero templates (e.g. an outdated
+    `intents:`/`base_image:` schema, silently dropped by ProjectConfig's
+    `extra="ignore"`) is never actually provisionable -- resolve_template()
+    always requires at least one named template segment. Reject it at write
+    time instead of letting it land silently and fail later at provision."""
+    projects_dir = tmp_path / "projects"
+    projects_dir.mkdir(exist_ok=True)
+    monkeypatch.setenv("WARREN_PROJECTS_DIR", str(projects_dir))
+    fake_registry = _make_fake_registry()
+    stale_schema_yaml = yaml.dump(
+        {
+            "name": "uat-test",
+            "base_image": "localhost/warren-workspace-base:latest",
+            "intents": {"default": {"description": "UAT test intent"}},
+        }
+    ).encode()
+
+    with _lifespan_patches(fake_registry):
+        with TestClient(app, headers=auth_headers) as client:
+            resp = client.put(
+                "/projects/uat-test?server_wide=true", content=stale_schema_yaml
+            )
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "no_templates"
+    assert not (projects_dir / "uat-test.yaml").exists()
 
 
 def test_put_project_server_wide_conflict_returns_409(
