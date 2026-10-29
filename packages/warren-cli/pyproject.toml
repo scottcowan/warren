@@ -22,7 +22,7 @@ warren-common = { workspace = true }
 [project.optional-dependencies]
 dev = [
   "pytest>=8",
-  "pytest-asyncio>=0.24",
+  "pytest-asyncio>=1.4.1",
   "respx>=0.21",
   "boto3>=1.43.51",
 ]
