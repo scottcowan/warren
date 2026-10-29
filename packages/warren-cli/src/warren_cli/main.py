@@ -395,8 +395,15 @@ async def _gather_remote_workspaces(remotes: dict) -> list:
     async def fetch(name: str, profile) -> tuple:
         try:
             async with make_remote_client(profile, timeout=5.0) as c:
-                ws_resp, hz_resp = await asyncio.gather(
+                # /healthz/detail (audit #45 moved runtime/workspace/secret counts
+                # here, admin-token-gated) is fetched alongside plain /healthz so a
+                # non-admin token still confirms the process is up -- without this
+                # fallback, /healthz alone no longer carries the `runtime`/
+                # `workspaces` fields this header displays, so it used to render
+                # "unknown ✗ 0 running" unconditionally even on a healthy server.
+                ws_resp, hzd_resp, hz_resp = await asyncio.gather(
                     c.get("/workspaces"),
+                    c.get("/healthz/detail"),
                     c.get("/healthz"),
                     return_exceptions=True,
                 )
@@ -406,10 +413,12 @@ async def _gather_remote_workspaces(remotes: dict) -> list:
             else:
                 data = ws_resp.json()
             # Extract health (non-fatal — partial success OK)
-            if isinstance(hz_resp, (Exception, BaseException)) or not hz_resp.is_success:
-                health = None
+            if not isinstance(hzd_resp, (Exception, BaseException)) and hzd_resp.is_success:
+                health = hzd_resp.json()
+            elif not isinstance(hz_resp, (Exception, BaseException)) and hz_resp.is_success:
+                health = {}
             else:
-                health = hz_resp.json()
+                health = None
             if data is not None:
                 state[name] = {
                     "last_seen": datetime.now(timezone.utc).isoformat(),
@@ -714,7 +723,11 @@ def workspaces_list(
                 # with zero active workspaces) -- this used to print nothing at all
                 # in that case, making a successful, possibly multi-second remote
                 # fetch (ssh/ecs tunnel setup included) look like it silently failed.
-                if health is not None:
+                if health:
+                    # Only /healthz/detail (admin token) populates these fields --
+                    # plain /healthz success alone sets health={} (see fetch()
+                    # above), which falls through to the plain "online" header
+                    # below instead of rendering misleading unknown/0 values.
                     rt = health.get("runtime", {})
                     ws_counts = health.get("workspaces", {})
                     rt_mark = ui.OK if rt.get("reachable") else ui.FAIL
