@@ -1,5 +1,7 @@
 """AJ2: run the real warren-server app on 127.0.0.1 with the scripted runtime, for an
-external process (examples/frameworks) to drive over HTTP/MCP.
+external process to drive over HTTP/MCP -- github.com/scottcowan/warren-examples'
+acceptance tests, checking this repo out as a sibling directory (not a published
+artifact; moved out of this repo's own examples/frameworks 2026-10-30).
 
     python -m tests.control_plane_server <port> <state-dir>
 
