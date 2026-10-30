@@ -18,7 +18,7 @@
 # every future workspace built from this tag). The plain warren-docker-base remains
 # available and untouched for anyone who prefers to decline this layer's supply-chain
 # surface.
-FROM ghcr.io/scottcowan/warren-docker-base:latest@sha256:7ba55669f50253fa1ddb7aa5992d21c8df05f935836fe54212282561add66a95
+FROM ghcr.io/scottcowan/warren-docker-base:latest@sha256:6102cea6f4a8a3668bd14c8aa87d14238b97e132b7efdb5960341107667e6990
 # warren-docker-base:latest (warren-docker-base-v1.0.1, with the S1 build fix
 # and UX-1's zsh banner/prompt) as of 2026-10-17
 
