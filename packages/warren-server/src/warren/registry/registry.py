@@ -77,6 +77,7 @@ _SPEC_EXTRA_FIELDS = (
     "secret_names",
     "owner_id",
     "storage_key",
+    "ecs_storage",
     "ssh_key_paths",
     "ssh_agent_sock",
     "app",
@@ -404,7 +405,15 @@ class WorkspaceRegistry:
         """The control plane's mount of the filesystem `ws` lives on: its owner's entry
         in WARREN_ECS_OWNER_STORAGE, else WARREN_EFS_LOCAL_MOUNT_PATH. "" when unknown
         (a workspace from before per-user storage, or an owner since removed), so no
-        workspace is ever reached through another user's filesystem."""
+        workspace is ever reached through another user's filesystem. Also "" for an
+        EBS-backed workspace (runtime/ebs.py): its volume is attached only to its task."""
+        from warren.runtime.ebs import storage_from_extra  # noqa: PLC0415
+
+        try:
+            if storage_from_extra(deserialize_spec_extra(ws.spec_json)) == "ebs":
+                return ""
+        except Exception:
+            pass
         storage = getattr(self.settings, "ecs_owner_storage", None) or {}
         if isinstance(storage, dict) and storage:
             from warren.runtime.ecs_storage import storage_key_from_extra  # noqa: PLC0415
@@ -1290,7 +1299,7 @@ class WorkspaceRegistry:
             if not mount:
                 errors.append(
                     "git/verdict: the workspace volume isn't mounted on the control plane "
-                    "(WARREN_EFS_LOCAL_MOUNT_PATH unset, or no per-user storage entry)"
+                    "(EBS storage, WARREN_EFS_LOCAL_MOUNT_PATH unset, or no per-user storage entry)"
                 )
             else:
                 volume_root = Path(mount) / "workspaces" / ws.workspace_id

@@ -1,0 +1,9 @@
+{
+  "workspace_id": "ws-0123abcd",
+  "container": "workspace",
+  "region": "eu-west-1",
+  "data_key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "wrapped_key": "AQJmYWtlLWttcy1jaXBoZXJ0ZXh0LWJsb2L/",
+  "blob": "v1:eu-west-1:AQJmYWtlLWttcy1jaXBoZXJ0ZXh0LWJsb2L/:AAAAAAAAAAAAAAAA:dZ7wk+V42p8yiosZOmvYzZoWFAx8zitqzryJoaKXLQkrJ4fRWp7dJB/hPKCNmiBskyUtjxcUd/k+2lZIL1ISistDHF/fmBOtl8zx/TRHKf8BYAapRZFlHUGUInPNfawVbigsw8un+h7x9yfnNDvo",
+  "output": "EMPTY=\nGITHUB_TOKEN=Z2hwX2V4YW1wbGU=\nMULTI=bGluZTEKbGluZTIK\nUNICODE=Y2Fmw6kg4piD\n"
+}

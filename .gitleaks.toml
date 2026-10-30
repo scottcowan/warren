@@ -29,3 +29,18 @@ paths = [
   '''^packages/warren-server/tests/unit/git/test_github_app\.py$''',
 ]
 regexes = ['''^ghs_liveTokenValue123$''', '''^ghs_xxx$''']
+
+[[allowlists]]
+description = "Deterministic KMS-envelope test vectors (counting-byte data keys, fake wrapped keys)"
+condition = "AND"
+paths = ['''^packages/warren-server/images/ecs-base/secrets-decrypt/testdata/vector(-git-init)?\.json$''']
+regexes = [
+  '''^AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=$''',
+  '''^ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=$''',
+  '''^AQJmYWtlLWttcy1jaXBoZXJ0ZXh0LWJsb2L/$''',
+  '''^Z2l0LWluaXQtd3JhcHBlZC1rZXk=$''',
+  '''^v1:eu-west-1:AQJmYWtlLWttcy1jaXBoZXJ0ZXh0LWJsb2L/:''',
+  '''^v1:eu-west-1:Z2l0LWluaXQtd3JhcHBlZC1rZXk=:''',
+  '''^Z2hwX2V4YW1wbGU=$''',
+  '''^Z2hwX2Nsb25lX29ubHk=$''',
+]

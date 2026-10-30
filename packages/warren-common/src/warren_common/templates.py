@@ -5,7 +5,7 @@ separate "intent" type), so resolving "develop" or "develop.claude" means
 walking from the root, merging each level's explicitly-set fields onto the
 accumulated parent as we go:
 
-- scalars (description, docker_image, app, ecs_cpu, ecs_memory,
+- scalars (description, docker_image, app, ecs_cpu, ecs_memory, ecs_storage,
   ecs_image, idle_ttl_seconds, idle_destroy_seconds, seed_prompt):
   child's value wins if the child set it, else the parent's carries through.
 - lists (mounts, secrets, docker_networks, harnesses): parent's items first, then the

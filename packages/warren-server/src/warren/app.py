@@ -35,6 +35,7 @@ from warren.preflight import run_preflight
 from warren.registry.reaper import run_reaper
 from warren.registry.registry import WorkspaceRegistry
 from warren.registry.store import (
+    EbsSnapshotStore,
     LaunchAttemptStore,
     OperationStore,
     WorkspaceStore,
@@ -91,8 +92,19 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
                 retention_days=settings.efs_retention_days,
                 settings=settings,
             )
+        _ebs = None
+        from warren.runtime.ebs import EBSVolumes, storage_configured  # noqa: PLC0415
+
+        if storage_configured(settings, "ebs"):
+            # EBS storage (WARREN_ECS_WORKSPACE_STORAGE=ebs, or templates opting in with
+            # ecs_storage: ebs); its snapshot store is wired once the database is open.
+            _ebs = EBSVolumes(server_id=settings.server_id, settings=settings)
         runtime = ECSRuntime(
-            server_id=settings.server_id, settings=settings, volume=_efs_volume, volumes=_owner_volumes
+            server_id=settings.server_id,
+            settings=settings,
+            volume=_efs_volume,
+            volumes=_owner_volumes,
+            ebs=_ebs,
         )
     elif settings.runtime_type == "docker":
         from warren_common.runtime.docker import DockerRuntime  # noqa: PLC0415
@@ -127,6 +139,17 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
             return storage_key_from_extra(deserialize_spec_extra(ws.spec_json)) if ws else None
 
         runtime.storage_key_of = _storage_key_of
+
+        async def _storage_of(workspace_id: str) -> str | None:
+            from warren.registry.registry import deserialize_spec_extra  # noqa: PLC0415
+            from warren.runtime.ebs import storage_from_extra  # noqa: PLC0415
+
+            ws = await store.get(workspace_id)
+            return storage_from_extra(deserialize_spec_extra(ws.spec_json)) if ws else None
+
+        runtime.storage_of = _storage_of
+        if runtime.ebs is not None:
+            runtime.ebs.snapshot_store = EbsSnapshotStore(db)
         from warren.secrets import store as secret_store  # noqa: PLC0415
         from warren.secrets.cipher import LocalCipher  # noqa: PLC0415
 
@@ -321,6 +344,23 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
         except Exception:
             log.exception("ecs_orphan_sweep_spawn_failed")
 
+    app.state.ebs_sweep_task = None
+    ebs_interval_s = float(getattr(settings, "ecs_ebs_sweep_interval_seconds", 0) or 0)
+    if settings.runtime_type == "ecs" and getattr(runtime, "ebs", None) is not None and ebs_interval_s > 0:
+        try:
+            from warren.registry.ebs_sweep import run_ebs_sweep  # noqa: PLC0415
+
+            app.state.ebs_sweep_task = asyncio.create_task(
+                run_ebs_sweep(
+                    registry,
+                    interval_seconds=ebs_interval_s,
+                    min_age_seconds=settings.ecs_orphan_sweep_min_age_seconds,
+                )
+            )
+            log.info("ebs_sweep_started", interval_s=ebs_interval_s)
+        except Exception:
+            log.exception("ebs_sweep_spawn_failed")
+
     from warren.control_mcp import new_session_manager  # noqa: PLC0415
 
     app.state.mcp_session_manager = new_session_manager()
@@ -329,6 +369,15 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
         async with app.state.mcp_session_manager.run():
             yield
     finally:
+        ebs_task = getattr(app.state, "ebs_sweep_task", None)
+        if ebs_task is not None:
+            ebs_task.cancel()
+            try:
+                await ebs_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("ebs_sweep_shutdown_error")
         sweep_task = getattr(app.state, "ecs_orphan_sweep_task", None)
         if sweep_task is not None:
             sweep_task.cancel()

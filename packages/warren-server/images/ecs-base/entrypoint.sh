@@ -1,20 +1,46 @@
 #!/bin/sh
 set -e
 
-# Secrets arrive as a file the control plane wrote onto this workspace's volume just
+# EFS mode: secrets arrive as a file the control plane wrote onto this workspace's volume just
 # before RunTask (runtime/ecs_secrets.py). Export them, keep a root-only copy for ECS
 # Exec sessions (warren-session) when root, and delete the file, all before anything
 # workspace-controlled runs. git-init's clone credentials are never loaded here; its
 # file is normally gone already and is deleted unread in case it isn't.
 . /usr/local/lib/warren/secrets.sh
-if [ "$(/usr/bin/id -u)" = 0 ]; then
+# EBS mode (runtime/ecs_kms_secrets.py): there is no volume to drop a file on before the
+# task starts, so the secrets arrive as KMS-wrapped ciphertext in WARREN_SECRETS_BLOB.
+# warren-secrets-decrypt unwraps it with the task role and prints the same NAME=<base64>
+# lines the file uses, parsed by warren_secrets_load without evaluation. As root they go
+# straight to the root-only copy warren-session reads; otherwise to a private temp file
+# deleted right after loading. Fails closed. The blob is unset before anything else runs.
+if [ -n "${WARREN_SECRETS_BLOB:-}" ]; then
+    if [ "$(/usr/bin/id -u)" = 0 ]; then
+        _ws_out=/run/warren/secrets.env
+        (umask 077 && /bin/mkdir -p /run/warren && /bin/rm -f "$_ws_out" \
+            && /usr/local/bin/warren-secrets-decrypt workspace > "$_ws_out") \
+            || { /bin/rm -f "$_ws_out"; echo "entrypoint: cannot decrypt workspace secrets" >&2; exit 1; }
+    else
+        _ws_out=$(umask 077 && /bin/mktemp) || { echo "entrypoint: cannot create temp file" >&2; exit 1; }
+        /usr/local/bin/warren-secrets-decrypt workspace > "$_ws_out" \
+            || { /bin/rm -f "$_ws_out"; echo "entrypoint: cannot decrypt workspace secrets" >&2; exit 1; }
+    fi
+    unset WARREN_SECRETS_BLOB
+    warren_secrets_load "$_ws_out"
+    [ "$_ws_out" = /run/warren/secrets.env ] || /bin/rm -f "$_ws_out"
+    unset _ws_out
+    # Nothing on an EBS volume was written by the control plane: a secrets file there
+    # is a leftover or planted, so it is deleted unread (below) rather than loaded.
+    _ws_ebs=1
+elif [ "$(/usr/bin/id -u)" = 0 ]; then
     warren_secrets_take /var/lib/warren/.warren workspace.env /run/warren/secrets.env
 else
     warren_secrets_take /var/lib/warren/.warren workspace.env
 fi
 if [ -d /var/lib/warren/.warren ] && [ ! -L /var/lib/warren/.warren ]; then
     /bin/rm -f /var/lib/warren/.warren/git-init.env
+    [ -z "${_ws_ebs:-}" ] || /bin/rm -f /var/lib/warren/.warren/workspace.env
 fi
+unset _ws_ebs
 
 # AD3: started as root (unless the task definition sets `user`), take ownership of the
 # volume mount points, then re-exec as warren. Nothing workspace-controlled runs as root.

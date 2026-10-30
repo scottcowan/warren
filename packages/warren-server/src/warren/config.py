@@ -267,6 +267,40 @@ class WarrenSettings(BaseSettings):
     def _parse_owner_storage(cls, v: object) -> object:
         return parse_owner_storage(v)
 
+    # WARREN_ECS_WORKSPACE_STORAGE: the deployment-wide default for a new ECS workspace's
+    # /var/lib/warren volume (runtime/ebs.py). "efs": a per-workspace EFS access point, as
+    # above. "ebs": an ECS-managed EBS volume created at launch, snapshotted on every
+    # stop and restored from that snapshot on the next launch, deleted with all its
+    # snapshots on destroy. A template may pick either with `ecs_storage` when the
+    # deployment has that mode configured; a workspace keeps the mode it was created with.
+    ecs_workspace_storage: Literal["efs", "ebs"] = "efs"
+    # ECS infrastructure role ECS assumes to create/attach/delete the volumes
+    # (AmazonECSInfrastructureRolePolicyForVolumes); passed via iam:PassRole.
+    ecs_ebs_infra_role_arn: str = ""
+    ecs_ebs_size_gib: int = Field(default=20, ge=1, le=16384)
+    ecs_ebs_volume_type: Literal["gp3", "gp2", "io1", "io2", "st1", "sc1", "standard"] = "gp3"
+    # Must never change for a deployment with existing snapshots: a volume restored from
+    # a snapshot has to be mounted with the filesystem type it was created with.
+    ecs_ebs_filesystem_type: Literal["ext4", "xfs"] = "ext4"
+    # Volumes (and their snapshots) are always encrypted; empty means aws/ebs.
+    ecs_ebs_kms_key_id: str = ""
+    # MiB/s at which a restored volume is hydrated from its snapshot (100-300); unset
+    # leaves the default lazy loading.
+    ecs_ebs_volume_initialization_rate: int | None = Field(default=None, ge=100, le=300)
+    # How long a relaunch waits for the workspace's latest snapshot to complete before
+    # failing with a retryable 503 (error "workspace_volume_not_ready", Retry-After); the
+    # snapshot keeps going. Keep it below client request timeouts, like the start wait.
+    ecs_ebs_snapshot_wait_seconds: float = 45.0
+    # How long stop/destroy wait for the task to stop and its volume to detach before
+    # leaving the snapshot/delete to the next launch or the volume sweep.
+    ecs_ebs_detach_wait_seconds: float = 180.0
+    ecs_ebs_poll_interval_seconds: float = 5.0
+    # Sweep of this server's leftover volumes/snapshots (runtime/ebs.py); 0 disables.
+    ecs_ebs_sweep_interval_seconds: float = 900.0
+    # Symmetric KMS key for EBS-mode secrets delivery (runtime/ecs_kms_secrets.py): the
+    # control plane only calls kms:GenerateDataKey, the task role kms:Decrypt.
+    ecs_secrets_kms_key_id: str = ""
+
     # Issue #11: `expires_at` existed in the tokens schema and in the query that resolves
     # a token to a user, but nothing ever wrote a value into it, so every minted token was
     # effectively permanent. This is the TTL applied at every token-creation site (bootstrap,

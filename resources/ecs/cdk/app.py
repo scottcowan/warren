@@ -38,6 +38,16 @@ Context variables (pass via --context or cdk.json):
                              str  (default: "")    Comma-separated principals allowed to assume
                                                    the break-glass role; empty trusts the account root
     break_glass_require_mfa  bool (default: true)  Require MFA to assume the break-glass role
+    workspace_storage       str  (default: efs)   Default ECS workspace volume
+                                                   (WARREN_ECS_WORKSPACE_STORAGE): efs | ebs
+    enable_ebs_storage      bool (default: false) Provision EBS workspace storage so templates
+                                                   may pick `ecs_storage: ebs`; implied by
+                                                   workspace_storage=ebs
+    ebs_kms_key_arn         str  (default: "")    KMS key ARN for EBS volume encryption; empty
+                                                   uses aws/ebs
+    secrets_kms_key_arn     str  (default: "")    KMS key ARN for EBS-mode secrets delivery;
+                                                   empty creates one (with rotation)
+    ebs_size_gib            int  (default: 20)    Size of a new workspace's EBS volume
 """
 import aws_cdk as cdk
 from warren_stack import WarrenECSStack
@@ -98,6 +108,18 @@ if break_glass_mfa_raw is None or isinstance(break_glass_mfa_raw, bool):
 else:
     break_glass_require_mfa = str(break_glass_mfa_raw).lower() not in ("false", "0", "no")
 
+workspace_storage = app.node.try_get_context("workspace_storage") or "efs"
+enable_ebs_raw = app.node.try_get_context("enable_ebs_storage")
+if enable_ebs_raw is None:
+    enable_ebs_storage = False
+elif isinstance(enable_ebs_raw, bool):
+    enable_ebs_storage = enable_ebs_raw
+else:
+    enable_ebs_storage = str(enable_ebs_raw).lower() in ("true", "1", "yes")
+ebs_kms_key_arn = app.node.try_get_context("ebs_kms_key_arn") or ""
+secrets_kms_key_arn = app.node.try_get_context("secrets_kms_key_arn") or ""
+ebs_size_gib = int(app.node.try_get_context("ebs_size_gib") or 20)
+
 WarrenECSStack(
     app,
     "WarrenECSStack",
@@ -117,6 +139,11 @@ WarrenECSStack(
     exec_owner_principal_tag=exec_owner_principal_tag,
     break_glass_principal_arns=break_glass_principal_arns,
     break_glass_require_mfa=break_glass_require_mfa,
+    workspace_storage=workspace_storage,
+    enable_ebs_storage=enable_ebs_storage,
+    ebs_kms_key_arn=ebs_kms_key_arn,
+    secrets_kms_key_arn=secrets_kms_key_arn,
+    ebs_size_gib=ebs_size_gib,
 )
 
 app.synth()

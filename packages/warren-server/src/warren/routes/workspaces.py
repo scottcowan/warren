@@ -75,13 +75,18 @@ _PROVISION_ERROR_STATUS: dict[str, int] = {
     "workspace_starting": 503,
     # A workspace from before per-user ECS storage, or an owner no longer configured.
     "workspace_storage_unavailable": 409,
+    # EBS storage (runtime/ebs.py): the latest snapshot is still completing (retry after
+    # Retry-After), or the workspace's snapshot is gone and its data can't be restored.
+    "workspace_volume_not_ready": 503,
+    "workspace_volume_lost": 409,
 }
 
 
 def _provision_http_error(exc: ProvisionError) -> HTTPException:
     """Map a ProvisionError to an HTTPException.
 
-    BB4: "workspace_starting" carries Retry-After; clients should re-POST
+    BB4: "workspace_starting" (and EBS's "workspace_volume_not_ready") carries
+    Retry-After; clients should re-POST
     connect/ensure_running after it (the server-side wait is bounded by
     ecs_start_wait_timeout_seconds, below client request timeouts).
     """
@@ -309,11 +314,12 @@ async def _provision_workspace(
     # AWS identity on ECS, so it lines up with who can actually
     # ecs:ExecuteCommand/SSM-tunnel into the resulting task.
     secret_owner_id = await resolve_owner_id(request)
-    storage_key = _require_owner_storage(request, settings)
 
     # Resolve image from settings/project config if available, else use placeholder
     image = await _resolve_image(body, request)
     template_cfg = await _resolve_template_cfg(body, request)
+    ecs_storage = _resolve_ecs_storage(template_cfg, settings)
+    storage_key = _require_owner_storage(request, settings, ecs_storage)
     secret_names = [ref.name for ref in template_cfg.secrets] if template_cfg is not None else []
     if template_cfg is not None:
         from warren_common.git_crypt import GitCryptError, check_key_not_delivered
@@ -437,6 +443,7 @@ async def _provision_workspace(
         secret_names=secret_names,
         owner_id=secret_owner_id,
         storage_key=storage_key,
+        ecs_storage=ecs_storage,
         folders=folders,
         app=app_cmd,
         harnesses=harnesses,
@@ -550,9 +557,39 @@ async def _provision_workspace(
     return WorkspaceView.from_workspace(ws)
 
 
-def _require_owner_storage(request: Request, settings) -> str:
+def _resolve_ecs_storage(template_cfg, settings) -> str:
+    """The new workspace's volume mode: the template's `ecs_storage`, else the
+    deployment default (WARREN_ECS_WORKSPACE_STORAGE). A template may only pick a mode
+    this deployment has configured (422 template_denied otherwise). "" off ECS."""
+    if settings is None or getattr(settings, "runtime_type", "podman") != "ecs":
+        return ""
+    from warren.runtime.ebs import default_storage, storage_configured  # noqa: PLC0415
+
+    requested = getattr(template_cfg, "ecs_storage", None) if template_cfg is not None else None
+    if requested is None:
+        return default_storage(settings)
+    if not storage_configured(settings, requested):
+        needs = (
+            "WARREN_ECS_EBS_INFRA_ROLE_ARN and WARREN_ECS_SECRETS_KMS_KEY_ID"
+            if requested == "ebs"
+            else "WARREN_EFS_ID or WARREN_ECS_OWNER_STORAGE"
+        )
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "template_denied",
+                "detail": f"the template asks for ecs_storage: {requested}, which this deployment "
+                f"hasn't configured ({needs})",
+            },
+        )
+    return requested
+
+
+def _require_owner_storage(request: Request, settings, ecs_storage: str = "efs") -> str:
     """The caller's WARREN_ECS_OWNER_STORAGE key, or 403 before anything is provisioned.
-    "" when per-user storage isn't configured (or this isn't ECS)."""
+    "" when per-user storage isn't configured (or this isn't ECS). An EBS workspace
+    needs no filesystem, so a user without an entry gets "" (the shared security
+    groups) instead of a 403; one with an entry still runs in their own groups."""
     if settings is None or getattr(settings, "runtime_type", "podman") != "ecs":
         return ""
     storage = getattr(settings, "ecs_owner_storage", None) or {}
@@ -561,6 +598,8 @@ def _require_owner_storage(request: Request, settings) -> str:
     from warren.runtime.ecs_storage import NOT_SET_UP  # noqa: PLC0415
 
     key = getattr(request.state, "aws_principal", "") or ""
+    if ecs_storage == "ebs":
+        return key if key in storage else ""
     if key not in storage:
         raise HTTPException(
             status_code=403,

@@ -20,6 +20,11 @@ locals {
   efs_id              = var.create_efs ? aws_efs_file_system.warren[0].id : ""
   control_plane_image = var.control_plane_image_uri != "" ? var.control_plane_image_uri : var.image_uri
   server_id           = "warren-server-control-plane-${var.env_suffix}"
+  # EBS workspace storage (runtime/ebs.py): provisioned when it is the default or opted in.
+  ebs_enabled = var.enable_ebs_storage || var.workspace_storage == "ebs"
+  secrets_kms_key_arn = local.ebs_enabled ? (
+    var.secrets_kms_key_arn != "" ? var.secrets_kms_key_arn : aws_kms_key.warren_secrets[0].arn
+  ) : ""
 }
 
 # ---------------------------------------------------------------------------
@@ -1179,6 +1184,32 @@ data "aws_iam_policy_document" "workspace_task_role_policy" {
       resources = [var.kms_key_id]
     }
   }
+
+  # EBS storage: warren-secrets-decrypt in the image (entrypoint and git-init) unwraps the
+  # task's WARREN_SECRETS_BLOB with this role, only under warren's encryption context; the
+  # control plane binds each envelope to one workspace and one container. Tasks must reach
+  # KMS: the NAT gateway (Template A) or a com.amazonaws.<region>.kms VPC endpoint.
+  dynamic "statement" {
+    for_each = local.ebs_enabled ? [1] : []
+    content {
+      sid       = "WorkspaceSecretsDecrypt"
+      effect    = "Allow"
+      actions   = ["kms:Decrypt"]
+      resources = [local.secrets_kms_key_arn]
+
+      condition {
+        test     = "Null"
+        variable = "kms:EncryptionContext:warren:workspace_id"
+        values   = ["false"]
+      }
+
+      condition {
+        test     = "ForAllValues:StringEquals"
+        variable = "kms:EncryptionContextKeys"
+        values   = ["warren:workspace_id", "warren:container"]
+      }
+    }
+  }
 }
 
 resource "aws_iam_role" "workspace_task_role" {
@@ -1284,6 +1315,204 @@ resource "aws_iam_role_policy" "task_policy" {
   name   = "WarrenTaskPolicy"
   role   = aws_iam_role.task_role.id
   policy = data.aws_iam_policy_document.task_role_policy.json
+}
+
+# ---------------------------------------------------------------------------
+# EBS workspace storage (warren-server runtime/ebs.py, runtime/ecs_kms_secrets.py), only
+# when local.ebs_enabled. ECS creates and attaches each launch's volume through the
+# infrastructure role below (deleteOnTermination=false, so ECS never deletes it); the
+# control plane snapshots a stopped workspace's volume, deletes it, restores from the
+# snapshot on the next launch and deletes everything on destroy. All scoped by the bare
+# `warren=true` tag runtime/ebs.py puts on every volume and snapshot (same convention as
+# the EFS grants). Fargate allows one EBS volume per task, platform 1.4.0+.
+# ---------------------------------------------------------------------------
+
+data "aws_iam_policy_document" "ecs_infra_trust" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ecs.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "ecs_infra" {
+  count              = local.ebs_enabled ? 1 : 0
+  name               = "warren-ecs-infra-role-${var.env_suffix}"
+  assume_role_policy = data.aws_iam_policy_document.ecs_infra_trust.json
+}
+
+# Lets ECS create/attach/detach/delete only volumes it manages (AmazonECSCreated/
+# AmazonECSManaged tags). Its tag-on-create grant keys on those ECS tags being present,
+# so warren's own volume tags ride along in the same CreateVolume call.
+resource "aws_iam_role_policy_attachment" "ecs_infra_volumes" {
+  count      = local.ebs_enabled ? 1 : 0
+  role       = aws_iam_role.ecs_infra[0].name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSInfrastructureRolePolicyForVolumes"
+}
+
+# The managed policy carries no KMS grants: a customer-managed volume key needs them here.
+data "aws_iam_policy_document" "ecs_infra_kms" {
+  statement {
+    sid       = "EBSVolumeKMS"
+    effect    = "Allow"
+    actions   = ["kms:GenerateDataKeyWithoutPlaintext", "kms:ReEncrypt*", "kms:Decrypt", "kms:DescribeKey"]
+    resources = [var.ebs_kms_key_arn]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["ec2.${var.aws_region}.amazonaws.com"]
+    }
+  }
+
+  statement {
+    sid       = "EBSVolumeKMSGrant"
+    effect    = "Allow"
+    actions   = ["kms:CreateGrant"]
+    resources = [var.ebs_kms_key_arn]
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["ec2.${var.aws_region}.amazonaws.com"]
+    }
+    condition {
+      test     = "Bool"
+      variable = "kms:GrantIsForAWSResource"
+      values   = ["true"]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "ecs_infra_kms" {
+  count  = local.ebs_enabled && var.ebs_kms_key_arn != "" ? 1 : 0
+  name   = "WarrenEcsInfraKmsPolicy"
+  role   = aws_iam_role.ecs_infra[0].id
+  policy = data.aws_iam_policy_document.ecs_infra_kms.json
+}
+
+# Secrets delivery key: the control plane may only GenerateDataKey, the workspace task
+# role only Decrypt, both only under warren's encryption context.
+resource "aws_kms_key" "warren_secrets" {
+  count               = local.ebs_enabled && var.secrets_kms_key_arn == "" ? 1 : 0
+  description         = "warren ${var.env_suffix}: EBS-mode workspace secrets delivery"
+  enable_key_rotation = true
+  tags = {
+    warren = "true"
+  }
+}
+
+# Its own policy document, so task_role_policy's only kms:Decrypt stays ECS Exec's.
+data "aws_iam_policy_document" "ebs_task_role_policy" {
+  statement {
+    sid       = "EBSPassInfraRole"
+    effect    = "Allow"
+    actions   = ["iam:PassRole"]
+    resources = local.ebs_enabled ? [aws_iam_role.ecs_infra[0].arn] : ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "iam:PassedToService"
+      values   = ["ecs.amazonaws.com"]
+    }
+  }
+
+  # Describe* has no resource-level permissions; runtime/ebs.py filters on its own tags.
+  statement {
+    sid       = "EBSDescribe"
+    effect    = "Allow"
+    actions   = ["ec2:DescribeVolumes", "ec2:DescribeSnapshots"]
+    resources = ["*"]
+  }
+
+  # CreateSnapshot authorizes against both the source volume and the new snapshot.
+  statement {
+    sid       = "EBSSnapshotManagedVolume"
+    effect    = "Allow"
+    actions   = ["ec2:CreateSnapshot"]
+    resources = ["arn:aws:ec2:*:*:volume/*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/warren"
+      values   = ["true"]
+    }
+  }
+
+  statement {
+    sid       = "EBSCreateTaggedSnapshot"
+    effect    = "Allow"
+    actions   = ["ec2:CreateSnapshot"]
+    resources = ["arn:aws:ec2:*::snapshot/*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:RequestTag/warren"
+      values   = ["true"]
+    }
+  }
+
+  statement {
+    sid       = "EBSTagSnapshotOnCreate"
+    effect    = "Allow"
+    actions   = ["ec2:CreateTags"]
+    resources = ["arn:aws:ec2:*::snapshot/*"]
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:CreateAction"
+      values   = ["CreateSnapshot"]
+    }
+  }
+
+  statement {
+    sid       = "EBSDeleteManaged"
+    effect    = "Allow"
+    actions   = ["ec2:DeleteVolume", "ec2:DeleteSnapshot"]
+    resources = ["arn:aws:ec2:*:*:volume/*", "arn:aws:ec2:*::snapshot/*"]
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/warren"
+      values   = ["true"]
+    }
+  }
+
+  # No kms:Decrypt: the control plane only wraps, the task role unwraps.
+  statement {
+    sid       = "SecretsGenerateDataKey"
+    effect    = "Allow"
+    actions   = ["kms:GenerateDataKey"]
+    resources = local.ebs_enabled ? [local.secrets_kms_key_arn] : ["*"]
+    condition {
+      test     = "Null"
+      variable = "kms:EncryptionContext:warren:workspace_id"
+      values   = ["false"]
+    }
+    condition {
+      test     = "ForAllValues:StringEquals"
+      variable = "kms:EncryptionContextKeys"
+      values   = ["warren:workspace_id", "warren:container"]
+    }
+  }
+
+  # Snapshotting a volume encrypted with a customer-managed key goes through that key.
+  dynamic "statement" {
+    for_each = var.ebs_kms_key_arn != "" ? [1] : []
+    content {
+      sid       = "EBSVolumeKMS"
+      effect    = "Allow"
+      actions   = ["kms:CreateGrant", "kms:GenerateDataKeyWithoutPlaintext", "kms:ReEncrypt*", "kms:Decrypt", "kms:DescribeKey"]
+      resources = [var.ebs_kms_key_arn]
+      condition {
+        test     = "StringEquals"
+        variable = "kms:ViaService"
+        values   = ["ec2.${var.aws_region}.amazonaws.com"]
+      }
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "ebs_task_policy" {
+  count  = local.ebs_enabled ? 1 : 0
+  name   = "WarrenEbsStoragePolicy"
+  role   = aws_iam_role.task_role.id
+  policy = data.aws_iam_policy_document.ebs_task_role_policy.json
 }
 
 # ---------------------------------------------------------------------------
@@ -1473,7 +1702,7 @@ resource "aws_ecs_task_definition" "warren_server" {
       # ECSRuntime.provision()'s existing EFS-mount wiring (already coded,
       # previously left dormant here). Empty string when create_efs = false,
       # which keeps ECSRuntime(volume=None) — ephemeral task storage only.
-      environment = [
+      environment = concat([
         { name = "WARREN_SERVER_ID", value = local.server_id },
         { name = "WARREN_RUNTIME_TYPE", value = "ecs" },
         { name = "WARREN_ECS_CLUSTER", value = aws_ecs_cluster.warren.name },
@@ -1499,7 +1728,18 @@ resource "aws_ecs_task_definition" "warren_server" {
         # R19: the IAM resource patterns here (task-definition families, log groups) are
         # built from var.ecs_resource_prefix, so the app must run with the same prefix.
         { name = "WARREN_ECS_RESOURCE_PREFIX", value = var.ecs_resource_prefix },
-      ]
+        ],
+        # EBS workspace storage (runtime/ebs.py): the default mode, and what an EBS launch
+        # needs. Empty role/key when EBS isn't enabled, so a template asking for
+        # `ecs_storage: ebs` is refused (422 template_denied).
+        [
+          { name = "WARREN_ECS_WORKSPACE_STORAGE", value = var.workspace_storage },
+          { name = "WARREN_ECS_EBS_INFRA_ROLE_ARN", value = local.ebs_enabled ? aws_iam_role.ecs_infra[0].arn : "" },
+          { name = "WARREN_ECS_SECRETS_KMS_KEY_ID", value = local.secrets_kms_key_arn },
+          { name = "WARREN_ECS_EBS_SIZE_GIB", value = tostring(var.ebs_size_gib) },
+        ],
+        var.ebs_kms_key_arn != "" ? [{ name = "WARREN_ECS_EBS_KMS_KEY_ID", value = var.ebs_kms_key_arn }] : [],
+      )
 
       logConfiguration = {
         logDriver = "awslogs"

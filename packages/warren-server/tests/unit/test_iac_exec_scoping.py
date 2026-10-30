@@ -242,6 +242,10 @@ def _workspace_role_actions() -> dict[str, set[str]]:
         'data "aws_iam_policy_document" "workspace_task_role_policy"',
         'resource "aws_iam_role" "workspace_task_role"',
     )
+    # Condition keys/values (e.g. kms:EncryptionContextKeys) aren't actions.
+    tf = "\n".join(
+        line for line in tf.splitlines() if not re.match(r"\s*(variable|values)\s*=", line)
+    )
     cdk = _between(
         (_ECS / "cdk" / "warren_stack.py").read_text(),
         '"WarrenWorkspaceTaskPolicy",',

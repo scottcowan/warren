@@ -65,7 +65,13 @@ def test_cdk_grants_no_ssm_for_workspace_secrets():
     cdk = (_ECS / "cdk" / "warren_stack.py").read_text()
     for gone in ('"ssm:GetParameters"', '"ssm:PutParameter"', "WARREN_KMS_KEY_ID", "ssm_kms_key_arn"):
         assert gone not in cdk
-    assert '"kms:Decrypt",\n' not in cdk[cdk.index('"WarrenTaskPolicy"') :]
+    # The control plane's only kms:Decrypt is ECS Exec's (one line, kms_key_id) and, with
+    # a customer-managed EBS key, EBSVolumeKMS in its own policy (via EC2 only).
+    task_policy = cdk[cdk.index('"WarrenTaskPolicy"') : cdk.index('"WarrenEbsStoragePolicy"')]
+    assert '"kms:Decrypt",\n' not in task_policy
+    ebs_policy = cdk[cdk.index('"WarrenEbsStoragePolicy"') : cdk.index("CfnOutputs — WARREN_ECS_*")]
+    assert ebs_policy.count('"kms:Decrypt"') == 1
+    assert '"kms:ViaService": f"ec2.{self.region}.amazonaws.com"' in ebs_policy[ebs_policy.index('"kms:Decrypt"') :]
     assert "root_ap = efs_fs.add_access_point(" in cdk
     assert 'value="/mnt/warren-efs-root" if root_ap is not None else ""' in cdk
 

@@ -6,9 +6,11 @@ pattern: same module docstring format, same import block, same class layout.
 Security invariants (see 07-RESEARCH.md threat model):
     - Secrets live only in warren's encrypted store. They reach a task as a
       file on its own EFS volume, written just before RunTask and consumed
-      (then deleted) by the image's entrypoint and git-init (ecs_secrets.py)
-      -- never as plaintext `run_task` overrides (T-07-01, D-07), and never in
-      the task definition.
+      (then deleted) by the image's entrypoint and git-init (ecs_secrets.py),
+      or, for an EBS-backed workspace (runtime/ebs.py), as per-container
+      KMS-wrapped ciphertext in the overrides (ecs_kms_secrets.py) -- never as
+      plaintext `run_task` overrides (T-07-01, D-07), and never in the task
+      definition.
     - cpu/memory validated against VALID_FARGATE_PAIRS before any AWS call
       (T-07-02, D-02).
     - Task ARNs read from warren's own SQLite store (T-07-04).
@@ -42,6 +44,12 @@ from warren.runtime.ecs_git import (
     GitInitPlan,
     build_git_init_plan,
 )
+from warren.runtime.ebs import (
+    VOLUME_NAME,
+    EBSVolumes,
+    storage_configured,
+)
+from warren.runtime.ecs_kms_secrets import BLOB_ENV, seal_with_kms
 from warren.runtime.ecs_storage import (
     LEGACY,
     NOT_SET_UP,
@@ -73,6 +81,16 @@ from warren_common.runtime.base import (
 log = structlog.get_logger(__name__)
 
 _STARTING_STATES = frozenset({"PROVISIONING", "PENDING", "ACTIVATING"})
+_ROLE_ARN_RE = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role/[\w+=,.@/-]{1,512}$")
+
+# RunTask rejects overrides whose JSON exceeds this many characters.
+MAX_OVERRIDES_BYTES = 8192
+
+
+class OverridesTooLarge(ProvisionError):
+    """The RunTask overrides (env + secrets envelopes) exceed ECS's 8 KiB limit."""
+
+    reason = "template_denied"
 
 # ---------------------------------------------------------------------------
 # Valid Fargate cpu/memory combinations (RESEARCH.md Pitfall 3)
@@ -129,6 +147,7 @@ class ECSRuntime:
         volume: WorkspaceVolume | None = None,
         volumes: dict[str, WorkspaceVolume] | None = None,
         launch_store: Any = None,
+        ebs: EBSVolumes | None = None,
     ) -> None:
         self.server_id = server_id
         # AI3: get/put/delete of the per-workspace launch identity; app.py wires the
@@ -160,6 +179,13 @@ class ECSRuntime:
         # async (workspace_id) -> storage key or None, wired by app.py from the
         # workspace's persisted spec; how stop/destroy find a workspace's filesystem.
         self.storage_key_of: Any = None
+        # EBS storage (runtime/ebs.py): the snapshot lifecycle, wired by app.py when the
+        # deployment has it configured, and async (workspace_id) -> "efs" | "ebs" | None,
+        # the mode the workspace was created with (from its persisted spec), so stop/
+        # destroy follow that mode even if WARREN_ECS_WORKSPACE_STORAGE changed since.
+        self.ebs: EBSVolumes | None = ebs
+        self.storage_of: Any = None
+        self._kms: Any = None
 
     @property
     def started_by(self) -> str:
@@ -210,7 +236,17 @@ class ECSRuntime:
             session = boto3.Session(region_name=region)
             self._ecs = session.client("ecs")
             self._logs = session.client("logs")
+            if self._kms is None:
+                self._kms = session.client("kms")
         return self._ecs
+
+    @staticmethod
+    def _spec_storage(spec: WorkspaceSpec) -> str:
+        return "ebs" if getattr(spec, "ecs_storage", "") == "ebs" else "efs"
+
+    async def _workspace_storage(self, workspace_id: str) -> str:
+        mode = await self.storage_of(workspace_id) if self.storage_of is not None else None
+        return "ebs" if mode == "ebs" else "efs"
 
     def _shared_placement(self) -> Placement:
         mount = getattr(self._settings, "efs_local_mount_path", "")
@@ -231,9 +267,21 @@ class ECSRuntime:
             security_group_ids=list(cfg.security_group_ids),
         )
 
+    def _ebs_placement(self, key: str) -> Placement:
+        """An EBS workspace has no filesystem and no control-plane mount. It runs in its
+        owner's security groups when they have a WARREN_ECS_OWNER_STORAGE entry (keeping
+        that network isolation), else the shared WARREN_ECS_SECURITY_GROUP_IDS."""
+        cfg = self._owner_storage.get(key) if key else None
+        sgs = list(cfg.security_group_ids) if cfg is not None else list(
+            getattr(self._settings, "ecs_security_group_ids", None) or []
+        )
+        return Placement(volume=None, efs_id="", local_mount="", security_group_ids=sgs)
+
     def _placement_for_spec(self, spec: WorkspaceSpec) -> Placement:
         """Where this workspace lives. Raises StorageUnavailable (before any AWS call)
         for a legacy shared-filesystem workspace or an owner with no entry."""
+        if self._spec_storage(spec) == "ebs":
+            return self._ebs_placement(getattr(spec, "storage_key", "") or "")
         if not self._owner_storage:
             return self._shared_placement()
         key = getattr(spec, "storage_key", "") or ""
@@ -246,6 +294,8 @@ class ECSRuntime:
     async def _placement_for_workspace(self, workspace_id: str) -> Placement | None:
         """For stop/destroy: the workspace's own placement, or None when it can't be
         known (legacy row, owner since removed) -- then nothing touches any filesystem."""
+        if await self._workspace_storage(workspace_id) == "ebs":
+            return self._ebs_placement("")
         if not self._owner_storage:
             return self._shared_placement()
         key = await self.storage_key_of(workspace_id) if self.storage_key_of is not None else None
@@ -293,6 +343,28 @@ class ECSRuntime:
             raise ProvisionError(
                 f"cannot write secrets onto workspace {workspace_id}'s volume: {type(exc).__name__}"
             ) from exc
+
+    async def _secrets_blobs(
+        self, workspace_id: str, delivered: dict[str, str], git_plan: GitInitPlan | None
+    ) -> dict[str, str]:
+        """EBS storage: one KMS envelope per container that has secrets, split exactly
+        like the EFS files (git-init's clone credentials only to git-init)."""
+        init_names = set(git_plan.init_secret_names) if git_plan is not None else set()
+        split = {
+            "workspace": {k: v for k, v in delivered.items() if k not in init_names},
+            GIT_INIT_CONTAINER: {k: v for k, v in delivered.items() if k in init_names},
+        }
+        self._ensure_clients()
+        key_id = getattr(self._settings, "ecs_secrets_kms_key_id", "") or ""
+        region = getattr(self._settings, "aws_region", "us-east-1") or "us-east-1"
+        blobs: dict[str, str] = {}
+        for container, values in split.items():
+            if values:
+                blobs[container] = await seal_with_kms(
+                    self._kms, key_id, values,
+                    workspace_id=workspace_id, container=container, region=region,
+                )
+        return blobs
 
     async def _remove_secrets(self, workspace_id: str, placement: Placement | None) -> None:
         if placement is None or not placement.local_mount or placement.volume is None:
@@ -350,7 +422,24 @@ class ECSRuntime:
             raise RuntimeUnreachable(
                 f"ECS cluster not found or inactive: {cluster!r}"
             )
+        if getattr(self._settings, "ecs_workspace_storage", "efs") == "ebs":
+            problem = self._ebs_settings_problem()
+            if problem:
+                raise RuntimeUnreachable(f"WARREN_ECS_WORKSPACE_STORAGE=ebs: {problem}")
         self._preflight_ok = True
+
+    def _ebs_settings_problem(self) -> str:
+        """Why EBS storage can't be used on this deployment, or "" when it can."""
+        role = getattr(self._settings, "ecs_ebs_infra_role_arn", "") or ""
+        if not role:
+            return "set WARREN_ECS_EBS_INFRA_ROLE_ARN (the ECS infrastructure role for volumes)"
+        if not _ROLE_ARN_RE.match(role):
+            return f"WARREN_ECS_EBS_INFRA_ROLE_ARN {role!r} is not an IAM role ARN"
+        if not getattr(self._settings, "ecs_secrets_kms_key_id", ""):
+            return "set WARREN_ECS_SECRETS_KMS_KEY_ID (secrets are delivered as KMS ciphertext)"
+        if self.ebs is None or not storage_configured(self._settings, "ebs"):
+            return "EBS storage is not wired on this server"
+        return ""
 
     def _validate_cpu_memory(self, cpu: str, memory: str) -> None:
         """Validate cpu/memory against VALID_FARGATE_PAIRS; raise ProvisionError if invalid."""
@@ -378,11 +467,18 @@ class ECSRuntime:
         # Validate before any AWS call (T-07-02).
         self._validate_cpu_memory(resolved_cpu, resolved_memory)
 
+        ebs = self._spec_storage(spec) == "ebs"
+        if ebs:
+            problem = self._ebs_settings_problem()
+            if problem:
+                raise ProvisionError(f"this workspace uses EBS storage, but {problem}")
+
         # Exactly the template-declared secrets this workspace's OWNER has, decrypted
         # from warren's own store. They reach the task only as a file on its EFS volume
-        # (runtime/ecs_secrets.py), written just before RunTask.
+        # (runtime/ecs_secrets.py), written just before RunTask, or on EBS storage as
+        # KMS ciphertext in the overrides (runtime/ecs_kms_secrets.py).
         delivered = await self._resolve_secrets(spec)
-        if delivered and not (placement.volume is not None and placement.local_mount):
+        if delivered and not ebs and not (placement.volume is not None and placement.local_mount):
             raise ProvisionError(
                 "this workspace declares secrets, and ECS delivers them through its EFS "
                 "volume: set WARREN_EFS_ID and WARREN_EFS_LOCAL_MOUNT_PATH"
@@ -390,6 +486,28 @@ class ECSRuntime:
 
         family = _slug(spec.image, self._resource_prefix)
         git_plan = build_git_init_plan(spec, frozenset(delivered))
+
+        if ebs:
+            assert self.ebs is not None
+            # A launch from an earlier attempt that is still live is adopted as is; its
+            # volume is attached, so there is nothing to settle or restore.
+            generation = getattr(spec, "provision_generation", "") or ""
+            adopted_arn = await self._find_live_task(spec.workspace_id, exclude=generation)
+            if adopted_arn:
+                log.info("ecs_adopted_task", workspace_id=spec.workspace_id, task_arn=adopted_arn)
+                return WorkspaceHandle(workspace_id=spec.workspace_id, runtime_id=adopted_arn, root_path="")
+            # Snapshot the previous task's retained volume if nothing did yet, and wait
+            # for the newest snapshot to complete; None = first launch, empty volume.
+            snapshot_id = await self.ebs.restore_point(spec.workspace_id)
+            volume_config = self.ebs.volume_configuration(
+                spec.workspace_id,
+                owner_id=getattr(spec, "owner_id", "") or None,
+                snapshot_id=snapshot_id,
+            )
+            return await self._register_and_run(
+                spec, None, resolved_cpu, resolved_memory, family, delivered, git_plan,
+                placement, volume_config=volume_config,
+            )
 
         # D-10: EFS is opt-in — only activate when a volume is wired in
         access_point_id: str | None = None
@@ -429,7 +547,11 @@ class ECSRuntime:
         delivered: dict[str, str],
         git_plan: GitInitPlan | None = None,
         placement: Placement | None = None,
+        *,
+        volume_config: dict[str, Any] | None = None,
     ) -> WorkspaceHandle:
+        """`volume_config`: EBS storage's RunTask volume configuration (runtime/ebs.py);
+        the task definition then declares the volume `configuredAtLaunch`."""
         placement = placement or self._shared_placement()
         ecs = self._ensure_clients()
         await self._ensure_log_group(f"/{self._resource_prefix}/{self.server_id}")
@@ -488,7 +610,12 @@ class ECSRuntime:
                 "readOnly": False,
             }
         ]
-        if access_point_id:
+        if volume_config is not None:
+            # Nothing workspace-specific in the definition, so it stays cacheable: the
+            # volume itself (size or snapshot, tags) is in RunTask's volumeConfigurations.
+            register_kwargs["volumes"] = [{"name": VOLUME_NAME, "configuredAtLaunch": True}]
+            register_kwargs["containerDefinitions"][0]["mountPoints"] = mount_points
+        elif access_point_id:
             efs_id_val = placement.efs_id
             register_kwargs["volumes"] = [
                 {
@@ -508,7 +635,7 @@ class ECSRuntime:
             register_kwargs["containerDefinitions"][0]["mountPoints"] = mount_points
 
         if git_plan is not None:
-            if not access_point_id:
+            if not access_point_id and volume_config is None:
                 # No EFS: a task-scoped volume still lets the init container
                 # hand the checkout to the workspace container.
                 register_kwargs["volumes"] = [{"name": "warren-workspace"}]
@@ -534,7 +661,8 @@ class ECSRuntime:
 
         # Build environment overrides list — spec.env only. Secrets never flow through
         # here (issue #4): RunTask overrides are recorded in DescribeTasks/CloudTrail, so
-        # secrets go through the workspace's volume instead (_deliver_secrets below).
+        # secrets go through the workspace's volume instead (_deliver_secrets below), or on
+        # EBS storage as KMS envelopes added after the fingerprint (_secrets_blobs below).
         # ecs-base/entrypoint.sh execs WARREN_APP_CMD as PID 1 when set, falling back to
         # `tail -f /dev/null` (idle, awaiting `aws ecs execute-command`) when unset. "bash"
         # is WorkspaceSpec.app's interactive default and has no business being exec'd as
@@ -614,6 +742,7 @@ class ECSRuntime:
                     "task_definition": register_kwargs,
                     "container_overrides": container_overrides,
                     "access_point_id": access_point_id,
+                    "volume_configuration": volume_config,
                 },
                 sort_keys=True,
             ).encode()
@@ -642,6 +771,18 @@ class ECSRuntime:
             if not access_point_id:
                 self._task_def_cache[cache_key] = task_def_arn
 
+        # EBS: the secrets envelopes are random per encryption, so they are kept out of the
+        # fingerprint and persisted with the attempt instead; a retry under the same
+        # clientToken then sends the identical request.
+        blobs: dict[str, str] = {}
+        if volume_config is not None and delivered:
+            blobs = _load_blobs(attempt.get("secrets_blobs") if attempt else None)
+            if not blobs:
+                blobs = await self._secrets_blobs(spec.workspace_id, delivered, git_plan)
+                if attempt:
+                    attempt = {**attempt, "secrets_blobs": json.dumps(blobs, sort_keys=True)}
+                    await self.launch_store.put(spec.workspace_id, attempt)
+
         if not attempt:
             # AM2: a client operationId makes the token deterministic, so a retry of the
             # same operation that lost its launch row is still deduplicated by ECS.
@@ -653,7 +794,32 @@ class ECSRuntime:
                 "task_definition_arn": task_def_arn,
                 "client_token": self._client_token(spec, attempt_id),
             }
+            if blobs:
+                attempt["secrets_blobs"] = json.dumps(blobs, sort_keys=True)
             await self.launch_store.put(spec.workspace_id, attempt)
+
+        if blobs:
+            for override in container_overrides:
+                blob = blobs.get(override["name"])
+                if blob:
+                    override["environment"] = [
+                        *override["environment"],
+                        {"name": BLOB_ENV, "value": blob},
+                    ]
+                    if override["name"] == GIT_INIT_CONTAINER:
+                        # warren-secrets-decrypt's encryption context names the workspace.
+                        override["environment"].append(
+                            {"name": "WARREN_WORKSPACE_ID", "value": spec.workspace_id}
+                        )
+        overrides = {"containerOverrides": container_overrides}
+        size = len(json.dumps(overrides, separators=(",", ":")))
+        if size > MAX_OVERRIDES_BYTES:
+            await self.launch_store.delete(spec.workspace_id)
+            raise OverridesTooLarge(
+                f"this workspace's environment and secrets need {size} bytes of RunTask "
+                f"overrides; ECS allows {MAX_OVERRIDES_BYTES}. Declare fewer or smaller "
+                "secrets or env values"
+            )
 
         # Launch Fargate task.
         cluster = getattr(self._settings, "ecs_cluster", "") or ""
@@ -668,8 +834,12 @@ class ECSRuntime:
         # Immediately before every RunTask, so a relaunch always gets current values and
         # never a stale file. (An exception from RunTask itself may still have launched
         # a task that needs the file, so only a definitive failure below removes it.)
-        await self._deliver_secrets(spec.workspace_id, delivered, git_plan, placement)
+        if volume_config is None:
+            await self._deliver_secrets(spec.workspace_id, delivered, git_plan, placement)
 
+        run_kwargs: dict[str, Any] = {}
+        if volume_config is not None:
+            run_kwargs["volumeConfigurations"] = [volume_config]
         run_resp = await asyncio.to_thread(
             ecs.run_task,
             cluster=cluster,
@@ -682,11 +852,12 @@ class ECSRuntime:
                     "assignPublicIp": assign_public_ip,
                 }
             },
-            overrides={"containerOverrides": container_overrides},
+            overrides=overrides,
             enableExecuteCommand=True,
             tags=self._task_tags(spec),
             startedBy=self.started_by,
             clientToken=attempt["client_token"],
+            **run_kwargs,
         )
 
         # A definitive failure launched nothing, so the next try gets a fresh identity.
@@ -807,6 +978,16 @@ class ECSRuntime:
         stay reconnectable via `ensure_running()`, which launches a fresh
         task against the SAME access point (D-04)."""
         await self._stop_task(handle, reason="warren stop (idle)")
+        if await self._workspace_storage(handle.workspace_id) == "ebs":
+            # Any stop that isn't a destroy (idle reaper, user stop) keeps the data: the
+            # retained volume is snapshotted and deleted. A failure here doesn't fail the
+            # stop; the next launch or the volume sweep finishes it.
+            if self.ebs is not None:
+                try:
+                    await self.ebs.preserve(handle.workspace_id)
+                except Exception:
+                    log.exception("ebs_preserve_failed", workspace_id=handle.workspace_id)
+            return
         await self._remove_secrets(handle.workspace_id, await self._placement_for_workspace(handle.workspace_id))
 
     async def destroy(self, handle: WorkspaceHandle) -> None:
@@ -837,6 +1018,14 @@ class ECSRuntime:
 
         await self._stop_task(handle, reason="warren destroy")
         await self.launch_store.delete(handle.workspace_id)
+        if await self._workspace_storage(handle.workspace_id) == "ebs":
+            # Explicit destroy: every snapshot now, the volume once it detaches. Raising
+            # leaves the row non-terminal so the destroy can be retried; a volume still
+            # attached at the deadline is deleted by the sweep (the row is destroyed).
+            if self.ebs is None:
+                raise ProvisionError("this workspace uses EBS storage, which is not configured here")
+            await self.ebs.purge(handle.workspace_id)
+            return
         await self._remove_secrets(handle.workspace_id, placement)
 
         # D-04: detach sets warren.expires_at tag; does NOT delete the access point
@@ -993,6 +1182,18 @@ class ECSRuntime:
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+def _load_blobs(raw: str | None) -> dict[str, str]:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
+
 
 def _slug(image: str, resource_prefix: str = "warren") -> str:
     """Convert an image string to a safe Fargate task definition family name.

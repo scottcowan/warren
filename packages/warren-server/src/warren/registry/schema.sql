@@ -28,7 +28,19 @@ CREATE TABLE IF NOT EXISTS ecs_launch_attempts (
     fingerprint          TEXT NOT NULL,
     task_definition_arn  TEXT NOT NULL,
     client_token         TEXT NOT NULL,
-    created_at           TEXT NOT NULL
+    created_at           TEXT NOT NULL,
+    -- EBS storage: the attempt's KMS-wrapped secrets envelopes (JSON container ->
+    -- WARREN_SECRETS_BLOB), reused by a retry so the request stays identical.
+    secrets_blobs        TEXT
+);
+
+-- EBS storage (runtime/ebs.py): the snapshot an EBS-backed workspace's next launch
+-- restores its volume from. The snapshots are also tagged, so this is a pointer that
+-- lets a launch notice a snapshot that has gone missing instead of starting empty.
+CREATE TABLE IF NOT EXISTS ecs_ebs_snapshots (
+    workspace_id  TEXT PRIMARY KEY,
+    snapshot_id   TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
 );
 
 -- AM2: client-supplied launch operations, keyed per principal, so a retried
