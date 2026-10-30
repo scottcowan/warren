@@ -122,6 +122,36 @@ def test_list_shows_healthz_inline(tmp_path: Path, monkeypatch):
     assert "1 running" in result.output
 
 
+def test_gather_remote_workspaces_falls_back_to_plain_healthz_for_non_admin_token(tmp_path: Path, monkeypatch):
+    """A non-admin auth_token gets 403 from /healthz/detail (admin-gated, audit
+    #45) -- this used to leave `health=None` entirely, which `list`'s header
+    rendering then showed as "unknown ✗  0 running" even though the server is
+    actually healthy. Must fall back to plain /healthz and render a bare
+    "online" header instead of fabricating runtime/count fields that were
+    never fetched."""
+    import asyncio
+
+    import httpx
+    import respx
+
+    from warren_cli.config import RemoteProfile
+    from warren_cli.main import _gather_remote_workspaces
+
+    profile = RemoteProfile(url="http://node2.local:8420", auth_token="tok-non-admin")
+
+    with respx.mock(base_url="http://node2.local:8420") as m:
+        m.get("/workspaces").mock(return_value=httpx.Response(200, json=[]))
+        m.get("/healthz/detail").mock(return_value=httpx.Response(403, json={"detail": "admin required"}))
+        m.get("/healthz").mock(return_value=httpx.Response(200, json={"status": "ok", "version": "0.2.0"}))
+
+        results = asyncio.run(_gather_remote_workspaces({"node2": profile}))
+
+    name, data, health = results[0]
+    assert name == "node2"
+    assert data == []
+    assert health == {}  # confirmed up, but no detail fields -- not None, not populated
+
+
 def test_list_shows_online_header_with_zero_active_workspaces(tmp_path: Path, monkeypatch):
     """A reachable remote with zero active workspaces (e.g. everything idle-reaped)
     used to print nothing at all -- making a successful, possibly multi-second
