@@ -22,6 +22,7 @@ from warren.auth.deps import current_user
 from warren_common.errors import ProjectNotFoundError
 from warren_common.loader import ProjectLoader, user_scoped_project_path
 from warren_common.models import collect_local_path_folders
+from warren_common.templates import list_template_paths
 
 log = structlog.get_logger(__name__)
 
@@ -151,6 +152,25 @@ def _write_project_file(dest: Path, body: bytes, *, server_wide: bool) -> None:
             raise HTTPException(
                 status_code=422, detail="project configuration is invalid"
             ) from exc
+        if not list_template_paths(cfg):
+            # A project with zero templates parses cleanly (ProjectConfig's
+            # extra="ignore" doesn't error on an unrecognized/renamed field,
+            # e.g. an old intents:/base_image: shape) but is never usable --
+            # nothing can provision from it. Reject at write time rather than
+            # only warning on load, so the caller finds out immediately
+            # instead of discovering it later via an empty TEMPLATES column.
+            log.warning("project_write_rejected_no_templates", dest=str(dest))
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "no_templates",
+                    "detail": (
+                        "project configuration has no usable templates -- check for "
+                        "an outdated schema (e.g. 'intents:'/'base_image:' instead of "
+                        "'templates:'/'docker_image:')"
+                    ),
+                },
+            )
         if not server_wide:
             bad = _local_path_folder_names(cfg)
             if bad:
