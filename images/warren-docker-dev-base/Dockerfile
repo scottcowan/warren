@@ -77,7 +77,7 @@ RUN curl -fsSL "https://raw.githubusercontent.com/pyenv/pyenv-installer/bdd89156
 #
 # Installs to $HOME/.local/bin (root's, since this image runs as root) --
 # symlinked into /usr/local/bin so it's on PATH the same way node/npm/npx are.
-RUN curl -fsSL https://claude.ai/install.sh | bash -s 2.1.301 \
+RUN curl -fsSL https://claude.ai/install.sh | bash -s 2.1.308 \
     && ln -sf /root/.local/bin/claude /usr/local/bin/claude
 
 # Deliberately NOT here: anything agent-specific — purpose-built agent images
