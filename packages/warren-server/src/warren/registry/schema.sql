@@ -43,6 +43,49 @@ CREATE TABLE IF NOT EXISTS ecs_ebs_snapshots (
     updated_at    TEXT NOT NULL
 );
 
+-- EBS bare seeds (runtime/ebs_seeds.py, WARREN_ECS_EBS_BARE_SEEDS): per owner, the seed
+-- snapshot new workspace volumes are created from. Only ever written by that owner's
+-- seed-refresh task. `pending_*`: a new snapshot still completing; `previous_*`: the one
+-- it replaced, deleted after a grace period (a launch may be creating a volume from it).
+-- `refreshing_since` makes the refresh single-flight.
+CREATE TABLE IF NOT EXISTS ecs_ebs_seeds (
+    owner_id              TEXT PRIMARY KEY,
+    snapshot_id           TEXT,
+    size_gib              INTEGER,
+    created_at            TEXT,
+    repo_keys             TEXT,
+    verified_at           TEXT,
+    pending_snapshot_id   TEXT,
+    pending_size_gib      INTEGER,
+    pending_repo_keys     TEXT,
+    pending_ref_shas      TEXT,
+    previous_snapshot_id  TEXT,
+    superseded_at         TEXT,
+    refreshing_since      TEXT,
+    last_error            TEXT,
+    image                 TEXT,
+    storage_key           TEXT,
+    updated_at            TEXT NOT NULL
+);
+
+-- The cached union of the repos an owner's EBS workspaces use (the registry is the
+-- source of truth), with the secret names that fetch them, the branches asked for, the
+-- ref SHAs the seed was last refreshed at, and when the last workspace using a repo went
+-- away (`released_at`; dropped WARREN_ECS_EBS_SEED_REPO_TTL_DAYS later).
+CREATE TABLE IF NOT EXISTS ecs_ebs_seed_repos (
+    owner_id      TEXT NOT NULL,
+    repo_key      TEXT NOT NULL,
+    url           TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    cred_kind     TEXT NOT NULL,
+    cred_secret   TEXT NOT NULL,
+    branches      TEXT NOT NULL DEFAULT '[]',
+    ref_shas      TEXT,
+    last_used_at  TEXT NOT NULL,
+    released_at   TEXT,
+    PRIMARY KEY (owner_id, repo_key)
+);
+
 -- AM2: client-supplied launch operations, keyed per principal, so a retried
 -- provision returns the original workspace instead of launching a second one.
 CREATE TABLE IF NOT EXISTS operations (

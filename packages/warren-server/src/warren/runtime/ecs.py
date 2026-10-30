@@ -25,6 +25,7 @@ _ensure_clients so module import stays cheap.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import re
@@ -186,6 +187,10 @@ class ECSRuntime:
         self.ebs: EBSVolumes | None = ebs
         self.storage_of: Any = None
         self._kms: Any = None
+        # EBS bare seeds (runtime/ebs_seeds.py), wired by app.py when
+        # WARREN_ECS_EBS_BARE_SEEDS is set: a new EBS workspace's volume may be created
+        # from its owner's seed snapshot.
+        self.seeds: Any = None
 
     @property
     def started_by(self) -> str:
@@ -499,10 +504,26 @@ class ECSRuntime:
             # Snapshot the previous task's retained volume if nothing did yet, and wait
             # for the newest snapshot to complete; None = first launch, empty volume.
             snapshot_id = await self.ebs.restore_point(spec.workspace_id)
+            size_gib: int | None = None
+            if snapshot_id is None and git_plan is not None and self.seeds is not None:
+                # A brand-new volume: start it from the owner's bare seed when there is
+                # one (runtime/ebs_seeds.py). Never fails or delays the create.
+                try:
+                    seed = await self.seeds.prepare_launch(
+                        spec, image=getattr(self._settings, "ecs_git_init_image", "") or spec.image
+                    )
+                except Exception:
+                    log.exception("ebs_seed_lookup_failed", workspace_id=spec.workspace_id)
+                    seed = None
+                if seed is not None:
+                    snapshot_id = seed.snapshot_id
+                    size_gib = max(int(getattr(self._settings, "ecs_ebs_size_gib", 20) or 20), seed.size_gib)
+                    git_plan = dataclasses.replace(git_plan, seeded=True)
             volume_config = self.ebs.volume_configuration(
                 spec.workspace_id,
                 owner_id=getattr(spec, "owner_id", "") or None,
                 snapshot_id=snapshot_id,
+                size_gib=size_gib,
             )
             return await self._register_and_run(
                 spec, None, resolved_cpu, resolved_memory, family, delivered, git_plan,
@@ -715,6 +736,12 @@ class ECSRuntime:
             known_hosts = getattr(self._settings, "ecs_git_known_hosts", "") or ""
             if known_hosts:
                 git_init_env.append({"name": "WARREN_GIT_KNOWN_HOSTS", "value": known_hosts})
+            if git_plan.seeded:
+                # The volume is a fresh restore of the owner's bare seed (ebs_seeds.py).
+                git_init_env.append({"name": "WARREN_GIT_SEEDED", "value": "1"})
+            clone_filter = getattr(self._settings, "git_clone_filter", "") or ""
+            if clone_filter in ("blob:none", "tree:0"):
+                git_init_env.append({"name": "WARREN_GIT_CLONE_FILTER", "value": clone_filter})
             container_overrides.append(
                 {
                     "name": GIT_INIT_CONTAINER,
@@ -943,6 +970,7 @@ class ECSRuntime:
 
         server_tag = f"{self._resource_prefix}.server_instance"
         ws_tag = f"{self._resource_prefix}.workspace_id"
+        kind_tag = f"{self._resource_prefix}.task_kind"
         owned: list[dict[str, Any]] = []
         for i in range(0, len(arns), 100):
             desc = await asyncio.to_thread(
@@ -951,6 +979,10 @@ class ECSRuntime:
             for task in desc.get("tasks", []):
                 tags = {t.get("key"): t.get("value") for t in task.get("tags", [])}
                 if tags.get(server_tag) != self.server_id:
+                    continue
+                if tags.get(kind_tag):
+                    # A seed-refresh task (ebs_seeds.py; its own startedBy keeps it out of
+                    # this listing anyway) is never a workspace's task.
                     continue
                 owned.append(
                     {

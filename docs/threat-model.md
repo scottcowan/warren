@@ -95,6 +95,24 @@ credentials endpoint `169.254.170.2` from the agent. So:
   private files, re-execs with an empty environment, clones into a private dir, deletes the
   credentials, and only then touches the volume. The workspace container depends on it
   finishing and never receives them.
+- EBS bare seeds (`WARREN_ECS_EBS_BARE_SEEDS`, off by default): each owner has one EBS
+  seed snapshot of bare mirrors of the repos their EBS workspaces use, and a new workspace
+  volume may be created from it. Only the control plane chooses a launch's `snapshotId`,
+  and only from the seed row of the workspace's authenticated owner, re-checked against
+  the snapshot's own tags (owner, server, `warren.storage=ebs-seed`); a workspace never
+  sees another owner's seed, and workspace tasks have no EC2 permissions. A seed is only
+  written by that owner's seed-refresh task (git-init container only, never mounted by a
+  workspace), fetching with that owner's own credentials, so it holds only what the
+  owner's PAT could fetch; nothing is shared across owners and a workspace's stop
+  snapshots stay workspace snapshots. git-init uses a seed only on a launch the control
+  plane marked as restored from it (`WARREN_GIT_SEEDED=1`) and only if the volume holds
+  nothing but the seed, i.e. before any workspace process has run on it. It then rewrites
+  each bare's config, refuses symlinks, alternates and a foreign remote, clones locally
+  into a repo whose config it wrote, and fetches the delta with the credentials (the one
+  credentialed operation on volume content, and that content is seed-task-written).
+  The seed is deleted from the volume before the workspace container starts; a bad seed
+  falls back to a network clone. The control plane's `git ls-remote` (to skip unchanged
+  refreshes) passes the PAT only through `GIT_ASKPASS` in the child environment.
 - No plan should add an in-task bwrap/nsjail layer. Runtime detection on Fargate is
   GuardDuty Runtime Monitoring plus CloudTrail alerting on the task role (AF1, deployment
   IaC, deferred).
