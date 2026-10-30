@@ -2,7 +2,7 @@
   "baseline": "ddf75e3ddb2b87719c8f4fc45d8191324b85c85b",
   "components": {
     "warren-server": {
-      "version": "1.4.0",
+      "version": "1.5.0",
       "dockerfile": "packages/warren-server/Dockerfile",
       "context": ".",
       "paths": [
@@ -42,7 +42,7 @@
       ]
     },
     "warren-ecs-base": {
-      "version": "1.2.0",
+      "version": "1.3.0",
       "dockerfile": "packages/warren-server/images/ecs-base/Dockerfile",
       "context": ".",
       "paths": [
@@ -52,7 +52,7 @@
       ]
     },
     "warren-ecs-dev-base": {
-      "version": "1.0.1",
+      "version": "1.1.0",
       "dockerfile": "packages/warren-server/images/warren-ecs-dev-base/Dockerfile",
       "context": "packages/warren-server/images/warren-ecs-dev-base",
       "paths": [
