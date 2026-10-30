@@ -10,7 +10,7 @@
 # plus wiring it to run via WARREN_APP_CMD (ecs-base/entrypoint.sh's eager-launch
 # contract, set by ECSRuntime.provision() when the connected intent declares a port —
 # see IntentConfig.port in warren_common/models.py once that lands).
-FROM ghcr.io/scottcowan/warren-ecs-dev-base:latest@sha256:acfdce186d1747f03f3280a099a856d8a207b09a57eed2a5c5916f1d6786d64f
+FROM ghcr.io/scottcowan/warren-ecs-dev-base:latest@sha256:eb81ef4c36606a5f421347539074f8ffbf0462bd0a6c40bf4b1e885c58bd7f50
 # warren-ecs-dev-base:latest as of 2026-10-17
 
 # TODO: install acp-harness once public.
