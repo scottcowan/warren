@@ -289,6 +289,16 @@ for setup, the Ubuntu 24.04 AppArmor fix, and where credentials should live.
 
 ---
 
+## Examples
+
+Agent-framework integration examples (LangGraph, CrewAI) driving warren's control-plane
+MCP endpoint live in a separate repo,
+[warren-examples](https://github.com/scottcowan/warren-examples) — split out so this
+repo's own Dependabot alerts stay about warren itself, not example-framework
+dependencies.
+
+---
+
 ## Prior Art
 
 Warren's Bubblewrap (Linux) and Seatbelt (macOS) runtime patterns are
