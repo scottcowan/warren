@@ -2,6 +2,19 @@
 
 Image releases, newest first. Written by scripts/release.py.
 
+## warren-server 1.5.0 (2026-10-30)
+
+- feat: EBS workspace storage for ECS (WARREN_ECS_WORKSPACE_STORAGE / template ecs_storage) (#48) (293ba53)
+- fix: warn on zero-template projects at load, reject at write (#54) (a19781c)
+
+## warren-ecs-base 1.3.0 (2026-10-30)
+
+- feat: EBS workspace storage for ECS (WARREN_ECS_WORKSPACE_STORAGE / template ecs_storage) (#48) (293ba53)
+
+## warren-ecs-dev-base 1.1.0 (2026-10-30)
+
+- feat: EBS workspace storage for ECS (WARREN_ECS_WORKSPACE_STORAGE / template ecs_storage) (#48) (293ba53)
+
 ## warren-server 1.4.0 (2026-10-27)
 
 - feat: per-user ECS storage and network isolation (WARREN_ECS_OWNER_STORAGE) (#46) (3cf23fa)
