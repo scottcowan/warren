@@ -22,7 +22,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x -o /tmp/nodesource-setup.sh
 # warren doesn't build/publish this image (no CI workflow, not in `warren
 # doctor`'s canonical list) -- it's offered as a Dockerfile for you to build
 # and tag yourself. See README.md in this directory.
-RUN npm install -g @anthropic-ai/claude-code@2.1.301
+RUN npm install -g @anthropic-ai/claude-code@2.1.308
 
 WORKDIR /workspace
 

@@ -89,7 +89,7 @@ RUN curl -fsSL "https://raw.githubusercontent.com/pyenv/pyenv-installer/bdd89156
 # silently point at the wrong (root's, now-unreadable-by-the-new-user) home directory
 # instead of failing loudly. Not fixed now since there's no USER directive to break
 # against yet; flagging so whoever adds one first fixes this too.
-ARG CLAUDE_CODE_VERSION=2.1.301
+ARG CLAUDE_CODE_VERSION=2.1.308
 RUN curl -fsSL https://claude.ai/install.sh | bash -s ${CLAUDE_CODE_VERSION} \
     && ln -sf /root/.local/bin/claude /usr/local/bin/claude \
     && case "$(uname -m)" in \
