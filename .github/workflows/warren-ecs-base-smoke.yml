@@ -114,6 +114,8 @@ jobs:
           # AH1: git-init ships root-owned, and the pinned known_hosts is read-only.
           test "$(docker run --rm --entrypoint stat "$IMG" -c '%u:%g:%a' /usr/local/bin/warren-git-materialize)" = "0:0:755"
           test "$(docker run --rm --entrypoint stat "$IMG" -c '%u:%g:%a' /etc/warren/ssh_known_hosts)" = "0:0:444"
+          test "$(docker run --rm --entrypoint stat "$IMG" -c '%u:%g:%a' /etc/warren)" = "0:0:755"
+          docker run --rm --entrypoint su-exec "$IMG" 1000:1000 cat /etc/warren/banner.bash /etc/warren/harness.sh >/dev/null
           docker run --rm --entrypoint ssh "$IMG" -V
           # AH1 + AD3 end to end on a fresh root-owned task volume: git-init (started as root)
           # runs warren-init-volume, drops to 1000, and materializes a worktree owned by 1000;
