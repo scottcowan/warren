@@ -31,6 +31,15 @@ agent-controlled and the workspace task role is the control; see
 
 Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and a rootless Podman socket.
 
+On Ubuntu 26.04, rootless Podman can't remove containers with its default `pasta` network
+helper: the shipped AppArmor `pasta` profile refuses SIGTERM from the `podman` profile
+("rootless netns: kill network process: permission denied"). Use slirp4netns instead:
+
+```bash
+mkdir -p ~/.config/containers
+printf '[network]\ndefault_rootless_network_cmd = "slirp4netns"\n' >> ~/.config/containers/containers.conf
+```
+
 ```bash
 git clone https://github.com/scottcowan/warren.git
 cd warren
