@@ -17,7 +17,10 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned: on ubuntu-26.04 (ubuntu-latest from 2026-10-28) rootless Podman 5.7 can't
+    # remove containers ("rootless netns: kill network process: permission denied"), which
+    # fails every podman integration test. Move back to ubuntu-latest once that's fixed.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read
