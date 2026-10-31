@@ -91,9 +91,12 @@ jobs:
     with:
       tag: ${{ fromJSON(needs.tag.outputs.released)['warren-ecs-base'] }}
 
+  # After warren-ecs-base: dev-base builds FROM the ecs-base release named in its
+  # Dockerfile (WARREN_ECS_BASE), which may be the one this same run publishes. Still runs
+  # when ecs-base wasn't released this time (skipped), but not if its publish failed.
   warren-ecs-dev-base:
-    needs: tag
-    if: fromJSON(needs.tag.outputs.released)['warren-ecs-dev-base']
+    needs: [tag, warren-ecs-base]
+    if: ${{ !cancelled() && needs.tag.result == 'success' && needs.warren-ecs-base.result != 'failure' && fromJSON(needs.tag.outputs.released)['warren-ecs-dev-base'] }}
     permissions:
       contents: read
       packages: write
