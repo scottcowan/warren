@@ -1,7 +1,14 @@
 name: warren pin bumps
 # AI6: weekly check of pinned harness/tool versions in the image Dockerfiles
-# (Claude Code) and the GitHub SSH known_hosts baked into ecs-base (#29) against
-# upstream. On drift it pushes chore/pin-bumps and opens (or updates) one PR.
+# (Claude Code), the GitHub SSH known_hosts baked into ecs-base (#29) and the AWS
+# CLI Team PGP key checked in for warren-ecs-dev-base (aws-cli-team.asc, compared
+# with AWS's CLI install guide) against upstream. On drift it pushes chore/pin-bumps
+# and opens (or updates) one PR. An AWS key rotation also rewrites the Dockerfile's
+# asserted fingerprint and puts a "verify before merging" warning in the PR body.
+# Warnings (rotation, the key expiring within 60 days, or the install guide no longer
+# parsing) also show as ::warning:: annotations on the run, and in the step summary
+# even when nothing changed and no PR is opened. gpg comes preinstalled on
+# ubuntu-latest; without it the key check is reported as skipped.
 #
 # Uses only GITHUB_TOKEN. Two consequences of that:
 #   - Pushes and PRs made with GITHUB_TOKEN don't trigger `pull_request`/`push`

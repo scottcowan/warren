@@ -14,7 +14,7 @@
 # Trust boundary: Debian's apt archive, nodejs.org's tarball (sha256 pinned below from
 # the release's SHASUMS256.txt), AWS's CLI installer zip (its detached PGP signature
 # checked against the AWS CLI Team key checked in next to this file, fingerprint
-# FB5DB77FD5C118B80511ADA8A6310ACC4672475C), pyenv's install script (fetched over HTTPS
+# asserted in the install step below), pyenv's install script (fetched over HTTPS
 # from its official GitHub repo, pinned to a commit and checksum), and Anthropic's own
 # native installer (`curl https://claude.ai/install.sh | bash`, pinned to an exact
 # version — NOT the npm package `@anthropic-ai/claude-code`; see the Claude Code install
@@ -66,8 +66,10 @@ RUN case "${TARGETARCH}" in \
 # npm/pip); it uses the ECS container credentials endpoint, no keys in the image. AWS's
 # installer zip bundles its own Python, separate from pyenv's. The zip's detached
 # signature is checked against aws-cli-team.asc (copied from AWS's install guide; the
-# fingerprint is asserted, so a swapped key file fails the build). The key expires
-# 2027-07-01; refresh the file from the install guide when AWS rotates it.
+# fingerprint is asserted, so a swapped key file fails the build). The fingerprint on
+# the `grep -q` line below is its only copy in this file. The weekly pin-bump job
+# (scripts/bump_pins.py, aws-cli-key) compares the file with the install guide, refreshes
+# it, rewrites that line when AWS rotates the key, and warns as expiry approaches.
 ARG AWS_CLI_VERSION=2.39.3
 COPY aws-cli-team.asc /tmp/aws-cli-team.asc
 RUN case "${TARGETARCH}" in \
