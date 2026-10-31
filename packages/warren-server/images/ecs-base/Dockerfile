@@ -94,8 +94,8 @@ COPY --from=secrets-decrypt --chown=0:0 --chmod=0755 /out/warren-secrets-decrypt
 # GitHub's published SSH host keys (api.github.com/meta "ssh_keys"), pinned for git-init's
 # ssh clones. Refresh the checked-in file when GitHub rotates a key.
 COPY --chown=0:0 --chmod=0444 packages/warren-server/images/ecs-base/ssh_known_hosts /etc/warren/ssh_known_hosts
-RUN chown 0:0 /usr /usr/local /usr/local/bin /usr/local/lib /usr/local/lib/warren \
-    && chmod 0755 /usr /usr/local /usr/local/bin /usr/local/lib /usr/local/lib/warren
+RUN chown 0:0 /usr /usr/local /usr/local/bin /usr/local/lib /usr/local/lib/warren /etc/warren \
+    && chmod 0755 /usr /usr/local /usr/local/bin /usr/local/lib /usr/local/lib/warren /etc/warren
 
 # The container starts as root so entrypoint.sh can take ownership of a fresh task volume
 # mount point, then it drops to warren (uid 1000) before running anything else. Extension
