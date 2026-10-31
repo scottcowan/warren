@@ -125,7 +125,7 @@ _SAFE_PROJECT_NAME_RE = re.compile(r"^[a-z0-9_-]+$")
 # Only reached when there's no `settings` at all (e.g. a test harness that never
 # wired up project config) -- NOT a per-field fallback. `docker_image` and
 # `ecs_image` each carry their own concrete default on ProjectConfig (the
-# Docker/Podman warren-base and the Alpine-based warren-ecs-base respectively)
+# Docker/Podman warren-base and the Debian-based warren-ecs-base respectively)
 # and are resolved independently, with no fallback between them: a template
 # overriding one (e.g. to a local registry mirror) must never leak into the
 # other runtime, which may not even be able to reach it.
@@ -681,7 +681,7 @@ async def _resolve_image(body: ProvisionRequest, request: Request) -> str:
          e.g. a local registry mirror -- must never leak into an ECS node
          that can't reach it, and vice versa):
            - `settings.runtime_type == "ecs"`: the resolved template's
-             `ecs_image` (defaults to the Alpine-based
+             `ecs_image` (defaults to the Debian-based
              `ghcr.io/scottcowan/warren-ecs-base:latest`).
            - otherwise (podman/docker): the resolved template's
              `docker_image` (defaults to `ghcr.io/scottcowan/warren-docker-base:latest`).
