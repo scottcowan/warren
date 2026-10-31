@@ -37,6 +37,16 @@ jobs:
       - name: Install dependencies
         run: uv sync --package warren-server --extra dev
 
+      # Ubuntu 26.04's AppArmor `pasta` profile won't receive SIGTERM from the `podman`
+      # profile, so rootless podman can't stop pasta when it removes a container ("rootless
+      # netns: kill network process: permission denied"). slirp4netns isn't affected.
+      # It keeps host loopback closed by default (allow_host_loopback stays false).
+      - name: Use slirp4netns for rootless networking
+        run: |
+          command -v slirp4netns >/dev/null || sudo apt-get install -y slirp4netns
+          mkdir -p ~/.config/containers
+          printf '[network]\ndefault_rootless_network_cmd = "slirp4netns"\n' > ~/.config/containers/containers.conf
+
       - name: Start rootless Podman socket
         run: |
           # ubuntu-latest runners execute as a non-logged-in user with no systemd
