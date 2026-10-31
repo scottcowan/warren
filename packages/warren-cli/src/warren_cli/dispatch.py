@@ -1608,8 +1608,16 @@ def start_orchestrator_port_forward(cluster: str, service: str, remote_port: int
     ``session-manager-plugin``, or the orchestrator task itself can't be
     resolved, or if the tunnel doesn't become connectable within a few seconds.
     """
-    aws = shutil.which("aws")
-    if not aws:
+    _require_ssm_tools()
+    task_arn = _resolve_orchestrator_task_arn(cluster, service)
+    runtime_id = _resolve_ecs_container_runtime_id(cluster, task_arn, container_name="workspace-provisioner")
+    return start_ssm_port_forward(ecs_ssm_target(cluster, task_arn, runtime_id), remote_port, label="orchestrator")
+
+
+def _require_ssm_tools() -> None:
+    """Raise ``RuntimeError`` naming the install page when the AWS CLI or
+    ``session-manager-plugin`` (which ``aws ssm start-session`` runs) isn't on PATH."""
+    if not shutil.which("aws"):
         raise RuntimeError(
             "aws CLI not found — install from "
             "https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
@@ -1620,10 +1628,21 @@ def start_orchestrator_port_forward(cluster: str, service: str, remote_port: int
             "https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html"
         )
 
-    task_arn = _resolve_orchestrator_task_arn(cluster, service)
+
+def ecs_ssm_target(cluster: str, task_arn: str, runtime_id: str) -> str:
+    """The SSM target for a container in an ECS Exec-enabled task."""
     task_id = task_arn.rstrip("/").rsplit("/", 1)[-1]
-    runtime_id = _resolve_ecs_container_runtime_id(cluster, task_arn, container_name="workspace-provisioner")
-    target = f"ecs:{cluster}_{task_id}_{runtime_id}"
+    return f"ecs:{cluster}_{task_id}_{runtime_id}"
+
+
+def start_ssm_port_forward(target: str, remote_port: int, *, label: str) -> tuple[subprocess.Popen, int]:
+    """Run ``AWS-StartPortForwardingSession`` to ``target`` in the background on a
+    free loopback port, and wait up to 10s for it to accept connections.
+
+    Returns ``(process, local_port)``; the caller terminates the process. Raises
+    ``RuntimeError`` carrying the CLI's stderr if the session exits early (expired
+    AWS SSO credentials end up here) or never becomes connectable.
+    """
     local_port = _free_local_port()
 
     proc = subprocess.Popen(
@@ -1642,7 +1661,7 @@ def start_orchestrator_port_forward(cluster: str, service: str, remote_port: int
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            raise RuntimeError(f"SSM port-forward to orchestrator exited early: {''.join(stderr_tail).strip()}")
+            raise RuntimeError(f"SSM port-forward to {label} exited early: {''.join(stderr_tail).strip()}")
         try:
             with socket.create_connection(("127.0.0.1", local_port), timeout=0.5):
                 return proc, local_port
@@ -1650,7 +1669,16 @@ def start_orchestrator_port_forward(cluster: str, service: str, remote_port: int
             time.sleep(0.3)
 
     proc.terminate()
-    raise RuntimeError(f"SSM port-forward to orchestrator did not become reachable on port {local_port} within 10s")
+    raise RuntimeError(f"SSM port-forward to {label} did not become reachable on port {local_port} within 10s")
+
+
+def start_workspace_port_forward(cluster: str, task_arn: str, remote_port: int) -> tuple[subprocess.Popen, int]:
+    """Background SSM port-forward to ``remote_port`` in a workspace task's
+    ``workspace`` container: the non-exec counterpart of ``_tunnel_via_execvp``,
+    used by ``warren proxy``. Same contract as ``start_ssm_port_forward``."""
+    _require_ssm_tools()
+    runtime_id = _resolve_ecs_container_runtime_id(cluster, task_arn)
+    return start_ssm_port_forward(ecs_ssm_target(cluster, task_arn, runtime_id), remote_port, label="workspace")
 
 
 def _tunnel_via_execvp(state: dict, remote_port: int, local_port: int | None = None) -> NoReturn:

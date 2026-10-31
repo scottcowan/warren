@@ -189,3 +189,8 @@ credentials endpoint `169.254.170.2` from the agent. So:
 11. **Images built FROM a bumped base by digest** (`warren-agent-base`,
     `warren-ecs-agent-base`) lag a harness bump until the base is republished and the digest
     updated.
+12. **`warren proxy` listeners have no authentication of their own.** They bind loopback
+    only, and refuse anything else, but any process or other user on the operator's
+    machine that can connect to `127.0.0.1:<port>` reaches that workspace port over the
+    operator's SSM session. Whatever the app on that port enforces (for example T3 Code's
+    pairing) is the only remaining check. Don't run the proxy on a shared host.

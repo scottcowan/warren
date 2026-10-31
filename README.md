@@ -48,6 +48,11 @@ top-level; `secrets`, `server`, `project` (singular — local YAML definitions),
 are namespaced subcommands for the less central nouns. Omit `--server` on `status`/`tunnel`
 and you get an interactive picker over your configured remotes.
 
+`warren proxy` keeps a stable `127.0.0.1` address for a port inside an ECS workspace,
+starting the SSM tunnel when something first connects and restarting it when the
+workspace's task changes (for desktop apps such as T3 Code that remember a server
+address). See [docs/proxy.md](docs/proxy.md).
+
 Or run entirely local (no server) against a `config.toml` project definition — see `warren
 init` to scaffold one:
 

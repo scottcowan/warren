@@ -190,6 +190,23 @@ class WindowsSection(BaseModel):
     wsl_distro: str = ""
 
 
+class ProxySection(BaseModel):
+    """`[proxy]`: `warren proxy run` settings (flags on `run` override these).
+
+    ``idle_minutes``: stop a mapping's SSM session after this long with no client
+    connections (0 = keep it until it dies). ``keepalive_seconds``: while clients are
+    connected, open and close a probe connection through the session this often, so
+    the SSM session carries traffic even when the app is quiet (0 = off; see
+    docs/proxy.md for what this can and can't keep alive). ``port_base``: first local
+    port tried when `warren proxy add` picks one."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    idle_minutes: float = Field(default=30.0, ge=0)
+    keepalive_seconds: float = Field(default=240.0, ge=0)
+    port_base: int = Field(default=47100, ge=1024, le=65535)
+
+
 class WarrenCLIConfig(BaseModel):
     """Top-level CLI configuration.
 
@@ -208,6 +225,7 @@ class WarrenCLIConfig(BaseModel):
     remotes: dict[str, RemoteProfile] = Field(default_factory=dict)
     github_app: GitHubAppSection | None = None
     windows: WindowsSection = Field(default_factory=WindowsSection)
+    proxy: ProxySection = Field(default_factory=ProxySection)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "WarrenCLIConfig":

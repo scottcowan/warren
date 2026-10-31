@@ -39,6 +39,7 @@ def _check_not_nested() -> None:
 from .client import make_remote_client
 from .commands import workspaces as workspaces_local
 from .commands.doctor import doctor as _doctor
+from .commands.proxy import proxy_app
 from .commands.remote import remote_app
 from .config import (
     WarrenCLIConfig,
@@ -112,6 +113,7 @@ app.add_typer(secrets_app, name="secrets")
 app.add_typer(server_app, name="server")
 app.add_typer(project_app, name="project")
 app.add_typer(remote_app, name="remote")
+app.add_typer(proxy_app, name="proxy")
 app.command(name="doctor")(_doctor)
 
 # Workspaces are what this CLI is for, so workspace commands (new/destroy/connect/list/
