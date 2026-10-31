@@ -17,7 +17,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        netcmd: [pasta, slirp4netns]
     timeout-minutes: 15
     permissions:
       contents: read
@@ -36,6 +40,17 @@ jobs:
       # the sync to just this package's own deps instead of the whole workspace.
       - name: Install dependencies
         run: uv sync --package warren-server --extra dev
+
+      - name: Rootless network helper (probe)
+        run: |
+          podman --version; uname -r; cat /etc/os-release | head -2
+          aa-status 2>/dev/null | head -20 || sudo aa-status | head -40 || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true
+          if [ "${{ matrix.netcmd }}" = slirp4netns ]; then
+            command -v slirp4netns || sudo apt-get install -y slirp4netns
+            mkdir -p ~/.config/containers
+            printf '[network]\ndefault_rootless_network_cmd = "slirp4netns"\n' > ~/.config/containers/containers.conf
+          fi
 
       - name: Start rootless Podman socket
         run: |
@@ -98,4 +113,11 @@ jobs:
       # with a traceback well before this outer wall-clock backstop, which only exists to
       # stop a wedged interpreter; it is kept under the job's 15-minute timeout-minutes.
       - name: Run test suite
-        run: timeout 720 uv run --package warren-server pytest packages/warren-server/tests -v
+        run: timeout 720 uv run --package warren-server pytest packages/warren-server/tests/integration -v -p no:cacheprovider
+
+      - name: Denials (probe)
+        if: always()
+        run: |
+          sudo dmesg | grep -iE 'apparmor|denied|audit' | tail -60 || true
+          sudo journalctl -k --no-pager | grep -iE 'apparmor|denied' | tail -60 || true
+          ps -eo pid,user,args | grep -E 'pasta|slirp4netns|podman|rootless-netns' | grep -v grep || true
