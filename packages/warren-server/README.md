@@ -23,6 +23,12 @@ Pick one at a time via `WARREN_RUNTIME_TYPE`:
 | ECS Fargate | `ecs` | One Fargate task per workspace, no host to manage |
 
 See [`resources/ecs/`](../../resources/ecs/) for the Terraform/CDK to stand up the ECS path.
+
+ECS workspaces default to `ghcr.io/scottcowan/warren-ecs-base`, built from
+[`images/ecs-base`](images/ecs-base/Dockerfile): Debian bookworm-slim since 2.0.0 (1.x was
+Alpine), so images built on it use `apt`. See
+[ECS workspace images](../../resources/ecs/README.md#ecs-workspace-images).
+
 Fargate allows no sandbox inside a task, so everything in an ECS workspace task is
 agent-controlled and the workspace task role is the control; see
 [Fargate isolation](../../resources/ecs/README.md#fargate-isolation-the-task-role-is-the-control).

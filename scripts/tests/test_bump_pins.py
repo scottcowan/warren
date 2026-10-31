@@ -46,7 +46,7 @@ class RepoFixture(unittest.TestCase):
         self.write("packages/warren-server/images/warren-ecs-dev-base/Dockerfile",
                    "FROM x\nARG CLAUDE_CODE_VERSION=2.1.301\n"
                    "RUN curl -fsSL https://claude.ai/install.sh | bash -s ${CLAUDE_CODE_VERSION}\n")
-        self.write("packages/warren-server/images/ecs-base/Dockerfile", "FROM alpine\n")
+        self.write("packages/warren-server/images/ecs-base/Dockerfile", "FROM debian\n")
         self.write("packages/warren-server/images/ecs-base/ssh_known_hosts",
                    f"github.com {ED}\ngithub.com {EC}\ngithub.com {RSA_OLD}\n")
         self.write(".github/workflows/warren-docker-dev-base-smoke.yml",

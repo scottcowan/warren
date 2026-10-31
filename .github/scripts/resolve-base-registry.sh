@@ -3,8 +3,8 @@
 #
 # Usage: resolve-base-registry.sh <Dockerfile> <registry-prefix>...
 #
-# The Dockerfile must contain `FROM ${BASE_REGISTRY}/<name>:<tag>@sha256:<digest>` (every such
-# line is checked, for multi-stage builds). Each
+# The Dockerfile must contain `FROM [--platform=...] ${BASE_REGISTRY}/<name>:<tag>@sha256:<digest>`
+# (every such line is checked, for multi-stage builds). Each
 # candidate prefix (e.g. mirror.gcr.io/library, public.ecr.aws/docker/library,
 # docker.io/library) is probed in order, with retry and backoff, and accepted only if it
 # resolves every <name>:<tag>@<digest> to that exact manifest digest -- so swapping registries
@@ -19,7 +19,7 @@ set -euo pipefail
 dockerfile="$1"
 shift
 
-mapfile -t refs < <(sed -nE 's|^FROM \$\{BASE_REGISTRY\}/([^[:space:]]+@sha256:[0-9a-f]{64}).*$|\1|p' "$dockerfile")
+mapfile -t refs < <(sed -nE 's|^FROM (--platform=[^[:space:]]+ +)?\$\{BASE_REGISTRY\}/([^[:space:]]+@sha256:[0-9a-f]{64}).*$|\2|p' "$dockerfile")
 if [ "${#refs[@]}" -eq 0 ]; then
     echo "::error::$dockerfile has no 'FROM \${BASE_REGISTRY}/<name>:<tag>@sha256:<digest>' line"
     exit 1
