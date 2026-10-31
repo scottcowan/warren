@@ -212,5 +212,5 @@ Then a script ran every applicable check from
 Every container was started with `--rm` or removed with `docker rm -f`.
 
 Not verified here: linux/amd64 runtime, and a real ECS task (Fargate pull, ECS Exec,
-EFS/EBS volumes, KMS decrypt against the real service). `warren proxy add` comes from a
-separate branch, and pairing from the desktop app through it wasn't tested.
+EFS/EBS volumes, KMS decrypt against the real service). Pairing the desktop app
+through `warren proxy add` wasn't tested.
