@@ -34,7 +34,7 @@
       ]
     },
     "warren-docker-dev-base": {
-      "version": "1.0.1",
+      "version": "1.0.2",
       "dockerfile": "images/warren-docker-dev-base/Dockerfile",
       "context": "images/warren-docker-dev-base",
       "paths": [
@@ -42,7 +42,7 @@
       ]
     },
     "warren-ecs-base": {
-      "version": "1.4.0",
+      "version": "1.4.1",
       "dockerfile": "packages/warren-server/images/ecs-base/Dockerfile",
       "context": ".",
       "paths": [
@@ -52,7 +52,7 @@
       ]
     },
     "warren-ecs-dev-base": {
-      "version": "1.2.0",
+      "version": "1.2.1",
       "dockerfile": "packages/warren-server/images/warren-ecs-dev-base/Dockerfile",
       "context": "packages/warren-server/images/warren-ecs-dev-base",
       "paths": [
