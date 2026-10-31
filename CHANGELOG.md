@@ -2,6 +2,18 @@
 
 Image releases, newest first. Written by scripts/release.py.
 
+## warren-docker-dev-base 1.0.2 (2026-10-31)
+
+- chore: bump pinned harness/host-key versions (AI6) (#43) (f46fbe8)
+
+## warren-ecs-base 1.4.1 (2026-10-31)
+
+- fix(ecs-base): make /etc/warren traversable so the workspace user gets the banner and harness hooks (#61) (88703fd)
+
+## warren-ecs-dev-base 1.2.1 (2026-10-31)
+
+- chore: bump pinned harness/host-key versions (AI6) (#43) (f46fbe8)
+
 ## warren-server 1.6.0 (2026-10-30)
 
 - build(deps): bump pytest-asyncio from 1.4.0 to 1.4.1 in the python group (#52) (b0b67f7)
