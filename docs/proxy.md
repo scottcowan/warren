@@ -230,4 +230,4 @@ warren proxy run                       # or keep it running under launchd/system
 
 Then pair the T3 desktop app with `http://127.0.0.1:47100`. Don't use T3 Connect
 for company code: it relays traffic through T3's cloud. The workspace image and
-how to start `t3 serve` are described with the T3 Code example image.
+how to start `t3 serve` are described in [examples/ecs-t3code](../examples/ecs-t3code/README.md).
