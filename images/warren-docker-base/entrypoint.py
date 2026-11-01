@@ -109,6 +109,37 @@ def init_harness_dirs(init: str = _HARNESS_INIT, root: str = _HARNESS_ROOT) -> N
         subprocess.run(["/bin/sh", init, root], timeout=60, check=True)
     except (OSError, subprocess.SubprocessError) as e:
         emit({"type": "harness_init_failed", "detail": str(e)})
+    match_mount_owner(root)
+
+
+def match_mount_owner(root: str) -> None:
+    """Give what this (root) entrypoint wrote under a bind mount to the mount's owner.
+
+    Under rootless podman's default mapping the server's host user is container root,
+    so the harness dir is root-owned here and this is a no-op. Under a keep-id userns
+    (WARREN_PODMAN_USERNS, the default) the server user is uid 1000 inside and the
+    dir is owned by 1000: files container root creates would land on the host as an
+    unprivileged subuid the server can't read or delete, and a uid-1000 harness
+    couldn't write them. Never follows a link.
+    """
+    if os.geteuid() != 0:
+        return
+    try:
+        st = os.stat(root, follow_symlinks=False)
+    except OSError:
+        return
+    if st.st_uid == 0 or not os.path.isdir(root) or os.path.islink(root):
+        return
+    uid, gid = st.st_uid, st.st_gid
+    for top, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs + files:
+            path = os.path.join(top, name)
+            try:
+                if os.lstat(path).st_uid != uid:
+                    os.lchown(path, uid, gid)
+            except OSError as e:
+                emit({"type": "harness_chown_failed", "path": path, "detail": str(e)})
+                return
 
 
 def _build_argv(app_cmd: str) -> list[str]:

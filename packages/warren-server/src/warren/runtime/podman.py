@@ -21,6 +21,7 @@ from podman.errors import APIError, BuildError, ImageNotFound, NotFound
 from podman.errors.exceptions import PodmanError
 
 from warren.images.build_spec import BuildSpec
+from warren.runtime.userns import DEFAULT_PODMAN_USERNS, parse_podman_userns
 from warren_common.errors import ImageUnavailable, RuntimeUnreachable
 from warren_common.agent_launch import SPEC_ENV as AGENT_SPEC_ENV
 from warren_common.harness_shell import seed_env, server_env, shell_first, workspace_shell
@@ -135,8 +136,11 @@ class PodmanRuntime:
         client_timeout: float = _DEFAULT_CLIENT_TIMEOUT_SECONDS,
         egress_bridge_name: str = "warren-egress",
         ssh_publish_host: str = "127.0.0.1",
+        userns: str = DEFAULT_PODMAN_USERNS,
     ) -> None:
         self._socket_path = str(socket_path)
+        # WARREN_PODMAN_USERNS (warren.runtime.userns): None leaves podman's default.
+        self._userns = parse_podman_userns(userns)
         self._server_id = server_id
         self._client = PodmanClient(
             base_url=f"unix://{self._socket_path}", timeout=client_timeout
@@ -230,6 +234,13 @@ class PodmanRuntime:
             remove=False,
             restart_policy={"Name": "no"},
         )
+        if self._userns is not None:
+            create_kwargs["userns_mode"] = {**self._userns}
+            # With keep-id and no explicit user, podman runs the container as the mapped
+            # uid (1000) rather than the image's USER. Pin the image's own user (root when
+            # it sets none) so the entrypoint starts as it did before; only the ownership
+            # of the bind mounts changes.
+            create_kwargs["user"] = await self._image_user(spec.image)
         # Publish the allocated SSH host port (D-05: fixed at provision time,
         # lives for the workspace's whole life). Only include the `ports`
         # kwarg when a port was actually allocated — never auto-assign an
@@ -318,6 +329,19 @@ class PodmanRuntime:
             runtime_id=container.id,
             root_path=spec.root_path,
         )
+
+    async def _image_user(self, image: str) -> str:
+        """The image's configured USER, or "0:0" when it sets none (podman's default)."""
+        try:
+            obj = await asyncio.to_thread(self._client.images.get, image)
+        except ImageNotFound as e:
+            raise ImageUnavailable(str(e)) from e
+        except (APIError, PodmanError, ConnectionError) as e:
+            raise RuntimeUnreachable(str(e)) from e
+        attrs = getattr(obj, "attrs", None)
+        config = attrs.get("Config") if isinstance(attrs, dict) else None
+        user = config.get("User") if isinstance(config, dict) else None
+        return user.strip() if isinstance(user, str) and user.strip() else "0:0"
 
     async def start(self, handle: WorkspaceHandle) -> None:
         container = await asyncio.to_thread(self._client.containers.get, handle.runtime_id)
