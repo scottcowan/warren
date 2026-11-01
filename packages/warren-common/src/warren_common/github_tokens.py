@@ -128,6 +128,34 @@ def github_grants_for(folders: Iterable["FolderSpec"]) -> dict[str, GitHubGrant]
     return grants
 
 
+# git_write templates: exactly these permissions, never admin/workflows/secrets.
+GIT_WRITE_PERMISSIONS = {"contents": "write", "pull_requests": "write"}
+
+
+def git_write_grants(folders: Iterable["FolderSpec"]) -> dict[str, GitHubGrant]:
+    """`git_write: true`: one grant per GitHub owner covering only the template's
+    writable (`git-worktree`, not `readonly`) github.com repos, with
+    GIT_WRITE_PERMISSIONS. Read-only folders and `git-clone` references are left
+    out, so the token can push to nothing the template doesn't develop on."""
+    repos: dict[str, list[str]] = {}
+    for folder in folders:
+        if folder.type != "git-worktree" or folder.readonly:
+            continue
+        parsed = parse_github_repo(folder.url)
+        if parsed is None:
+            continue
+        owner, repo = parsed
+        names = repos.setdefault(owner.lower(), [])
+        if repo not in names:
+            names.append(repo)
+    return {
+        owner: GitHubGrant(
+            owner=owner, repositories=tuple(sorted(names)), permissions=dict(GIT_WRITE_PERMISSIONS)
+        )
+        for owner, names in repos.items()
+    }
+
+
 def grant_for_path(grants: Mapping[str, GitHubGrant], path: str | None) -> GitHubGrant | None:
     """The grant that covers `owner/repo(.git)`, or None if the repo isn't granted.
 
@@ -232,12 +260,15 @@ class GitHubAppMinter:
         self._installations[grant.owner] = installation_id
         return installation_id
 
-    def issue(self, grant: GitHubGrant) -> IssuedToken:
+    def issue(self, grant: GitHubGrant, *, fresh: bool = False) -> IssuedToken:
+        """`fresh=True` always mints and never touches the cache: for a token that
+        one workspace owns and that gets revoked on its own lifecycle (git_write),
+        so revoking it can't break another workspace sharing the same grant."""
         if not grant.repositories:
             raise TokenIssuerError("refusing to mint a token with no repositories")
         cache_key = (grant.owner, grant.repositories, tuple(sorted(grant.permissions.items())))
         with self._lock:
-            cached = self._cache.get(cache_key)
+            cached = None if fresh else self._cache.get(cache_key)
             if cached is not None and cached.expires_at - self._clock() > _REMINT_MARGIN_SECONDS:
                 return cached
             signed = self._jwt()
@@ -270,8 +301,28 @@ class GitHubAppMinter:
                 expires_at=_parse_expiry(payload.get("expires_at"), self._clock()),
                 grant=grant,
             )
-            self._cache[cache_key] = issued
+            if not fresh:
+                self._cache[cache_key] = issued
             return issued
+
+    def revoke(self, token: str) -> bool:
+        """DELETE /installation/token, authenticated by the token itself. True when
+        GitHub confirmed (204) or the token was already invalid (401)."""
+        import httpx  # noqa: PLC0415
+
+        try:
+            with self._client() as client:
+                resp = client.delete(
+                    f"{self.api_base}/installation/token",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/vnd.github+json",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                    },
+                )
+        except httpx.HTTPError as exc:
+            raise TokenIssuerError("github installation-token revoke failed") from exc
+        return resp.status_code in (204, 401)
 
 
 # Workspace-side files. Same layout for every issuer: only the endpoint URL and
