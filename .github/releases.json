@@ -58,6 +58,14 @@
       "paths": [
         "packages/warren-server/images/warren-ecs-dev-base/"
       ]
+    },
+    "warren-ecs-ssh-base": {
+      "version": "0.0.0",
+      "dockerfile": "packages/warren-server/images/warren-ecs-ssh-base/Dockerfile",
+      "context": "packages/warren-server/images/warren-ecs-ssh-base",
+      "paths": [
+        "packages/warren-server/images/warren-ecs-ssh-base/"
+      ]
     }
   }
 }

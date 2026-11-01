@@ -16,6 +16,7 @@ warren proxy add <workspace> <remote-port> [--local-port N] [--server NAME]
 warren proxy list [--json]
 warren proxy rm <local-port | workspace | workspace:remote-port> [--server NAME]
 warren proxy run [--idle-minutes M] [--keepalive-seconds S] [--log-level info]
+warren proxy stdio <workspace> <remote-port> [--server NAME]
 ```
 
 - `add` records a mapping and prints its address. It does not contact AWS. The
@@ -26,6 +27,9 @@ warren proxy run [--idle-minutes M] [--keepalive-seconds S] [--log-level info]
   rereads the mapping file every few seconds, so `add`/`rm` take effect without a
   restart. It logs with the CLI's structlog setup: JSON lines when stderr is not a
   terminal, which suits launchd and journald.
+- `stdio` forwards one connection: it resolves the task, starts a forward and pipes
+  stdin/stdout through it until either side closes. It is an ssh `ProxyCommand`; see
+  `warren ssh-config` and [ecs-ssh.md](ecs-ssh.md).
 - Mappings live in `~/.warren/proxy.json` (owner-only), next to the CLI's
   `config.toml`.
 

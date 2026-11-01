@@ -403,7 +403,7 @@ def render_summary(changes: list[Change], notes: list[str], warnings: "list[str]
         ]
     lines += [
         "Merge only after the dispatched smoke tests pass on this branch. Images that FROM a "
-        "bumped image by digest (warren-agent-base, warren-ecs-agent-base) need a publish + digest "
+        "bumped image by digest (warren-agent-base, warren-ecs-agent-base, warren-ecs-ssh-base) need a publish + digest "
         "bump afterwards.",
     ]
     return "\n".join(lines) + "\n"

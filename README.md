@@ -134,7 +134,8 @@ local runtimes (warren-common, used by the warren CLI directly, no server involv
 container images
 ├── warren-base / warren-ecs-base           minimal — git, ssh-client/jq/curl, uv; no sshd
 ├── warren-dev-base / warren-ecs-dev-base   + Claude Code CLI, nvm/pyenv, common dev tools
-└── warren-agent-base / warren-ecs-agent-base   stubs for purpose-built agent tooling (deferred)
+├── warren-agent-base / warren-ecs-agent-base   stubs for purpose-built agent tooling (deferred)
+└── warren-ecs-ssh-base                     opt-in: + sshd on the task's loopback for editors, over SSM (docs/ecs-ssh.md)
 
 warren-sidecar (in-workspace)
 └── agent-state recorder: tails the tmux pane for OSC 7501 state and writes

@@ -170,3 +170,38 @@ def proxy_run(
         asyncio.run(_main())
     except KeyboardInterrupt:
         pass
+
+
+@proxy_app.command("stdio")
+def proxy_stdio(
+    workspace: str = typer.Argument(help="Workspace ID (or a prefix unique on that server)"),
+    remote_port: int = typer.Argument(help="Port inside the workspace (2222: warren-ecs-ssh-base's sshd)"),
+    server: Optional[str] = typer.Option(None, "--server", help="ECS remote profile (default: the only one)"),
+    config: Optional[Path] = typer.Option(None, "--config"),
+) -> None:
+    """Pipe stdin/stdout through an SSM port-forward to a workspace port: an ssh
+    ProxyCommand (see `warren ssh-config` and docs/ecs-ssh.md)."""
+    import os  # noqa: PLC0415
+
+    from .. import ssh_access  # noqa: PLC0415
+
+    cfg = _load_cfg(config)
+    server = _pick_server(cfg, server)
+    # stdin/stdout carry the SSH stream: keep private copies for the relay, and point
+    # fds 0/1 at /dev/null and stderr so no child (aws, session-manager-plugin) or stray
+    # print can read from or write into it.
+    in_fd, out_fd = os.dup(0), os.dup(1)
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull, 0)
+    os.close(devnull)
+    os.dup2(2, 1)
+    try:
+        ssh_access.run_stdio(cfg, server, workspace, remote_port, in_fd=in_fd, out_fd=out_fd)
+    except core.ProxyError as exc:
+        ui.error(f"warren proxy stdio: {exc}")
+        raise typer.Exit(1) from exc
+    finally:
+        os.dup2(in_fd, 0)
+        os.dup2(out_fd, 1)
+        os.close(in_fd)
+        os.close(out_fd)
