@@ -31,6 +31,9 @@ class WarrenSettings(BaseSettings):
         env_prefix="WARREN_",
         frozen=True,
         extra="ignore",
+        # A validation error must not echo a rejected value: several (secret key,
+        # bootstrap token, notify webhook URL) are credentials.
+        hide_input_in_errors=True,
     )
 
     secret_key: SecretStr
@@ -357,6 +360,36 @@ class WarrenSettings(BaseSettings):
     # permission wait until blocked this long, anything at most hook_max_hold_seconds.
     blocked_ttl_seconds: float = 4 * 3600.0
     hook_max_hold_seconds: float = 24 * 3600.0
+
+    # Agent notifications (warren.notify): a server-wide webhook every event goes to
+    # (operator-set, https only, never logged), plus per-owner webhooks registered
+    # through PUT /notifications/webhook. notify_enabled=False turns both off.
+    notify_enabled: bool = True
+    notify_webhook_url: SecretStr | None = None
+    notify_format: Literal["json", "slack"] = "json"
+    # Comma-separated event names for the server-wide webhook; empty means all.
+    notify_events: str = ""
+    notify_poll_interval: float = Field(default=30.0, gt=0)
+    notify_dedupe_seconds: float = Field(default=300.0, ge=0)
+    notify_timeout_seconds: float = Field(default=5.0, gt=0)
+    notify_max_retries: int = Field(default=3, ge=0, le=10)
+    notify_queue_size: int = Field(default=100, ge=1, le=10_000)
+
+    @field_validator("notify_webhook_url")
+    @classmethod
+    def _validate_notify_webhook_url(cls, v: SecretStr | None) -> SecretStr | None:
+        if v is None:
+            return None
+        from warren.notify.targets import validate_webhook_url  # noqa: PLC0415
+
+        raw = v.get_secret_value().strip()
+        if not raw:
+            return None
+        try:
+            return SecretStr(validate_webhook_url(raw))
+        except ValueError:
+            # Never echo the value: a webhook URL is a credential.
+            raise ValueError("WARREN_NOTIFY_WEBHOOK_URL must be an https:// URL with no credentials") from None
 
     # AH2: how long a destroyed single-turn workspace's events (ending in
     # workspace.completed) stay replayable via GET /workspaces/{id}/events?since=.
