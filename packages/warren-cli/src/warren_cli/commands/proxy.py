@@ -1,4 +1,4 @@
-"""warren proxy — stable loopback addresses for ports inside ECS workspaces (see warren_cli.proxy)."""
+"""warren proxy — stable loopback addresses for ports inside workspaces (see warren_cli.proxy)."""
 
 from __future__ import annotations
 
@@ -19,8 +19,9 @@ from ..config import WarrenCLIConfig
 proxy_app = typer.Typer(
     no_args_is_help=True,
     help=(
-        "Stable 127.0.0.1 addresses for ports inside ECS workspaces, started on demand "
-        "over SSM (e.g. a `t3 serve` for the T3 Code app). See docs/proxy.md."
+        "Stable 127.0.0.1 addresses for ports inside workspaces, started on demand: over SSM "
+        "for ECS, over SSH (or directly, for a local server) for podman/docker "
+        "(e.g. a `t3 serve` for the T3 Code app). See docs/proxy.md."
     ),
 )
 
@@ -34,15 +35,23 @@ def _load_cfg(config: Optional[Path]) -> WarrenCLIConfig:
 
 
 def _pick_server(cfg: WarrenCLIConfig, server: Optional[str]) -> str:
+    """--server, else [defaults] server if the proxy can reach it, else the only remote
+    it can reach (ecs, ssh, or an http remote on this machine's loopback)."""
     if server:
         return server
-    ecs = sorted(name for name, r in cfg.remotes.items() if r.runtime_type == "ecs")
-    if len(ecs) == 1:
-        return ecs[0]
-    if not ecs:
-        ui.error("no ECS remotes configured — warren proxy only reaches ECS workspaces (add one with `warren remote add`)")
+    capable = sorted(name for name, r in cfg.remotes.items() if core.proxy_capable(r))
+    default = cfg.defaults.server
+    if default and default in capable:
+        return default
+    if len(capable) == 1:
+        return capable[0]
+    if not capable:
+        ui.error(
+            "no remotes warren proxy can reach: it needs an ecs or ssh remote, or an http remote on "
+            "this machine's loopback (add one with `warren remote add`)"
+        )
     else:
-        ui.error(f"more than one ECS remote ({', '.join(ecs)}): pass --server")
+        ui.error(f"more than one remote warren proxy can reach ({', '.join(capable)}): pass --server")
     raise typer.Exit(1)
 
 
@@ -64,15 +73,19 @@ def proxy_add(
     local_port: Optional[int] = typer.Option(
         None, "--local-port", help="Local port to use (default: the first free one from [proxy] port_base)"
     ),
-    server: Optional[str] = typer.Option(None, "--server", help="ECS remote profile (default: the only one)"),
+    server: Optional[str] = typer.Option(
+        None, "--server", help="Remote profile (default: [defaults] server, else the only ecs/ssh/local one)"
+    ),
     config: Optional[Path] = typer.Option(None, "--config"),
 ) -> None:
     """Record a mapping and print its stable local address.
 
-    With a port number nothing connects to AWS here; a port name or
+    With a port number nothing connects to the server here; a port name or
     --from-template reads the workspace's declared ports from the control plane.
-    `warren proxy run` starts the SSM session the first time something connects
-    to the address. Re-running is safe: existing mappings keep their address.
+    `warren proxy run` starts the forward (SSM for ECS, SSH for an ssh remote,
+    none for a local server) the first time something connects to the address.
+    On podman/docker only template-declared ports are published. Re-running is
+    safe: existing mappings keep their address.
     """
     if from_template and remote_port is not None:
         ui.error("pass a port or --from-template, not both")
@@ -195,7 +208,7 @@ def proxy_run(
     except core.ProxyError as exc:
         ui.error(str(exc))
         raise typer.Exit(1) from exc
-    daemon = core.ProxyDaemon(store, core.ControlPlaneResolver(cfg), core.SsmForwarder(), settings)
+    daemon = core.ProxyDaemon(store, core.ControlPlaneResolver(cfg), core.RuntimeForwarder(), settings)
 
     async def _main() -> None:
         stop = asyncio.Event()
