@@ -12,22 +12,60 @@ proxy is the long-running version of it.
 ## Commands
 
 ```bash
-warren proxy add <workspace> <remote-port> [--local-port N] [--server NAME]
+warren proxy add <workspace> <remote-port | port-name> [--local-port N] [--server NAME]
+warren proxy add <workspace> --from-template [--server NAME]
 warren proxy list [--json]
-warren proxy rm <local-port | workspace | workspace:remote-port> [--server NAME]
+warren proxy rm <local-port | workspace | workspace:remote-port | workspace/port-name> [--server NAME]
 warren proxy run [--idle-minutes M] [--keepalive-seconds S] [--log-level info]
 ```
 
-- `add` records a mapping and prints its address. It does not contact AWS. The
-  local port is picked once (the first free port from `port_base`, or the one you
-  pass with `--local-port`) and saved, so adding the same mapping again returns
-  the same address. `--server` defaults to your only ECS remote.
+- `add` records a mapping and prints its address. With a port number it does not
+  contact AWS. The local port is picked once (the first free port from
+  `port_base`, or the one you pass with `--local-port`) and saved, so adding the
+  same mapping again returns the same address. `--server` defaults to your only
+  ECS remote.
+- `add <workspace> <port-name>` and `add <workspace> --from-template` map ports
+  the workspace's template declares by name (see [Named ports](#named-ports)).
+  They read the names from the control plane (`GET /workspaces`), so they need
+  the same AWS access as `warren list`.
 - `run` serves every mapping in the foreground until it gets SIGINT/SIGTERM. It
   rereads the mapping file every few seconds, so `add`/`rm` take effect without a
   restart. It logs with the CLI's structlog setup: JSON lines when stderr is not a
   terminal, which suits launchd and journald.
 - Mappings live in `~/.warren/proxy.json` (owner-only), next to the CLI's
   `config.toml`.
+
+### Named ports
+
+A template can name the ports its workspace serves:
+
+```yaml
+templates:
+  t3:
+    ports:
+      t3: 3773                                  # shorthand for {port: 3773}
+      code: {port: 8080, description: code-server}
+```
+
+Names are lowercase letters, digits and `-`; ports are 1-65535 and no two names
+may share one. Nested templates merge `ports` key by key, the child winning, like
+`env`. Declaring a port exposes nothing by itself: it only tells the CLI what to
+map. The server returns the declared ports in each workspace's `ports` field.
+
+```bash
+warren proxy add <workspace> --from-template   # one mapping per declared port
+warren proxy add <workspace> t3                # just one, by name
+warren proxy list
+# http://127.0.0.1:47100   -> prod/<workspace>/code (port 8080)
+# http://127.0.0.1:47101   -> prod/<workspace>/t3 (port 3773)
+```
+
+Running `--from-template` again is safe: ports already mapped keep their local
+address and nothing new is printed as `added`. If the template later moves a name
+to a different port, the next `--from-template` points the same local address at
+the new port. If that new port is already mapped under another entry, `add` stops
+and asks you to `warren proxy rm` one of them. `--local-port` can't be combined
+with `--from-template`, since it maps a single port.
 
 ### Settings
 
@@ -221,12 +259,23 @@ workspace in the cluster.
 
 ## Using it with T3 Code
 
-With a workspace running `t3 serve` on, say, port 3773:
+With a workspace running `t3 serve` on, say, port 3773, declare the port in the
+template:
+
+```yaml
+templates:
+  t3:
+    ports: {t3: 3773}
+```
+
+Then connect with one command:
 
 ```bash
-warren proxy add <workspace> 3773      # prints http://127.0.0.1:47100
-warren proxy run                       # or keep it running under launchd/systemd
+warren proxy add <workspace> --from-template   # prints <server>/<workspace>/t3 added: http://127.0.0.1:47100
+warren proxy run                               # or keep it running under launchd/systemd
 ```
+
+`warren proxy add <workspace> 3773` still works for a template without `ports`.
 
 Then pair the T3 desktop app with `http://127.0.0.1:47100`. Don't use T3 Connect
 for company code: it relays traffic through T3's cloud. The workspace image and

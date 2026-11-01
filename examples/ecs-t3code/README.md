@@ -110,6 +110,7 @@ templates:
     permission: write
     harnesses: [claude]
     app: t3 serve --host 127.0.0.1 --port 3773 --no-browser --base-dir /var/lib/warren/t3
+    ports: {t3: 3773}   # lets `warren proxy add <workspace> --from-template` find it
 ```
 
 warren treats an `app` that isn't a shell or a harness as a service and passes it to the
@@ -126,9 +127,11 @@ t3 serve --port 3773 --no-browser --base-dir /var/lib/warren/t3   # in a tmux wi
 
 ## Pairing the T3 desktop app
 
-1. On your machine, run `warren proxy add <workspace> 3773`. It prints a stable
-   `127.0.0.1:<local-port>` that forwards to port 3773 inside the workspace. (`warren
-   proxy` is a new CLI command, being added separately.)
+1. On your machine, run `warren proxy add <workspace> --from-template` (and keep
+   `warren proxy run` going). With `ports: {t3: 3773}` in the template, it prints a
+   stable `127.0.0.1:<local-port>` for `<server>/<workspace>/t3` that forwards to port
+   3773 inside the workspace. Without `ports`, `warren proxy add <workspace> 3773` does
+   the same. See [docs/proxy.md](../../docs/proxy.md).
 2. Get a pairing link inside the workspace. `t3 serve` prints one when it starts. For
    a fresh one, run `t3 pair` from a warren shell in the workspace (pass `--ttl` and
    `--scope` to narrow it).
@@ -160,8 +163,8 @@ Pairing links and codes are passwords. Keep them out of logs, screenshots and is
   previews isn't installed. At startup the server warns that the sandbox is blocked.
   `t3 browser setup` needs root and apt, so add Chrome's libraries in a derived image if
   you need the panel.
-- **You'll need a different port if 3773 is taken.** Pick another `--port` and pass
-  the same number to `warren proxy add`.
+- **You'll need a different port if 3773 is taken.** Pick another `--port` and put
+  the same number in the template's `ports` (or pass it to `warren proxy add`).
 
 ## Verified locally (2026-10-31)
 

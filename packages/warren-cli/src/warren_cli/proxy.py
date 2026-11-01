@@ -28,7 +28,7 @@ import os
 import re
 import socket
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Protocol
 
@@ -104,6 +104,10 @@ class Mapping:
     workspace: str
     remote_port: int
     local_port: int
+    # The template's port name (`ports:` in the template), when the mapping was
+    # added by name or with --from-template. Not part of identity: naming an
+    # existing mapping must not restart its listener.
+    name: str | None = field(default=None, compare=False)
 
     @property
     def key(self) -> tuple[str, str, int]:
@@ -111,6 +115,8 @@ class Mapping:
 
     @property
     def label(self) -> str:
+        if self.name:
+            return f"{self.server}/{self.workspace}/{self.name}"
         return f"{self.server}/{self.workspace}:{self.remote_port}"
 
     @property
@@ -152,6 +158,7 @@ class MappingStore:
                     workspace=str(row["workspace"]),
                     remote_port=int(row["remote_port"]),
                     local_port=int(row["local_port"]),
+                    name=str(row["name"]) if row.get("name") else None,
                 )
             except (KeyError, TypeError, ValueError):
                 log.warning("proxy_mapping_skipped", reason="malformed entry", path=str(self.path))
@@ -162,7 +169,8 @@ class MappingStore:
     def save(self, mappings: Iterable[Mapping]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(json.dumps({"mappings": [asdict(m) for m in mappings]}, indent=2) + "\n")
+        rows = [{k: v for k, v in asdict(m).items() if k != "name" or v} for m in mappings]
+        tmp.write_text(json.dumps({"mappings": rows}, indent=2) + "\n")
         restrict_to_owner(tmp)
         os.replace(tmp, self.path)
 
@@ -173,6 +181,7 @@ class MappingStore:
         remote_port: int,
         *,
         local_port: int | None = None,
+        name: str | None = None,
         port_base: int = 47100,
         port_free: Callable[[int], bool] = _port_bindable,
     ) -> tuple[Mapping, bool]:
@@ -182,6 +191,12 @@ class MappingStore:
         mapping and its port unchanged, unless ``local_port`` asks for a different
         one. A new port is the first one from ``port_base`` that no other mapping
         uses and that nothing on this machine is listening on right now.
+
+        ``name`` labels the mapping ``<server>/<workspace>/<name>``. A name already
+        mapped on that workspace to a different remote port (the template changed
+        the port) moves to the new remote port and keeps its local port, so the
+        address stays stable; if the new remote port is already mapped too, that's
+        a conflict for the operator to resolve with ``warren proxy rm``.
         """
         if not _valid_port(remote_port):
             raise ProxyError(f"remote port {remote_port} is not a TCP port")
@@ -189,8 +204,32 @@ class MappingStore:
             raise ProxyError(f"local port {local_port} is not a TCP port")
         mappings = self.load()
         existing = next((m for m in mappings if m.key == (server, workspace, remote_port)), None)
+        if name:
+            named = next(
+                (m for m in mappings if (m.server, m.workspace, m.name) == (server, workspace, name) and m is not existing),
+                None,
+            )
+            if named is not None:
+                if existing is not None:
+                    raise ProxyError(
+                        f"{named.label} maps remote port {named.remote_port} but the workspace declares "
+                        f"{name!r} as {remote_port}, which {existing.label} already maps; "
+                        f"remove one with `warren proxy rm`"
+                    )
+                existing = named
         if existing and (local_port is None or local_port == existing.local_port):
-            return existing, False
+            if (existing.name or None) == (name or existing.name) and existing.remote_port == remote_port:
+                return existing, False
+            renamed = Mapping(
+                server=server,
+                workspace=workspace,
+                remote_port=remote_port,
+                local_port=existing.local_port,
+                name=name or existing.name,
+            )
+            self.save([renamed if m is existing else m for m in mappings])
+            return renamed, False
+        name = name or (existing.name if existing else None)
         others = [m for m in mappings if m is not existing]
         used = {m.local_port for m in others}
         if local_port is not None:
@@ -205,14 +244,14 @@ class MappingStore:
             )
             if port is None:
                 raise ProxyError(f"no free local port in {port_base}-{port_base + _PORT_SEARCH_SPAN - 1}")
-        mapping = Mapping(server=server, workspace=workspace, remote_port=remote_port, local_port=port)
+        mapping = Mapping(server=server, workspace=workspace, remote_port=remote_port, local_port=port, name=name)
         self.save([*others, mapping])
         return mapping, existing is None
 
     def remove(self, selector: str, *, server: str | None = None) -> list[Mapping]:
         """Remove mappings matching ``selector``: a local port, ``<workspace>`` (every
-        port of it) or ``<workspace>:<remote-port>``; ``server`` narrows the match.
-        Returns what was removed."""
+        port of it), ``<workspace>:<remote-port>`` or ``<workspace>/<port-name>``;
+        ``server`` narrows the match. Returns what was removed."""
         mappings = self.load()
 
         def matches(m: Mapping) -> bool:
@@ -220,6 +259,9 @@ class MappingStore:
                 return False
             if selector.isdigit():
                 return m.local_port == int(selector)
+            ws_, slash, port_name = selector.rpartition("/")
+            if slash and ws_ and port_name:
+                return m.workspace == ws_ and m.name == port_name
             ws, sep, port = selector.rpartition(":")
             if sep and port.isdigit():
                 return m.workspace == ws and m.remote_port == int(port)
@@ -291,6 +333,37 @@ def target_for(ws: dict, *, cluster: str, server: str) -> Target:
     )
 
 
+def declared_ports(ws: dict) -> dict[str, int]:
+    """The ``ports`` a workspace row from ``GET /workspaces`` declares, as
+    ``{name: port}`` (a server predating named ports sends none)."""
+    out: dict[str, int] = {}
+    raw = ws.get("ports")
+    if not isinstance(raw, dict):
+        return out
+    for name, entry in raw.items():
+        port = entry.get("port") if isinstance(entry, dict) else entry
+        if isinstance(port, int) and not isinstance(port, bool) and _valid_port(port):
+            out[str(name)] = port
+    return out
+
+
+async def fetch_workspaces(cfg: Any, server: str) -> list[dict]:
+    """``GET /workspaces`` on ``server``'s control plane, with operator-facing errors."""
+    from .client import make_remote_client  # noqa: PLC0415
+
+    remote = remote_for(cfg, server)
+    try:
+        async with make_remote_client(remote, timeout=15.0) as c:
+            r = await c.get("/workspaces")
+    except Exception as exc:  # tunnel or HTTP transport failure
+        raise credentials_error(str(exc)) or ProxyError(f"control plane for {server!r} unreachable: {exc}") from exc
+    if r.status_code in (401, 403):
+        raise ProxyError(f"control plane for {server!r} refused the request (HTTP {r.status_code})")
+    if not r.is_success:
+        raise ProxyError(f"control plane for {server!r} answered HTTP {r.status_code}")
+    return r.json()
+
+
 class ControlPlaneResolver:
     """Resolve a mapping's workspace to its current ECS task through the
     control plane (``GET /workspaces``), tunnelling to the orchestrator the same
@@ -307,22 +380,10 @@ class ControlPlaneResolver:
         return await asyncio.to_thread(asyncio.run, self._resolve(mapping))
 
     async def _resolve(self, mapping: Mapping) -> Target:
-        from .client import make_remote_client  # noqa: PLC0415
-
         remote = remote_for(self.cfg, mapping.server)
         cluster = remote.ecs_cluster or os.environ.get("WARREN_ECS_CLUSTER", "")
-        try:
-            async with make_remote_client(remote, timeout=15.0) as c:
-                r = await c.get("/workspaces")
-        except Exception as exc:  # tunnel or HTTP transport failure
-            raise credentials_error(str(exc)) or ProxyError(
-                f"control plane for {mapping.server!r} unreachable: {exc}"
-            ) from exc
-        if r.status_code in (401, 403):
-            raise ProxyError(f"control plane for {mapping.server!r} refused the request (HTTP {r.status_code})")
-        if not r.is_success:
-            raise ProxyError(f"control plane for {mapping.server!r} answered HTTP {r.status_code}")
-        return target_for(match_workspace(r.json(), mapping.workspace), cluster=cluster, server=mapping.server)
+        workspaces = await fetch_workspaces(self.cfg, mapping.server)
+        return target_for(match_workspace(workspaces, mapping.workspace), cluster=cluster, server=mapping.server)
 
 
 def remote_for(cfg: Any, server: str) -> Any:

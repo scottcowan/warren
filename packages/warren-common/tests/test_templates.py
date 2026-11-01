@@ -185,6 +185,72 @@ def test_env_rejects_reserved_or_invalid_names(name):
         ProjectConfig.model_validate({"name": "demo", "env": {name: "x"}})
 
 
+def _ports(cfg: ProjectConfig) -> dict:
+    return {name: (p.port, p.description) for name, p in cfg.ports.items()}
+
+
+def test_ports_accept_shorthand_and_full_form():
+    cfg = ProjectConfig.model_validate(
+        {"name": "demo", "ports": {"t3": 3773, "acp-1": {"port": 4000, "description": "ACP"}}}
+    )
+    assert _ports(cfg) == {"t3": (3773, ""), "acp-1": (4000, "ACP")}
+    assert ProjectConfig.model_validate({"name": "demo"}).ports == {}
+
+
+@pytest.mark.parametrize(
+    "ports",
+    [
+        {"T3": 3773},  # uppercase
+        {"t3_x": 3773},  # underscore
+        {"": 3773},
+        {"t3": 0},
+        {"t3": 65536},
+        {"t3": True},
+        {"t3": {"port": True}},
+        {"t3": "abc"},
+        {"t3": 3773, "web": {"port": 3773}},  # duplicate port
+    ],
+)
+def test_ports_reject_bad_names_ports_and_duplicates(ports):
+    with pytest.raises(ValueError):
+        ProjectConfig.model_validate({"name": "demo", "ports": ports})
+
+
+def test_ports_merge_key_by_key_through_nested_templates():
+    root = ProjectConfig.model_validate(
+        {
+            "name": "demo",
+            "ports": {"t3": 3773, "code": 8080},
+            "templates": {
+                "develop": {
+                    "ports": {"acp": 4000},
+                    "templates": {"claude": {"ports": {"code": {"port": 8081, "description": "moved"}}}},
+                }
+            },
+        }
+    )
+    assert _ports(resolve_template(root, "develop")) == {"t3": (3773, ""), "code": (8080, ""), "acp": (4000, "")}
+    assert _ports(resolve_template(root, "develop.claude")) == {
+        "t3": (3773, ""),
+        "code": (8081, "moved"),
+        "acp": (4000, ""),
+    }
+
+
+def test_ports_child_reusing_a_parent_port_under_another_name_is_rejected():
+    root = ProjectConfig.model_validate(
+        {"name": "demo", "ports": {"t3": 3773}, "templates": {"develop": {"ports": {"web": 3773}}}}
+    )
+    with pytest.raises(ValueError, match="both declare port 3773"):
+        resolve_template(root, "develop")
+
+
+def test_ports_merge_through_user_overlay():
+    base = ProjectConfig.model_validate({"name": "demo", "ports": {"t3": 3773}})
+    overlay = ProjectConfig.model_validate({"name": "demo", "ports": {"code": 8080}})
+    assert _ports(merge_projects(base, overlay)) == {"t3": (3773, ""), "code": (8080, "")}
+
+
 def test_template_env_for_drops_reserved_and_excluded_names():
     from warren_common.models import template_env_for
 

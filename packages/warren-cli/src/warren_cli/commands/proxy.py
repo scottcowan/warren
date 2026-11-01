@@ -46,10 +46,21 @@ def _pick_server(cfg: WarrenCLIConfig, server: Optional[str]) -> str:
     raise typer.Exit(1)
 
 
+def _declared_ports(cfg: WarrenCLIConfig, server: str, workspace: str) -> dict[str, int]:
+    """The workspace's template `ports` ({name: port}), read from the control plane."""
+    ws = core.match_workspace(asyncio.run(core.fetch_workspaces(cfg, server)), workspace)
+    return core.declared_ports(ws)
+
+
 @proxy_app.command("add")
 def proxy_add(
     workspace: str = typer.Argument(help="Workspace ID (or a prefix unique on that server)"),
-    remote_port: int = typer.Argument(help="Port inside the workspace"),
+    remote_port: Optional[str] = typer.Argument(
+        None, help="Port inside the workspace: a number, or a port name the workspace's template declares"
+    ),
+    from_template: bool = typer.Option(
+        False, "--from-template", help="Map every port the workspace's template declares under `ports:`"
+    ),
     local_port: Optional[int] = typer.Option(
         None, "--local-port", help="Local port to use (default: the first free one from [proxy] port_base)"
     ),
@@ -58,22 +69,55 @@ def proxy_add(
 ) -> None:
     """Record a mapping and print its stable local address.
 
-    Nothing connects to AWS here; `warren proxy run` starts the SSM session the
-    first time something connects to the address.
+    With a port number nothing connects to AWS here; a port name or
+    --from-template reads the workspace's declared ports from the control plane.
+    `warren proxy run` starts the SSM session the first time something connects
+    to the address. Re-running is safe: existing mappings keep their address.
     """
+    if from_template and remote_port is not None:
+        ui.error("pass a port or --from-template, not both")
+        raise typer.Exit(2)
+    if not from_template and remote_port is None:
+        ui.error("pass a port (number or declared name), or --from-template")
+        raise typer.Exit(2)
+    if from_template and local_port is not None:
+        ui.error("--local-port maps one port; it can't be combined with --from-template")
+        raise typer.Exit(2)
     cfg = _load_cfg(config)
     server = _pick_server(cfg, server)
+    store = core.MappingStore()
+    wanted: list[tuple[int, Optional[str]]]
     try:
         core.remote_for(cfg, server)
-        mapping, created = core.MappingStore().add(
-            server, workspace, remote_port, local_port=local_port, port_base=cfg.proxy.port_base
-        )
+        if remote_port is not None and remote_port.isdigit():
+            wanted = [(int(remote_port), None)]
+        else:
+            declared = _declared_ports(cfg, server, workspace)
+            if from_template:
+                if not declared:
+                    raise core.ProxyError(
+                        f"workspace {workspace!r} declares no ports (add `ports:` to its template, "
+                        "or map a port number)"
+                    )
+                wanted = [(port, name) for name, port in sorted(declared.items())]
+            elif remote_port in declared:
+                wanted = [(declared[remote_port], remote_port)]
+            else:
+                known = ", ".join(sorted(declared)) or "none"
+                raise core.ProxyError(
+                    f"workspace {workspace!r} declares no port named {remote_port!r} (declared: {known})"
+                )
+        results = [
+            store.add(server, workspace, port, local_port=local_port, name=name, port_base=cfg.proxy.port_base)
+            for port, name in wanted
+        ]
     except core.ProxyError as exc:
         ui.error(str(exc))
         raise typer.Exit(1) from exc
-    verb = "added" if created else "already mapped"
-    typer.echo(f"{mapping.label} {verb}: {mapping.address}")
-    if created:
+    for mapping, created in results:
+        verb = "added" if created else "already mapped"
+        typer.echo(f"{mapping.label} {verb}: {mapping.address}")
+    if any(created for _, created in results):
         typer.echo("Serve it with `warren proxy run` (picks up new mappings while running).", err=True)
 
 
@@ -92,12 +136,15 @@ def proxy_list(output_json: bool = typer.Option(False, "--json", help="Print JSO
         typer.echo("no mappings — add one with `warren proxy add <workspace> <port>`")
         return
     for m in sorted(mappings, key=lambda m: m.local_port):
-        typer.echo(f"{m.address:<24} -> {m.label}")
+        suffix = f" (port {m.remote_port})" if m.name else ""
+        typer.echo(f"{m.address:<24} -> {m.label}{suffix}")
 
 
 @proxy_app.command("rm")
 def proxy_rm(
-    selector: str = typer.Argument(help="Local port, <workspace>, or <workspace>:<remote-port>"),
+    selector: str = typer.Argument(
+        help="Local port, <workspace>, <workspace>:<remote-port> or <workspace>/<port-name>"
+    ),
     server: Optional[str] = typer.Option(None, "--server", help="Only mappings on this remote"),
 ) -> None:
     """Remove mappings (a running proxy stops serving them within a few seconds)."""
