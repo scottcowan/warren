@@ -359,6 +359,35 @@ terraform apply \
 terraform apply -var="image_uri=..." -var="env_suffix=staging"
 ```
 
+## ECS workspace images
+
+| Image | Base | What it is |
+| --- | --- | --- |
+| `ghcr.io/scottcowan/warren-ecs-base` | Debian bookworm-slim (glibc) since 2.0.0; 1.x was Alpine | The default `ecs_image`: entrypoint, `warren-session`, git-init, secrets handling, the uid 1000 `warren` user. No harnesses. |
+| `ghcr.io/scottcowan/warren-ecs-dev-base` | `warren-ecs-base` (Debian since 2.0.0) | + Claude Code, Node.js LTS, pyenv Python 3.12, uv, AWS CLI v2, ripgrep. |
+
+Built from [`packages/warren-server/images/ecs-base`](../../packages/warren-server/images/ecs-base/Dockerfile)
+and [`warren-ecs-dev-base`](../../packages/warren-server/images/warren-ecs-dev-base/Dockerfile).
+
+**ecs-base 2.0.0 moved from Alpine to Debian.** glibc means prebuilt PyPI manylinux
+wheels, prebuilt npm native addons and glibc-only tools (T3 Code, Playwright/Chrome)
+work without compiling. The workspace contract is unchanged: the same files at the same
+paths and modes, uid/gid 1000, `USER root`, `WORKDIR /home/warren` and the same
+`ENTRYPOINT`. The 1.x Alpine Dockerfile is in git history, and the 1.x images stay on
+GHCR.
+
+If you build an image `FROM warren-ecs-base` and install packages with `apk`, switch
+to `apt-get` when you move to 2.0.0 (`apt-get update && apt-get install -y
+--no-install-recommends ... && rm -rf /var/lib/apt/lists/*`), or stay on a pinned 1.x
+tag. Other differences for derived images:
+
+- su-exec is still `/sbin/su-exec`, built from the same upstream source Alpine
+  packages (bookworm has none).
+- bash reads `/etc/bash.bashrc`; `/etc/bash/bashrc` links to it.
+- git is 2.39 (bookworm), not 2.45.
+- `LANG=C.UTF-8` is set.
+- [`examples/ecs-t3code`](../../examples/ecs-t3code/) is an image built on 2.0.0.
+
 ## Wiring Outputs into warren-server
 
 After running any of the three tools, set these environment variables in warren-server's runtime

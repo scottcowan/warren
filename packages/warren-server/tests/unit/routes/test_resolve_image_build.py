@@ -190,7 +190,7 @@ async def test_ecs_runtime_uses_ecs_image_override_when_set():
 @pytest.mark.asyncio
 async def test_ecs_runtime_uses_its_own_default_not_docker_image():
     """When a template doesn't override `ecs_image`, ECS gets its own default
-    (the Alpine-based ecs-base image), never the docker_image default — the
+    (the Debian-based ecs-base image), never the docker_image default — the
     two fields are independent, not a fallback chain."""
     request = _make_request(image_build_enabled=True, runtime_type="ecs")
     project_cfg, template_cfg = _project_cfg(docker_image="localhost/warren-base:latest")

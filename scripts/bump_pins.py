@@ -18,23 +18,57 @@ What it checks:
                   manifest), so a bump is version-only.
     github-ssh    packages/warren-server/images/ecs-base/ssh_known_hosts (#29)
                   vs ``ssh_keys`` from https://api.github.com/meta.
+    aws-cli-key   packages/warren-server/images/warren-ecs-dev-base/aws-cli-team.asc
+                  (the AWS CLI Team key that verifies the AWS CLI v2 zip's .sig)
+                  vs the PGP PUBLIC KEY BLOCK in AWS's CLI install guide
+                  (https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html,
+                  which repeats it once per OS section; every copy must agree).
+                  Compared after whitespace normalisation; on drift --write replaces
+                  the file. ``gpg`` (throwaway GNUPGHOME) reads both keys' fingerprint
+                  and expiry:
+                    - fingerprint changed (rotation): also rewrites the fingerprint
+                      asserted by the dev-base Dockerfile's ``grep -q`` line, and the
+                      summary carries a ROTATED warning to check the new fingerprint
+                      against AWS's docs by hand before merging;
+                    - same fingerprint: reported as an expiry extension or another
+                      metadata change (new signatures, user ids).
+                  Warns when the resulting key expires within 60 days; once it has
+                  actually expired, --expired-key-marker flags it so the weekly job
+                  fails (see below). A page without
+                  the block, or with conflicting blocks, fails this check (a warning in
+                  the summary; the other checks still run). Without gpg on PATH the
+                  check is reported as skipped.
+
+Warnings also print as GitHub Actions ``::warning::`` annotations when GITHUB_ACTIONS=true.
 
 Usage:
     scripts/bump_pins.py                 # report only, exit 0
     scripts/bump_pins.py --write         # rewrite the pins in place
-    scripts/bump_pins.py --write --summary PATH --smoke-workflows PATH
+    scripts/bump_pins.py --write --summary PATH --smoke-workflows PATH --expired-key-marker PATH
 
 With --smoke-workflows, writes the file names of the smoke workflows whose
 ``paths:`` filter covers a changed image directory (one per line), so the
 workflow can dispatch them against the bump branch.
+
+With --expired-key-marker, creates that file (holding the reason) only when the AWS CLI key
+the image would build with, i.e. upstream's after this run's changes, is already past its
+expiry, and removes a stale one otherwise. The exit code stays 0 either way, so the workflow
+can still push the PR and dispatch smoke tests before failing on the marker in its last step.
+Near expiry and check failures are warnings only and never create the marker.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import html
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -45,10 +79,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCKERFILE_GLOBS = ("images/*/Dockerfile", "packages/warren-server/images/*/Dockerfile")
 KNOWN_HOSTS = Path("packages/warren-server/images/ecs-base/ssh_known_hosts")
 WORKFLOWS_DIR = Path(".github/workflows")
+AWS_CLI_KEY = Path("packages/warren-server/images/warren-ecs-dev-base/aws-cli-team.asc")
+AWS_CLI_DOCKERFILE = AWS_CLI_KEY.parent / "Dockerfile"
+AWS_CLI_KEY_EXPIRY_WARN_DAYS = 60
 
 NPM_DIST_TAGS_URL = "https://registry.npmjs.org/-/package/@anthropic-ai/claude-code/dist-tags"
 CLAUDE_MANIFEST_URL = "https://downloads.claude.ai/claude-code-releases/{version}/manifest.json"
 GITHUB_META_URL = "https://api.github.com/meta"
+AWS_CLI_INSTALL_GUIDE_URL = "https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
 
 _SEMVER = r"(\d+\.\d+\.\d+)"
 CLAUDE_PIN_PATTERNS = (
@@ -57,6 +95,8 @@ CLAUDE_PIN_PATTERNS = (
     re.compile(r"(ARG CLAUDE_CODE_VERSION=)" + _SEMVER),
 )
 _SSH_KEY = re.compile(r"(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]+={0,2}")
+_PGP_BLOCK = re.compile(r"-----BEGIN PGP PUBLIC KEY BLOCK-----.*?-----END PGP PUBLIC KEY BLOCK-----", re.S)
+_DEFAULT_GPG = object()  # sentinel: look gpg up on PATH
 
 # fetch(url) -> (status, body). Injected in tests; never raises for HTTP errors.
 Fetcher = Callable[[str], "tuple[int, bytes]"]
@@ -85,7 +125,7 @@ class Pin:
 
 @dataclass
 class Change:
-    kind: str  # "claude-code" | "github-ssh"
+    kind: str  # "claude-code" | "github-ssh" | "aws-cli-key"
     path: Path
     old: str
     new: str
@@ -190,6 +230,148 @@ def bump_github_ssh(root: Path, fetch: Fetcher, write: bool) -> "tuple[list[Chan
                    "added: " + (", ".join(added) or "none"))], []
 
 
+def normalise_pgp_block(text: str) -> str:
+    """Strip each line and the surrounding blank lines; one trailing newline."""
+    return "\n".join(line.strip() for line in text.strip().splitlines()) + "\n"
+
+
+def extract_pgp_blocks(page: str) -> list[str]:
+    """Every public key block on an HTML page: tags stripped, entities decoded, normalised."""
+    return [normalise_pgp_block(html.unescape(re.sub(r"<[^>]*>", "", m.group(0))))
+            for m in _PGP_BLOCK.finditer(page)]
+
+
+@dataclass
+class KeyInfo:
+    fingerprint: str
+    expires: Optional[dt.date]  # None = never; earliest of the primary key and any signing subkey
+    uids: "tuple[str, ...]"
+
+
+class GpgError(Exception):
+    pass
+
+
+def gpg_key_info(gpg: str, armored: str) -> KeyInfo:
+    """Read one public key with ``gpg --import-options show-only`` in a throwaway GNUPGHOME."""
+    with tempfile.TemporaryDirectory(prefix="bump-pins-gpg-") as tmp:
+        home = Path(tmp) / "gnupg"
+        home.mkdir(mode=0o700)
+        env = {**os.environ, "GNUPGHOME": str(home), "HOME": tmp}
+        try:
+            out = subprocess.run(
+                [gpg, "--batch", "--no-tty", "--with-colons", "--import-options", "show-only", "--import"],
+                input=armored.encode(), capture_output=True, env=env, timeout=60, check=True,
+            ).stdout.decode()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise GpgError(f"gpg could not read the key ({exc})") from exc
+    rows = [line.split(":") for line in out.splitlines()]
+    pubs = [r for r in rows if r[0] == "pub"]
+    if len(pubs) != 1:
+        raise GpgError(f"expected exactly one primary key, gpg found {len(pubs)}")
+    fprs = [r[9] for r in rows if r[0] == "fpr" and len(r) > 9]
+    if not fprs or not re.fullmatch(r"[0-9A-F]{40}", fprs[0]):
+        raise GpgError("gpg printed no fingerprint for the primary key")
+    # The primary key plus signing-capable subkeys (capabilities field has "s"): any may sign the zip.
+    stamps = [int(r[6]) for r in rows
+              if len(r) > 11 and r[6] and (r[0] == "pub" or (r[0] == "sub" and "s" in r[11]))]
+    expires = dt.datetime.fromtimestamp(min(stamps), dt.timezone.utc).date() if stamps else None
+    uids = tuple(r[9] for r in rows if r[0] == "uid" and len(r) > 9)
+    return KeyInfo(fprs[0], expires, uids)
+
+
+def spaced_fingerprint(fpr: str) -> str:
+    """gpg --fingerprint's layout: ``FB5D B77F D5C1 18B8 0511  ADA8 A631 0ACC 4672 475C``."""
+    groups = [fpr[i:i + 4] for i in range(0, len(fpr), 4)]
+    return " ".join(groups[:5]) + "  " + " ".join(groups[5:])
+
+
+def _describe(info: KeyInfo) -> str:
+    return f"{info.fingerprint}, expires {info.expires or 'never'}"
+
+
+def bump_aws_cli_key(root: Path, fetch: Fetcher, write: bool, gpg=_DEFAULT_GPG,
+                     today: Optional[dt.date] = None) -> "tuple[list[Change], list[str], list[str], Optional[str]]":
+    """Returns (changes, notes, warnings, expired); warnings go at the top of the summary.
+
+    ``expired`` is set (to the reason) only when the key the image would build with is past
+    its expiry; near expiry and failed/skipped checks leave it None.
+    """
+    key_path, docker_path = root / AWS_CLI_KEY, root / AWS_CLI_DOCKERFILE
+    if not key_path.exists():
+        return [], [f"aws-cli-key: {AWS_CLI_KEY} not found; skipped"], [], None
+
+    def failed(why: str) -> "tuple[list[Change], list[str], list[str], Optional[str]]":
+        return [], [], [f"aws-cli-key check FAILED: {why}. {AWS_CLI_KEY} was not checked; "
+                         f"see {AWS_CLI_INSTALL_GUIDE_URL}"], None
+
+    status, body = fetch(AWS_CLI_INSTALL_GUIDE_URL)
+    if status != 200:
+        return failed(f"GET {AWS_CLI_INSTALL_GUIDE_URL} returned {status}")
+    blocks = extract_pgp_blocks(body.decode("utf-8", "replace"))
+    if not blocks:
+        return failed("no PGP PUBLIC KEY BLOCK found in the install guide (page layout changed?)")
+    if len(set(blocks)) > 1:
+        return failed(f"the install guide has {len(set(blocks))} different PGP public key blocks")
+    upstream, current = blocks[0], normalise_pgp_block(key_path.read_text())
+    same = upstream == current
+
+    if gpg is _DEFAULT_GPG:
+        gpg = shutil.which("gpg")
+    if gpg is None:
+        state = "matches" if same else "DIFFERS from"
+        return [], [f"aws-cli-key: gpg not found; skipped (the install guide's key block {state} "
+                    f"{AWS_CLI_KEY.name})"], [], None
+    try:
+        cur, up = gpg_key_info(gpg, current), gpg_key_info(gpg, upstream)
+    except GpgError as exc:
+        return failed(str(exc))
+
+    changes: list[Change] = []
+    notes: list[str] = []
+    warnings: list[str] = []
+    if same:
+        notes.append(f"aws-cli-key: {AWS_CLI_KEY.name} matches the install guide ({_describe(cur)})")
+    else:
+        changes.append(Change("aws-cli-key", AWS_CLI_KEY, _describe(cur), _describe(up)))
+        docker = docker_path.read_text() if docker_path.exists() else ""
+        new_docker = docker
+        if up.fingerprint != cur.fingerprint:
+            warnings.append(
+                "**AWS CLI signing key ROTATED: verify the new fingerprint against AWS's docs before merging.** "
+                f"{cur.fingerprint} -> {up.fingerprint} ({', '.join(up.uids) or 'no user id'}). Compare it "
+                f"with the \"Key fingerprint\" line of {AWS_CLI_INSTALL_GUIDE_URL} in a browser, not via this job.")
+            old_spaced = spaced_fingerprint(cur.fingerprint)
+            if old_spaced in docker:
+                new_docker = docker.replace(old_spaced, spaced_fingerprint(up.fingerprint))
+                changes.append(Change("aws-cli-key", AWS_CLI_DOCKERFILE,
+                                      f"asserts {cur.fingerprint}", f"asserts {up.fingerprint}"))
+            else:
+                warnings.append(f"aws-cli-key: {AWS_CLI_DOCKERFILE} does not assert \"{old_spaced}\"; "
+                                "update its fingerprint check by hand")
+        elif up.expires != cur.expires:
+            notes.append(f"aws-cli-key: same key, expiry {cur.expires or 'never'} -> {up.expires or 'never'} "
+                         "(extension, no fingerprint change)")
+        else:
+            notes.append("aws-cli-key: same fingerprint and expiry, other key metadata changed "
+                         "(signatures or user ids)")
+        if write:
+            key_path.write_text(upstream)
+            if new_docker != docker:
+                docker_path.write_text(new_docker)
+
+    # Upstream's key is what the image builds with once this run's changes land.
+    today = today or dt.date.today()
+    expired: Optional[str] = None
+    if up.expires is not None and (up.expires - today).days <= AWS_CLI_KEY_EXPIRY_WARN_DAYS:
+        verb = "EXPIRED on" if up.expires < today else "expires on"
+        warnings.append(f"AWS CLI signing key {up.fingerprint} {verb} {up.expires} and the install guide has "
+                        "no newer key; warren-ecs-dev-base builds fail to verify the AWS CLI once it lapses")
+        if up.expires < today:
+            expired = f"AWS CLI signing key {up.fingerprint} expired on {up.expires} (checked {today})"
+    return changes, notes, warnings, expired
+
+
 def smoke_workflows_for(root: Path, changed: list[Path]) -> list[str]:
     """Smoke workflows whose path filters cover a changed file's image directory."""
     out: list[str] = []
@@ -200,8 +382,11 @@ def smoke_workflows_for(root: Path, changed: list[Path]) -> list[str]:
     return out
 
 
-def render_summary(changes: list[Change], notes: list[str]) -> str:
+def render_summary(changes: list[Change], notes: list[str], warnings: "list[str] | tuple[str, ...]" = ()) -> str:
     lines = ["Automated weekly pin check (AI6, `scripts/bump_pins.py`).", ""]
+    if warnings:
+        lines += [f"- :warning: {w}" for w in warnings]
+        lines.append("")
     if changes:
         lines += ["| Pin | File | Old | New |", "|---|---|---|---|"]
         lines += [f"| {c.kind} | `{c.path.as_posix()}` | {c.old} | {c.new} |" for c in changes]
@@ -224,26 +409,46 @@ def render_summary(changes: list[Change], notes: list[str]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def main(argv: Optional[list[str]] = None, fetch: Fetcher = http_fetch, root: Path = REPO_ROOT) -> int:
+def github_annotation(message: str) -> str:
+    """A ``::warning::`` workflow command, with %, CR and LF escaped as GitHub documents."""
+    escaped = message.replace("**", "").replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    return f"::warning title=bump_pins::{escaped}"
+
+
+def main(argv: Optional[list[str]] = None, fetch: Fetcher = http_fetch, root: Path = REPO_ROOT,
+         gpg=_DEFAULT_GPG, today: Optional[dt.date] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--write", action="store_true", help="rewrite pins in place")
     ap.add_argument("--channel", default="stable", help="npm dist-tag for Claude Code (default: stable)")
     ap.add_argument("--summary", type=Path, help="write a markdown PR body here")
     ap.add_argument("--smoke-workflows", type=Path, help="write affected smoke workflow names here")
+    ap.add_argument("--expired-key-marker", type=Path,
+                    help="create this file only if the AWS CLI key the image would use has expired")
     args = ap.parse_args(argv)
 
     changes, notes = bump_claude(root, fetch, args.channel, args.write)
     ssh_changes, ssh_notes = bump_github_ssh(root, fetch, args.write)
     changes += ssh_changes
     notes += ssh_notes
+    aws_changes, aws_notes, warnings, expired = bump_aws_cli_key(root, fetch, args.write, gpg=gpg, today=today)
+    changes += aws_changes
+    notes += aws_notes
 
-    summary = render_summary(changes, notes)
+    summary = render_summary(changes, notes, warnings)
     print(summary)
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        for w in warnings:
+            print(github_annotation(w))
     if args.summary:
         args.summary.write_text(summary)
     if args.smoke_workflows:
         wfs = smoke_workflows_for(root, [c.path for c in changes])
         args.smoke_workflows.write_text("".join(f"{w}\n" for w in wfs))
+    if args.expired_key_marker:
+        if expired:
+            args.expired_key_marker.write_text(expired + "\n")
+        else:
+            args.expired_key_marker.unlink(missing_ok=True)
     return 0
 
 

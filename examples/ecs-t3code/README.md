@@ -9,49 +9,33 @@ connects to it.
 in `.github/releases.json`, and no image-workflow path filter matches `examples/`. If you
 want to use it, build and push it yourself.
 
-## Why it isn't `FROM warren-ecs-base`
+## Base image: `warren-ecs-base` 2.0.0
 
-T3 Code's prebuilt server is glibc-only. On Alpine it fails with
-`fcntl64: symbol not found`, even with gcompat. So this image is Debian bookworm-slim
-with warren's ECS workspace contract rebuilt on top. Everything below matches
-[`packages/warren-server/images/ecs-base`](../../packages/warren-server/images/ecs-base/Dockerfile):
+This image targets **`warren-ecs-base` 2.0.0**, the first Debian bookworm-slim (glibc)
+release. T3 Code's prebuilt server is glibc-only: on the 1.x Alpine images it fails with
+`fcntl64: symbol not found`, even with gcompat. So build it on 2.0.0 or later, not 1.x.
 
-- The same files at the same paths and modes, copied out of the published,
-  digest-pinned `ghcr.io/scottcowan/warren-ecs-base:1.4.0`. That covers `entrypoint.sh`,
-  `warren-session`, `warren-init-volume`, `warren-git-materialize`,
-  `warren-harness-init`, `warren-state-hook`, `warren-agent-supervisor`,
-  `/usr/local/lib/warren/secrets.sh`, `/etc/warren/{harness.sh,banner.bash,ssh_known_hosts}`
-  and `/etc/zsh/zshrc`.
-- The same uid/gid 1000 `warren` user, with a 2755 `/home/warren` that has no skel files.
-- `/workspace` and `/var/lib/warren` owned by 1000.
-- `USER root`, `WORKDIR /home/warren`, `ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]`
-  and no CMD.
+Everything warren needs comes from ecs-base unchanged: `entrypoint.sh`,
+`warren-session`, `warren-init-volume`, `warren-git-materialize`, the harness and
+secrets helpers, `su-exec`, the uid/gid 1000 `warren` user, `USER root`,
+`WORKDIR /home/warren`, `ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]` and no CMD. This
+image only adds apt packages, Claude Code and t3, so the default workspace behaves the
+same as ecs-base. It idles on `tail -f /dev/null` as uid 1000 for ECS Exec, runs
+`WARREN_APP_CMD` when one is set, and uses the same git-init and secrets handling. It
+also works as the task's `git-init` container.
 
-The default workspace behaves the same as ecs-base. It idles on `tail -f /dev/null` as
-uid 1000 for ECS Exec, runs `WARREN_APP_CMD` when one is set, and uses the same git-init
-and secrets handling. The image also works as the task's `git-init` container.
-
-### Debian vs Alpine
-
-| Piece | ecs-base (Alpine) | here (Debian) |
-| --- | --- | --- |
-| `su-exec` | apk `su-exec` (musl) | bookworm has no `su-exec` package, so ncopa/su-exec 0.2 (the same source Alpine packages; sha256 pinned, matches Alpine's sha512) is built for glibc and installed as `/usr/sbin/su-exec`. `/sbin` is a symlink to `usr/sbin`, so `/sbin/su-exec` works. |
-| `warren-secrets-decrypt` | built in the image | ecs-base is published for linux/amd64 only. The binary is built from the ecs-base release commit (`3a0dbdd`) with ecs-base's Go image (same digest), tests and flags. On amd64 the build fails unless the result is byte-identical to the published binary (checked: both are sha256 `7ddb979f…1ddaf`). |
-| bash hooks | appended to `/etc/bash/bashrc` | Debian's bash reads `/etc/bash.bashrc`, so the same two lines are appended there, and `/etc/bash/bashrc` links to it. |
-| zsh | `/etc/zsh/zshrc` | same file. Debian's `zsh-newuser-install` menu is removed so a home without `.zshrc` doesn't prompt. |
-| `/etc/warren` | 0644 in ecs-base 1.4.0 | 0755. In 1.4.0 the directory has no search bit, so uid 1000 can't read `banner.bash` or `harness.sh`, and the warren shell commands are missing for the workspace user. This is an ecs-base bug, not a Debian difference. |
-| shell tools | busybox | dash, coreutils, findutils, sed, grep, mawk, tar. The scripts only use options these share with busybox (`stat -c`, `find -mindepth/-prune/-empty`, `base64 -d`, `mktemp`, `head -c`, `ls -ldn`, `sed -n -E`). Every absolute path the scripts call (`/bin/rm`, `/bin/stat`, `/usr/bin/id`, `/usr/bin/tmux`, `/sbin/su-exec`, …) exists through merged `/usr`. |
-| git | 2.45 | 2.39.5. The options git-materialize uses all predate 2.39, and its end-to-end checks pass (see below). |
+2.0.0 isn't published yet, so `WARREN_ECS_BASE` defaults to the
+`ghcr.io/scottcowan/warren-ecs-base:2.0.0` tag. Once it's published, pin it by digest
+for your own builds (`--build-arg WARREN_ECS_BASE=ghcr.io/scottcowan/warren-ecs-base:2.0.0@sha256:...`).
 
 ## What's in the image
 
 | | Version | Pinned by |
 | --- | --- | --- |
-| Debian | bookworm-slim (12.15) | index digest `sha256:99c0b25c…22b6f3` |
-| warren files | warren-ecs-base 1.4.0 | `ghcr.io/scottcowan/warren-ecs-base:1.4.0@sha256:43b4196a…c202b7` (commit `3a0dbddf74b405c4115249d8ebf0caf7d921712c`) |
+| base | warren-ecs-base 2.0.0 (Debian bookworm-slim) | `WARREN_ECS_BASE` (tag until 2.0.0 is published; pin by digest) |
 | t3 | 0.1.6 (stable) | `T3_VERSION` plus the per-arch sha256 from the release's `SHA256SUMS` |
 | Claude Code | 2.1.308 | `CLAUDE_CODE_VERSION`, sha256 from Anthropic's GPG-signed manifest |
-| apt | git, openssh-client, bash, zsh, tmux, ca-certificates, curl, python3 (3.11), jq, ripgrep | the bookworm archive at build time (not version-pinned) |
+| apt (on top of ecs-base) | curl, python3 (3.11), jq, ripgrep | the bookworm archive at build time (not version-pinned) |
 
 - **t3** comes from the release archive that `https://t3.codes/install.sh` downloads,
   `t3-<version>-linux-{arm64,x64}.tar.gz`. The archive is the `t3` executable plus the
@@ -82,6 +66,19 @@ docker buildx build --platform linux/arm64 --load -t warren-ecs-t3code:local exa
 # or, on an amd64 host / for an ECS task on X86_64:
 docker buildx build --platform linux/amd64 --load -t warren-ecs-t3code:local examples/ecs-t3code
 ```
+
+To build on an ecs-base you built from this repo (for example before 2.0.0 is
+published):
+
+```bash
+docker buildx build --platform linux/arm64 --load -t warren-ecs-base:local \
+  -f packages/warren-server/images/ecs-base/Dockerfile .
+docker buildx build --platform linux/arm64 --load -t warren-ecs-t3code:local \
+  --build-arg WARREN_ECS_BASE=warren-ecs-base:local examples/ecs-t3code
+```
+
+This needs a builder that can see local images (the `docker` driver, which Docker
+Desktop and colima use by default).
 
 Push it to a registry your ECS tasks can pull from (for example your ECR repository),
 then point a template's `docker_image` at that tag (or digest).
@@ -168,48 +165,19 @@ Pairing links and codes are passwords. Keep them out of logs, screenshots and is
 
 ## Verified locally (2026-10-31)
 
-Host: Apple Silicon Mac, colima (BuildKit v0.30.0), native linux/arm64. linux/amd64 was
-not run, because emulated Go/bun binaries crash on this host. The amd64-only part was
-checked by cross-compiling (below).
+Host: Apple Silicon Mac, colima (BuildKit v0.30.0), native linux/arm64, on an ecs-base
+built from this repo (`--build-arg WARREN_ECS_BASE=<local tag>`, the 2.0.0 Dockerfile).
+linux/amd64 was not run.
 
-```bash
-docker buildx build --platform linux/arm64 --load -t warren-ecs-t3code:local examples/ecs-t3code
-# built clean, first try; image 1.31 GB. Build-time checks print:
-#   t3 v0.1.6
-#   2.1.308 (Claude Code)
-
-# amd64 secrets-decrypt provenance (the Go stage runs on the build platform, so no emulation):
-docker buildx build --platform linux/amd64 --target secrets-decrypt \
-  --output type=local,dest=/tmp/decrypt-amd64 examples/ecs-t3code
-shasum -a 256 /tmp/decrypt-amd64/out/warren-secrets-decrypt /tmp/decrypt-amd64/published/warren-secrets-decrypt
-# 7ddb979f3bc6df7195af131fba8dfe0d670d11ae8a04e79a676b53bbcdd1ddaf  (both: byte-identical; the in-build cmp passed)
-```
-
-Then a script ran every applicable check from
-`.github/workflows/warren-ecs-base-smoke.yml` against the image, plus the T3 checks.
-**Result: 49 passed, 0 failed.**
-
-| Check | Command (abridged) | Result |
-| --- | --- | --- |
-| versions | `docker run --rm --entrypoint <tool> IMG --version` | t3 v0.1.6; Claude Code 2.1.308; git 2.39.5; bash 5.2.15; tmux 3.3a; OpenSSH 9.2p1; zsh 5.9; Python 3.11.2; jq 1.6; ripgrep 13.0.0; Debian 12.15 |
-| script syntax | `sh -n` and `bash -n` on entrypoint.sh, warren-session, warren-init-volume, warren-git-materialize, warren-harness-init, warren-state-hook, secrets.sh; `bash -n` harness.sh, banner.bash, /etc/bash.bashrc; `zsh -n /etc/zsh/zshrc`; `python3 -m py_compile warren-agent-supervisor` | all pass (`/bin/sh` is dash) |
-| su-exec | `--entrypoint /sbin/su-exec IMG 1000:1000 id` | `uid=1000(warren) gid=1000(warren) groups=1000(warren)`; HOME `/home/warren` |
-| entrypoint drop | `-e WARREN_APP_CMD='id -u; echo $HOME' IMG` | `1000 /home/warren` |
-| decrypt usage | `--entrypoint /usr/local/bin/warren-secrets-decrypt IMG` | `usage: warren-secrets-decrypt <workspace\|git-init>`, non-zero; no blob → fails, empty stdout; junk blob → app never runs |
-| modes | `stat -c %u:%g:%a` on the helpers, /usr, /usr/local{,/bin,/lib,/lib/warren}, /etc/warren | `0:0:755`; ssh_known_hosts `0:0:444`; secrets.sh `0:0:644`; /workspace, /var/lib/warren, /home/warren `1000:1000`, home 2755 and empty |
-| image config | `docker image inspect` | User=root, WorkingDir=/home/warren, Entrypoint=["/usr/local/bin/entrypoint.sh"], Cmd=null |
-| fresh volume | tmpfs on /var/lib/warren, `touch` as the app | `1000:1000` |
-| shell hooks | `su-exec warren bash -ic 'type -t warren'`, `zsh -ic 'whence -v warren'` | function from /etc/warren/harness.sh, no zsh-newuser menu |
-| warren-session PATH | planted su-exec/tmux/id first on PATH | not used; reaches tmux (`open terminal failed: not a terminal`) |
-| git-init (AH1) | file:// worktree materialize, then entrypoint | `1000:1000`, `/workspace` → `/var/lib/warren/workspace`, branch `warren/dev/abcdef12/code-app` |
-| EBS bare seeds | `--seed-key`, `refresh-seed`, seeded clone | `cloned from the seed` ×1, seed removed, sees the later commit |
-| EFS secrets | workspace.env + git-init.env on the volume | exported, both files gone, git PAT not loaded, root copy unreadable to warren |
-| idle workspace | `docker run -d IMG`, wait 5 s, `docker inspect`, `docker rm -f` | running; PID 1 `tail -f /dev/null` as uid 1000 |
-| t3 serve | `docker run -d -e WARREN_APP_CMD='exec t3 serve --host 127.0.0.1 --port 3773 --no-browser' IMG`; `docker exec … curl -sS -m 3 -w '%{http_code}' http://127.0.0.1:3773/` | HTTP 200 after 2 s (the web app's HTML); PID 1 is uid 1000; logs `Listening on`, `T3 Code server is ready.`, a pairing URL; one WARN (browser sandbox, see above) |
-| t3 pair | `docker exec … su-exec warren t3 pair --ttl 1m` | exit 0, pairing URL on `http://127.0.0.1:3773` |
-| t3 default bind | `WARREN_APP_CMD='exec t3 serve --no-browser'` | listens only on 127.0.0.1:3773 |
-
-Every container was started with `--rm` or removed with `docker rm -f`.
+- The build-time checks print `t3 v0.1.6` and `2.1.308 (Claude Code)`.
+- Image config is inherited from ecs-base: User=root, WorkingDir=/home/warren,
+  Entrypoint=["/usr/local/bin/entrypoint.sh"], Cmd=null, LANG=C.UTF-8.
+- `.github/scripts/ecs-base-smoke.sh` (the ecs-base smoke checks) passes against this
+  image too.
+- `docker run -d -e WARREN_APP_CMD='exec t3 serve --host 127.0.0.1 --port 3773 --no-browser' IMG`,
+  then `curl http://127.0.0.1:3773/` inside the container: HTTP 200 after 3 s, PID 1 is
+  uid 1000, and the log shows `Listening on http://127.0.0.1:3773` and
+  `T3 Code server is ready.`
 
 Not verified here: linux/amd64 runtime, and a real ECS task (Fargate pull, ECS Exec,
 EFS/EBS volumes, KMS decrypt against the real service). Pairing the desktop app
