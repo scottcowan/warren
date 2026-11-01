@@ -868,3 +868,37 @@ def test_provision_local_pin_green_rejects_non_github_repo(tmp_path: Path):
     projects_dir = _write_worktree_project(tmp_path, url="git@gitlab.com:acme/app.git")
     with pytest.raises(typer.Exit):
         provision_local("proj", "develop", projects_dir, runtime=_RecordingRuntime(), pin_green=True)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "far_side"),
+    [
+        ({}, "localhost:8420"),  # the control plane, as before
+        ({"remote_host": "127.0.0.1"}, "127.0.0.1:8420"),  # a published workspace port (warren proxy)
+        ({"remote_host": "::1"}, "[::1]:8420"),
+    ],
+)
+def test_start_ssh_port_forward_far_side_address(monkeypatch, kwargs, far_side):
+    captured: dict = {}
+
+    class _FakeProc:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+    def _fake_popen(argv, **_kw):
+        captured["argv"] = list(argv)
+        return _FakeProc()
+
+    monkeypatch.setattr("warren_cli.dispatch.shutil.which", lambda name: "/usr/bin/ssh")
+    monkeypatch.setattr("warren_cli.dispatch.subprocess.Popen", _fake_popen)
+    monkeypatch.setattr("warren_cli.dispatch._start_pipe_drainers", lambda proc: [])
+    monkeypatch.setattr(
+        "warren_cli.dispatch.socket.create_connection",
+        lambda *a, **k: __import__("contextlib").nullcontext(),
+    )
+    _, port = start_ssh_port_forward("node2", 8420, **kwargs)
+    argv = captured["argv"]
+    assert argv[argv.index("-L") + 1] == f"{port}:{far_side}"

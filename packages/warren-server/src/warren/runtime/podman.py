@@ -27,6 +27,7 @@ from warren_common.harness_shell import seed_env, server_env, shell_first, works
 from warren_common.models import template_env_for
 from warren_common.seed_prompt import app_command_with_seed
 from warren_common.runtime.base import ExecExit, WorkspaceHandle, WorkspaceSpec
+from warren_common.runtime.ports import app_port_bindings, loopback_publish_host, parse_published
 
 if TYPE_CHECKING:
     from warren.registry.events import WorkspaceEventBuffer
@@ -145,6 +146,9 @@ class PodmanRuntime:
         # app.py threads settings.egress_bridge_name through. "" = pasta default.
         self._egress_bridge_name = egress_bridge_name
         self._ssh_publish_host = ssh_publish_host
+        # Template-declared app ports always go on loopback, even if the SSH port
+        # was deliberately exposed wider (warren_common.runtime.ports).
+        self._app_publish_host = loopback_publish_host(ssh_publish_host)
 
     # --- ContainerRuntime Protocol surface ---
 
@@ -248,10 +252,16 @@ class PodmanRuntime:
         # Bound to `ssh_publish_host` (loopback by default): rootless podman
         # keeps host loopback unreachable from containers, so other workspaces
         # can't reach this port via the host or the bridge gateway.
+        ports: dict[str, Any] = {}
         if ssh_port is not None and publish_ssh_port:
-            create_kwargs["ports"] = {
-                "22/tcp": (self._ssh_publish_host, ssh_port) if self._ssh_publish_host else ssh_port
-            }
+            ports["22/tcp"] = (self._ssh_publish_host, ssh_port) if self._ssh_publish_host else ssh_port
+        # Template-declared `ports`: each on host loopback, host port 0 = podman picks
+        # a free one at create time (`published_ports` reads it back). Same isolation
+        # argument as the SSH port above; never 0.0.0.0.
+        for key, host in app_port_bindings(spec.ports, self._app_publish_host, taken=set(ports)).items():
+            ports[key] = (host, 0)
+        if ports:
+            create_kwargs["ports"] = ports
 
         # D-04: rootless `pasta` has no veth pair and so no host-readable byte
         # counters (04-RESEARCH.md Pitfall 1), so every workspace is attached to
@@ -322,6 +332,19 @@ class PodmanRuntime:
     async def start(self, handle: WorkspaceHandle) -> None:
         container = await asyncio.to_thread(self._client.containers.get, handle.runtime_id)
         await asyncio.to_thread(container.start)
+
+    async def published_ports(self, handle: WorkspaceHandle) -> dict[int, tuple[str, int]]:
+        """``{container_port: (host_ip, host_port)}`` for the container's loopback-published
+        tcp ports, read from inspect (podman assigns a requested host port 0 at create)."""
+        if not handle.runtime_id:
+            return {}
+        try:
+            container = await asyncio.to_thread(self._client.containers.get, handle.runtime_id)
+        except NotFound:
+            return {}
+        except (APIError, PodmanError, ConnectionError) as e:
+            raise RuntimeUnreachable(str(e)) from e
+        return parse_published((container.attrs.get("NetworkSettings") or {}).get("Ports"))
 
     async def build_image(self, spec: BuildSpec) -> str:
         """Build a project-supplied Containerfile into `spec.tag` (LIFE-04, D-09).

@@ -1,7 +1,7 @@
 """Finding 9: podman workspaces can't reach each other, nor the host's loopback services.
 
-Each workspace gets its own `isolate`d bridge and its SSH port is published on host
-loopback only. Every negative check has a positive control showing the target really is
+Each workspace gets its own `isolate`d bridge; its SSH port and template-declared ports
+are published on host loopback only. Every negative check has a positive control showing the target really is
 listening. Also covers the startup migration off the legacy shared bridge. Gated by
 `requires_podman`.
 """
@@ -234,3 +234,89 @@ async def test_reconcile_migrates_legacy_shared_bridge_workspace(
             )
         if await asyncio.to_thread(client.networks.exists, shared):
             await asyncio.to_thread(client.networks.remove, shared, True)
+
+
+async def test_declared_app_port_is_published_on_loopback_only_and_unreachable_from_other_workspaces(
+    itest_server_id: str,
+    itest_long_running_image: str,
+) -> None:
+    """A template-declared port (`ports:`) is published on host loopback on an ephemeral
+    host port: the host reaches it there (what `warren proxy` forwards to), nothing
+    binds it on a wildcard or LAN address, and another workspace can't reach it via
+    the host (gateway, host.containers.internal, slirp4netns/pasta host addresses, the
+    host's IP) or via the owning container's own IP."""
+    runtime = PodmanRuntime(socket_path=os.environ["PODMAN_SOCKET"], server_id=itest_server_id)
+    spec_a = _spec(itest_server_id, "aa", itest_long_running_image)
+    spec_b = _spec(itest_server_id, "ab", itest_long_running_image)
+    spec_b.ports = {"app": {"port": _PORT, "description": ""}}
+    handles = []
+    try:
+        handles.append(await runtime.provision(spec_a))
+        handles.append(await runtime.provision(spec_b))
+        handle_a, handle_b = handles
+
+        code, out = await _exec(
+            runtime,
+            handle_b.runtime_id,
+            f"mkdir -p /tmp/www && echo app-ok > /tmp/www/index.html && httpd -p {_PORT} -h /tmp/www",
+        )
+        assert code == 0, out
+
+        published = await runtime.published_ports(handle_b)
+        assert set(published) == {_PORT}, published
+        host_ip, host_port = published[_PORT]
+        assert host_ip == "127.0.0.1"
+        assert host_port > 0
+        container = await asyncio.to_thread(runtime._client.containers.get, handle_b.runtime_id)
+        bindings = container.attrs["NetworkSettings"]["Ports"][f"{_PORT}/tcp"]
+        assert {b["HostIp"] for b in bindings} == {"127.0.0.1"}, bindings
+
+        # Positive control: the host reaches it on loopback (the proxy's target).
+        url = f"http://127.0.0.1:{host_port}/"
+        for _ in range(20):
+            try:
+                body = await asyncio.to_thread(_http_get, url)
+                break
+            except OSError:
+                await asyncio.sleep(0.25)
+        assert "app-ok" in body
+
+        # Not on the host's LAN address, even from the host itself.
+        lan_ip = _host_ip()
+        if lan_ip and not lan_ip.startswith("127."):
+            with pytest.raises(OSError):
+                await asyncio.to_thread(_http_get, f"http://{lan_ip}:{host_port}/")
+
+        net_a = next(iter((await _networks(runtime, handle_a.runtime_id)).values()))
+        ip_b = next(iter((await _networks(runtime, handle_b.runtime_id)).values()))["IPAddress"]
+        hosts = {net_a["Gateway"], "host.containers.internal", "10.0.2.2", "169.254.1.2", lan_ip}
+        targets = [f"{h}:{host_port}" for h in sorted(filter(None, hosts))]
+        targets.append(f"{ip_b}:{_PORT}")
+        for target in targets:
+            code, out = await _exec(runtime, handle_a.runtime_id, f"wget -q -T 3 -O- http://{target}/")
+            assert code != 0, f"workspace A reached workspace B's app port at {target}: {out!r}"
+            assert "app-ok" not in out, target
+
+        # The CLI side, when its package is installed alongside (local server: no SSH):
+        # `warren proxy`'s direct path relays a client to that same host port.
+        try:
+            from warren_cli import proxy as cli_proxy
+        except ImportError:  # CI's server job installs only warren-server
+            return
+        target = cli_proxy.Target(workspace_id=spec_b.workspace_id, kind="direct", host=host_ip, host_port=host_port)
+
+        class _Resolver:
+            async def resolve(self, mapping):
+                return target
+
+        mapping = cli_proxy.Mapping(server="local", workspace=spec_b.workspace_id, remote_port=_PORT, local_port=_free_port())
+        mp = cli_proxy.MappingProxy(mapping, _Resolver(), cli_proxy.DirectForwarder(), cli_proxy.ProxySettings())
+        await mp.listen()
+        try:
+            assert "app-ok" in await asyncio.to_thread(_http_get, f"http://127.0.0.1:{mapping.local_port}/")
+        finally:
+            await mp.close()
+    finally:
+        for handle in handles:
+            await runtime.destroy(handle)
+    assert await _labelled_networks(runtime, itest_server_id) == []

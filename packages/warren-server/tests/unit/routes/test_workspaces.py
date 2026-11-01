@@ -1425,3 +1425,25 @@ def test_concurrent_provisions_never_exceed_per_user_cap(env_defaults, monkeypat
     assert codes.count(202) == 2
     assert codes.count(503) == 4
     assert len(rows) == 2
+
+
+def test_get_workspaces_returns_host_ports_next_to_ports(env_defaults, auth_headers):
+    """podman/docker: each declared port's loopback binding on the server host
+    (`warren proxy` forwards to it), and nothing for names the template doesn't declare."""
+    import json
+
+    owner_registry = _make_fake_registry()
+    with _lifespan_patches(owner_registry):
+        with TestClient(app, headers=auth_headers) as client:
+            app.state.registry = owner_registry
+            ws = _fake_workspace(status="running", owner_id=_bootstrap_user_id(client))
+            ws.spec_json = json.dumps({"ports": _DECLARED_PORTS})
+            ws.host_ports_json = json.dumps(
+                {"t3": {"host": "127.0.0.1", "port": 41001}, "other": {"host": "127.0.0.1", "port": 41009}}
+            )
+            owner_registry.store.list_all = AsyncMock(return_value=[ws])
+            listed = client.get("/workspaces")
+    assert listed.status_code == 200
+    row = listed.json()[0]
+    assert row["ports"] == _DECLARED_PORTS
+    assert row["host_ports"] == {"t3": {"host": "127.0.0.1", "port": 41001}}

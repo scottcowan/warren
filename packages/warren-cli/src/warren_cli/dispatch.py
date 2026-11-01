@@ -1456,8 +1456,13 @@ def _start_pipe_drainers(proc: subprocess.Popen) -> "collections.deque[str]":
     return tail
 
 
+def _forward_host(host: str) -> str:
+    """``host`` as ssh's ``-L`` wants it: an IPv6 literal in brackets."""
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
 def start_ssh_port_forward(
-    ssh_host: str, remote_port: int, *, ssh_key_path: str | None = None
+    ssh_host: str, remote_port: int, *, ssh_key_path: str | None = None, remote_host: str = "localhost"
 ) -> tuple[subprocess.Popen, int]:
     """Start a background SSH local port-forward to a podman/docker-mode
     server's control plane -- the plain-SSH equivalent of
@@ -1466,6 +1471,11 @@ def start_ssh_port_forward(
     ``127.0.0.1:8420`` on the server's own host, so ``warren remote add
     --ssh-host`` (``runtime_type="ssh"``) is the only way to reach it
     remotely without the caller hand-running ``ssh -L`` themselves first.
+
+    ``remote_host`` is the address on the far side the forward connects to
+    (``-L local:remote_host:remote_port``): ``localhost`` for the control plane,
+    the published loopback address (``127.0.0.1``) for a workspace port
+    (``warren proxy``).
 
     Returns ``(process, local_port)``; the caller must terminate the
     returned process once done, same contract as the ECS tunnel. Raises
@@ -1494,7 +1504,7 @@ def start_ssh_port_forward(
             "-N",
             "-o", "BatchMode=yes",  # never hang on an interactive password prompt if key auth fails
             "-o", "ExitOnForwardFailure=yes",  # fail fast if the forward itself can't bind, e.g. this race
-            "-L", f"{local_port}:localhost:{remote_port}",
+            "-L", f"{local_port}:{_forward_host(remote_host)}:{remote_port}",
         ]
         if ssh_key_path:
             argv += ["-i", str(Path(ssh_key_path).expanduser())]
