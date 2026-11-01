@@ -32,7 +32,9 @@ What it checks:
                       against AWS's docs by hand before merging;
                     - same fingerprint: reported as an expiry extension or another
                       metadata change (new signatures, user ids).
-                  Warns when the resulting key expires within 60 days. A page without
+                  Warns when the resulting key expires within 60 days; once it has
+                  actually expired, --expired-key-marker flags it so the weekly job
+                  fails (see below). A page without
                   the block, or with conflicting blocks, fails this check (a warning in
                   the summary; the other checks still run). Without gpg on PATH the
                   check is reported as skipped.
@@ -42,11 +44,17 @@ Warnings also print as GitHub Actions ``::warning::`` annotations when GITHUB_AC
 Usage:
     scripts/bump_pins.py                 # report only, exit 0
     scripts/bump_pins.py --write         # rewrite the pins in place
-    scripts/bump_pins.py --write --summary PATH --smoke-workflows PATH
+    scripts/bump_pins.py --write --summary PATH --smoke-workflows PATH --expired-key-marker PATH
 
 With --smoke-workflows, writes the file names of the smoke workflows whose
 ``paths:`` filter covers a changed image directory (one per line), so the
 workflow can dispatch them against the bump branch.
+
+With --expired-key-marker, creates that file (holding the reason) only when the AWS CLI key
+the image would build with, i.e. upstream's after this run's changes, is already past its
+expiry, and removes a stale one otherwise. The exit code stays 0 either way, so the workflow
+can still push the PR and dispatch smoke tests before failing on the marker in its last step.
+Near expiry and check failures are warnings only and never create the marker.
 """
 
 from __future__ import annotations
@@ -283,15 +291,19 @@ def _describe(info: KeyInfo) -> str:
 
 
 def bump_aws_cli_key(root: Path, fetch: Fetcher, write: bool, gpg=_DEFAULT_GPG,
-                     today: Optional[dt.date] = None) -> "tuple[list[Change], list[str], list[str]]":
-    """Returns (changes, notes, warnings); warnings go at the top of the summary."""
+                     today: Optional[dt.date] = None) -> "tuple[list[Change], list[str], list[str], Optional[str]]":
+    """Returns (changes, notes, warnings, expired); warnings go at the top of the summary.
+
+    ``expired`` is set (to the reason) only when the key the image would build with is past
+    its expiry; near expiry and failed/skipped checks leave it None.
+    """
     key_path, docker_path = root / AWS_CLI_KEY, root / AWS_CLI_DOCKERFILE
     if not key_path.exists():
-        return [], [f"aws-cli-key: {AWS_CLI_KEY} not found; skipped"], []
+        return [], [f"aws-cli-key: {AWS_CLI_KEY} not found; skipped"], [], None
 
-    def failed(why: str) -> "tuple[list[Change], list[str], list[str]]":
+    def failed(why: str) -> "tuple[list[Change], list[str], list[str], Optional[str]]":
         return [], [], [f"aws-cli-key check FAILED: {why}. {AWS_CLI_KEY} was not checked; "
-                         f"see {AWS_CLI_INSTALL_GUIDE_URL}"]
+                         f"see {AWS_CLI_INSTALL_GUIDE_URL}"], None
 
     status, body = fetch(AWS_CLI_INSTALL_GUIDE_URL)
     if status != 200:
@@ -309,7 +321,7 @@ def bump_aws_cli_key(root: Path, fetch: Fetcher, write: bool, gpg=_DEFAULT_GPG,
     if gpg is None:
         state = "matches" if same else "DIFFERS from"
         return [], [f"aws-cli-key: gpg not found; skipped (the install guide's key block {state} "
-                    f"{AWS_CLI_KEY.name})"], []
+                    f"{AWS_CLI_KEY.name})"], [], None
     try:
         cur, up = gpg_key_info(gpg, current), gpg_key_info(gpg, upstream)
     except GpgError as exc:
@@ -350,11 +362,14 @@ def bump_aws_cli_key(root: Path, fetch: Fetcher, write: bool, gpg=_DEFAULT_GPG,
 
     # Upstream's key is what the image builds with once this run's changes land.
     today = today or dt.date.today()
+    expired: Optional[str] = None
     if up.expires is not None and (up.expires - today).days <= AWS_CLI_KEY_EXPIRY_WARN_DAYS:
         verb = "EXPIRED on" if up.expires < today else "expires on"
         warnings.append(f"AWS CLI signing key {up.fingerprint} {verb} {up.expires} and the install guide has "
                         "no newer key; warren-ecs-dev-base builds fail to verify the AWS CLI once it lapses")
-    return changes, notes, warnings
+        if up.expires < today:
+            expired = f"AWS CLI signing key {up.fingerprint} expired on {up.expires} (checked {today})"
+    return changes, notes, warnings, expired
 
 
 def smoke_workflows_for(root: Path, changed: list[Path]) -> list[str]:
@@ -407,13 +422,15 @@ def main(argv: Optional[list[str]] = None, fetch: Fetcher = http_fetch, root: Pa
     ap.add_argument("--channel", default="stable", help="npm dist-tag for Claude Code (default: stable)")
     ap.add_argument("--summary", type=Path, help="write a markdown PR body here")
     ap.add_argument("--smoke-workflows", type=Path, help="write affected smoke workflow names here")
+    ap.add_argument("--expired-key-marker", type=Path,
+                    help="create this file only if the AWS CLI key the image would use has expired")
     args = ap.parse_args(argv)
 
     changes, notes = bump_claude(root, fetch, args.channel, args.write)
     ssh_changes, ssh_notes = bump_github_ssh(root, fetch, args.write)
     changes += ssh_changes
     notes += ssh_notes
-    aws_changes, aws_notes, warnings = bump_aws_cli_key(root, fetch, args.write, gpg=gpg, today=today)
+    aws_changes, aws_notes, warnings, expired = bump_aws_cli_key(root, fetch, args.write, gpg=gpg, today=today)
     changes += aws_changes
     notes += aws_notes
 
@@ -427,6 +444,11 @@ def main(argv: Optional[list[str]] = None, fetch: Fetcher = http_fetch, root: Pa
     if args.smoke_workflows:
         wfs = smoke_workflows_for(root, [c.path for c in changes])
         args.smoke_workflows.write_text("".join(f"{w}\n" for w in wfs))
+    if args.expired_key_marker:
+        if expired:
+            args.expired_key_marker.write_text(expired + "\n")
+        else:
+            args.expired_key_marker.unlink(missing_ok=True)
     return 0
 
 

@@ -202,7 +202,19 @@ class AwsKeyFixture(RepoFixture):
             self.assertEqual(url, bump_pins.AWS_CLI_INSTALL_GUIDE_URL)
             return status, page or b""
 
-        return bump_pins.bump_aws_cli_key(self.root, fetch, write, gpg=gpg, today=today)
+        changes, notes, warnings, self.expired = bump_pins.bump_aws_cli_key(
+            self.root, fetch, write, gpg=gpg, today=today)
+        return changes, notes, warnings
+
+    def run_main_with_marker(self, key: str, today: dt.date) -> "tuple[int, Path]":
+        def fetch(url):
+            return (200, guide_with(key)) if url == bump_pins.AWS_CLI_INSTALL_GUIDE_URL else (404, b"")
+
+        marker = self.root / "expired-key"
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = bump_pins.main(["--write", "--expired-key-marker", str(marker)],
+                                fetch=fetch, root=self.root, gpg=GPG, today=today)
+        return rc, marker
 
 
 class TestAwsCliKeyNoGpg(AwsKeyFixture):
@@ -217,6 +229,7 @@ class TestAwsCliKeyNoGpg(AwsKeyFixture):
         page = INSTALL_GUIDE_A.replace("BEGIN PGP PUBLIC KEY BLOCK", "BEGIN SOMETHING ELSE").encode()
         changes, notes, warnings = self.run_check(page)
         self.assertEqual((changes, notes), ([], []))
+        self.assertIsNone(self.expired)  # a failed check is a warning, never a job failure
         self.assertIn("aws-cli-key check FAILED", warnings[0])
         self.assertIn("no PGP PUBLIC KEY BLOCK", warnings[0])
         self.assertEqual(self.read(self.ASC), KEY_A)
@@ -319,6 +332,33 @@ class TestAwsCliKeyGpg(AwsKeyFixture):
         _, notes, warnings = self.run_check(guide_with(KEY_A_EXTENDED), today=near)  # upstream extended it
         self.assertEqual(warnings, [])
         self.assertIn("extension", notes[0])
+
+    def test_expired_key_is_flagged_and_writes_marker(self):
+        self.run_check(guide_with(KEY_A), today=dt.date(2036, 1, 2))  # KEY_A expired 2036-01-01
+        self.assertIn(f"{FPR_A} expired on 2036-01-01", self.expired)
+        rc, marker = self.run_main_with_marker(KEY_A, dt.date(2036, 1, 2))
+        self.assertEqual(rc, 0)  # the workflow fails on the marker, after the PR/smoke steps
+        self.assertIn("expired on 2036-01-01", marker.read_text())
+
+    def test_near_expiry_is_not_flagged(self):
+        for today in (dt.date(2035, 12, 1), dt.date(2036, 1, 1)):  # 31 days out; the expiry day itself
+            _, _, warnings = self.run_check(guide_with(KEY_A), today=today)
+            self.assertEqual(len(warnings), 1, today)
+            self.assertIsNone(self.expired, today)
+        marker = self.root / "expired-key"
+        marker.write_text("stale\n")  # a leftover marker is removed when the key is fine
+        rc, marker = self.run_main_with_marker(KEY_A, dt.date(2035, 12, 1))
+        self.assertEqual((rc, marker.exists()), (0, False))
+
+    def test_normal_and_upstream_extended_keys_are_not_flagged(self):
+        self.run_check(guide_with(KEY_A), today=self.TODAY)
+        self.assertIsNone(self.expired)
+        # The checked-in key has expired but upstream extended it: the refreshed key is fine.
+        _, _, warnings = self.run_check(guide_with(KEY_A_EXTENDED), today=dt.date(2036, 1, 2), write=False)
+        self.assertIsNone(self.expired)
+        self.assertEqual(warnings, [])
+        rc, marker = self.run_main_with_marker(KEY_A, self.TODAY)
+        self.assertEqual((rc, marker.exists()), (0, False))
 
     def test_near_expiry_emits_actions_warning(self):
         def fetch(url):
