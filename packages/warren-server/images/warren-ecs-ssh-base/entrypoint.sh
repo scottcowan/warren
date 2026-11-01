@@ -1,5 +1,5 @@
 #!/bin/sh
-# warren-ecs-ssh-base entrypoint wrapper (docs/ecs-ssh.md). Installed at
+# warren-ecs-ssh-base entrypoint wrapper (docs/workspace-ssh.md). Installed at
 # /usr/local/bin/entrypoint.sh; ecs-base's own entrypoint moves to
 # /usr/local/lib/warren/ecs-entrypoint.sh and is otherwise unchanged.
 #

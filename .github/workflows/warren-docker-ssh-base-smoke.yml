@@ -1,0 +1,48 @@
+name: warren-docker-ssh-base smoke test
+# Build-only validation, path-scoped like the other image smoke tests. Publishing stays
+# separate, in warren-docker-ssh-base-image.yml, triggered only by a version tag.
+#
+# Builds FROM the digest-pinned, published warren-docker-dev-base (the same pin the
+# release builds), then runs .github/scripts/docker-ssh-base-smoke.sh: sshd -T
+# hardening, port 22 published on loopback only, a minted key logging in, passwords,
+# root and a wiped key refused, the host key surviving a restart.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - images/warren-docker-ssh-base/**
+      - .github/workflows/warren-docker-ssh-base-smoke.yml
+      - .github/scripts/docker-ssh-base-smoke.sh
+  push:
+    branches: [main]
+    paths:
+      - images/warren-docker-ssh-base/**
+      - .github/workflows/warren-docker-ssh-base-smoke.yml
+      - .github/scripts/docker-ssh-base-smoke.sh
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: images/warren-docker-ssh-base
+          file: images/warren-docker-ssh-base/Dockerfile
+          push: false
+          load: true
+          tags: warren-docker-ssh-base:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the built image
+        run: .github/scripts/docker-ssh-base-smoke.sh warren-docker-ssh-base:smoke

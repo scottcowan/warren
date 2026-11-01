@@ -32,6 +32,7 @@ updates:
     directories:
       - "/images/warren-docker-base"
       - "/images/warren-docker-dev-base"
+      - "/images/warren-docker-ssh-base"
       - "/images/warren-agent-base"
       - "/images/warren-base-claude-code"
       - "/packages/warren-server"

@@ -19,7 +19,7 @@ prints a block that jumps through the server host (or connects directly to a loc
 Both pin ``HostKeyAlias`` to ``warren-<server>-<workspace id>``, so a workspace's
 known_hosts entry is the same whatever task, forward port or route reaches it.
 
-See docs/ecs-ssh.md.
+See docs/workspace-ssh.md.
 """
 
 from __future__ import annotations
@@ -145,7 +145,7 @@ def render_ssh_config(
         comment=[
             f"warren workspace {workspace_id} on {server}: its sshd (warren-ecs-ssh-base) on the",
             f"task's 127.0.0.1:{port}, reached over SSM. Needs the aws CLI, session-manager-plugin",
-            "and ssm:StartSession on the task. See docs/ecs-ssh.md.",
+            "and ssm:StartSession on the task. See docs/workspace-ssh.md.",
         ],
         host=host or f"warren-{workspace_id[:8]}",
         hostname="127.0.0.1",
@@ -221,7 +221,7 @@ def render_podman_ssh_config(
         comment=[
             f"warren workspace {workspace_id} on {server}: the workspace's sshd, published on the",
             f"server host's 127.0.0.1:{port}, with a key minted for this config (another",
-            "`warren ssh-config` for this workspace replaces it). See docs/ecs-ssh.md.",
+            "`warren ssh-config` for this workspace replaces it). See docs/workspace-ssh.md.",
         ],
         host=host or f"warren-{workspace_id[:8]}",
         hostname="127.0.0.1",

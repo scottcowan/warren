@@ -180,7 +180,7 @@ def proxy_stdio(
     config: Optional[Path] = typer.Option(None, "--config"),
 ) -> None:
     """Pipe stdin/stdout through an SSM port-forward to a workspace port: an ssh
-    ProxyCommand (see `warren ssh-config` and docs/ecs-ssh.md)."""
+    ProxyCommand (see `warren ssh-config` and docs/workspace-ssh.md)."""
     import os  # noqa: PLC0415
 
     from .. import ssh_access  # noqa: PLC0415

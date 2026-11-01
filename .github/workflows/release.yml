@@ -81,6 +81,17 @@ jobs:
     with:
       tag: ${{ fromJSON(needs.tag.outputs.released)['warren-docker-dev-base'] }}
 
+  # FROMs a published warren-docker-dev-base by digest, so it doesn't wait on this run's.
+  warren-docker-ssh-base:
+    needs: tag
+    if: fromJSON(needs.tag.outputs.released)['warren-docker-ssh-base']
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/warren-docker-ssh-base-image.yml
+    with:
+      tag: ${{ fromJSON(needs.tag.outputs.released)['warren-docker-ssh-base'] }}
+
   warren-ecs-base:
     needs: tag
     if: fromJSON(needs.tag.outputs.released)['warren-ecs-base']

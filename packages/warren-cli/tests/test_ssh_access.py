@@ -89,8 +89,8 @@ def test_host_block_with_identity_file_alias_and_config():
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX quoting")
 def test_proxy_command_quotes_paths_and_escapes_percent():
-    cmd = ssh_access.proxy_command(server="prodecs", workspace_id=_WS, warren="/Users/a b/100%/warren")
-    assert cmd.startswith("'/Users/a b/100%%/warren' proxy stdio ")
+    cmd = ssh_access.proxy_command(server="prodecs", workspace_id=_WS, warren="/opt/a b/100%/warren")
+    assert cmd.startswith("'/opt/a b/100%%/warren' proxy stdio ")
 
 
 @pytest.mark.parametrize(

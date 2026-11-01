@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # warren-ecs-ssh-base — opt-in layer on top of warren-ecs-dev-base that adds an sshd for
 # editor remoting (VS Code Remote-SSH, Cursor, JetBrains Gateway). Published as
-# ghcr.io/scottcowan/warren-ecs-ssh-base. See docs/ecs-ssh.md.
+# ghcr.io/scottcowan/warren-ecs-ssh-base. See docs/workspace-ssh.md.
 #
 # ecs-base and dev-base deliberately ship no sshd: ECS Exec over SSM is the interactive
 # path (../ecs-base/Dockerfile's header). This image keeps that model. Its sshd:

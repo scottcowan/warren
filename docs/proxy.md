@@ -29,7 +29,7 @@ warren proxy stdio <workspace> <remote-port> [--server NAME]
   terminal, which suits launchd and journald.
 - `stdio` forwards one connection: it resolves the task, starts a forward and pipes
   stdin/stdout through it until either side closes. It is an ssh `ProxyCommand`; see
-  `warren ssh-config` and [ecs-ssh.md](ecs-ssh.md).
+  `warren ssh-config` and [workspace-ssh.md](workspace-ssh.md).
 - Mappings live in `~/.warren/proxy.json` (owner-only), next to the CLI's
   `config.toml`.
 

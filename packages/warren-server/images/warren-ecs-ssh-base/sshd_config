@@ -1,4 +1,4 @@
-# warren-ecs-ssh-base sshd configuration (/etc/ssh/sshd_config). See docs/ecs-ssh.md.
+# warren-ecs-ssh-base sshd configuration (/etc/ssh/sshd_config). See docs/workspace-ssh.md.
 #
 # sshd runs as the workspace user (uid 1000, `warren`), started by warren-sshd after
 # the entrypoint has dropped privileges. It is reached only through an SSM port-forward

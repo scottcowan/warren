@@ -49,7 +49,7 @@ def ssh_config(
     config: Optional[Path] = typer.Option(None, "--config"),
 ) -> None:
     """Print an ~/.ssh/config Host block for a workspace's sshd, for VS Code Remote-SSH,
-    Cursor or JetBrains Gateway (docs/ecs-ssh.md).
+    Cursor or JetBrains Gateway (docs/workspace-ssh.md).
 
     ECS (warren-ecs-ssh-base): the block's ProxyCommand is `warren proxy stdio <ws> 2222`,
     an SSM port-forward to the sshd on the task's 127.0.0.1:2222.

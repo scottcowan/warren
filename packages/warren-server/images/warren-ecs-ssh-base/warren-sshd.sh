@@ -1,5 +1,5 @@
 #!/bin/sh
-# warren-sshd: start the workspace's sshd (warren-ecs-ssh-base, docs/ecs-ssh.md).
+# warren-sshd: start the workspace's sshd (warren-ecs-ssh-base, docs/workspace-ssh.md).
 #
 # Runs as the workspace user (uid 1000), never root: entrypoint.sh (this image's
 # wrapper) calls it after ecs-base's entrypoint has loaded the secrets and dropped

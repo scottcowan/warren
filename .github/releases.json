@@ -41,6 +41,14 @@
         "images/warren-docker-dev-base/"
       ]
     },
+    "warren-docker-ssh-base": {
+      "version": "0.0.0",
+      "dockerfile": "images/warren-docker-ssh-base/Dockerfile",
+      "context": "images/warren-docker-ssh-base",
+      "paths": [
+        "images/warren-docker-ssh-base/"
+      ]
+    },
     "warren-ecs-base": {
       "version": "1.4.0",
       "dockerfile": "packages/warren-server/images/ecs-base/Dockerfile",
