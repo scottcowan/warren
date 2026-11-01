@@ -122,7 +122,8 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
         if settings.runtime_type in ("ecs", "docker"):
             await runtime.preflight()
         else:
-            await run_preflight(settings.podman_socket)
+            # host_data_dir unset means the server isn't containerized (config.py).
+            await run_preflight(settings.podman_socket, same_host=settings.host_data_dir is None)
 
     db = await open_db(db_path(settings), journal_mode=settings.sqlite_journal_mode)
     auth_store = AuthStore(db)
