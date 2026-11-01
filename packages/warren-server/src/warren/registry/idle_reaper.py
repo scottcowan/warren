@@ -46,6 +46,7 @@ from typing import Any
 
 import structlog
 
+from warren import notify
 from warren.network.egress import EgressUnavailable, read_container_egress_bytes
 from warren_common import agent_state as st
 
@@ -191,6 +192,9 @@ async def run_idle_reaper(
                     stopped = await registry.store.get(ws.workspace_id)
                     if stopped is not None and stopped.status == "stopped":
                         await registry.store.mark_idle_stopped(ws.workspace_id)
+                        notify.notify_workspace(
+                            registry, notify.IDLE_STOPPED, stopped, notify.idle_stopped_message(reason)
+                        )
 
                 except asyncio.CancelledError:
                     raise
