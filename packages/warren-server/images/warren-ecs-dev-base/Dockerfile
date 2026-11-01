@@ -4,7 +4,7 @@
 # Code plus common dev tools preinstalled, without touching ecs-base's own minimal,
 # no-sshd design (see ../ecs-base/Dockerfile's header).
 #
-# Debian bookworm (glibc) since 2.0.0, because warren-ecs-base 2.0.0 is; 1.x was Alpine.
+# Debian bookworm (glibc) since 1.3.0, because warren-ecs-base 1.5.0 is; 1.2 and earlier were Alpine.
 # Packages come from apt. Node is nodejs.org's official linux tarball (glibc-linked, so
 # prebuilt npm native addons load), the AWS CLI is AWS's official v2 installer (Debian's
 # `awscli` package is v1), Python is pyenv-compiled, and Claude Code is the glibc build.
@@ -24,11 +24,11 @@
 # against), a known, deliberately-unresolved broader supply-chain gap this audit
 # already tracks separately.
 #
-# WARREN_ECS_BASE: the ecs-base image this layers on. It names the 2.0.0 release by tag
+# WARREN_ECS_BASE: the ecs-base image this layers on. It names the 1.5.0 release by tag
 # because that's the first Debian release and it isn't published yet; pin it by digest
 # (tag@sha256:...) once it is. The smoke workflow builds ecs-base from the same commit and
 # passes it here, so the two are always tested together.
-ARG WARREN_ECS_BASE=ghcr.io/scottcowan/warren-ecs-base:2.0.0
+ARG WARREN_ECS_BASE=ghcr.io/scottcowan/warren-ecs-base:1.5.0
 FROM ${WARREN_ECS_BASE}
 ARG TARGETARCH
 
@@ -131,7 +131,7 @@ RUN curl -fsSL "https://raw.githubusercontent.com/pyenv/pyenv-installer/bdd89156
 # (https://code.claude.com/docs/en/setup#binary-integrity-and-code-signing). After
 # install.sh runs, verify the signature on that manifest and that the installed
 # binary's own checksum matches the manifest's entry for this image's actual
-# architecture (linux-{arm64,x64}, the glibc builds; the -musl ones were 1.x's) --
+# architecture (linux-{arm64,x64}, the glibc builds; the -musl ones were 1.2's) --
 # catching a tampered or corrupted binary even though the script that fetched it was
 # still TOFU.
 # R26/S12 (c): the installer's own $HOME/.local/bin/claude symlink target above
