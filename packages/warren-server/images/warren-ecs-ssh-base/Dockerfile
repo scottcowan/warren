@@ -18,12 +18,12 @@
 # Nothing changes for ecs-base or dev-base, and nothing here runs unless a template
 # uses this image.
 #
-# WARREN_ECS_DEV_BASE: the dev-base image this layers on. It names the 2.0.0 release by
-# tag (the first Debian dev-base, built FROM warren-ecs-base 2.0.0) because that isn't
+# WARREN_ECS_DEV_BASE: the dev-base image this layers on. It names the 1.3.0 release by
+# tag (the first Debian dev-base, built FROM warren-ecs-base 1.5.0) because that isn't
 # published yet; pin it by digest (tag@sha256:...) once it is, as
 # ../warren-ecs-agent-base pins dev-base. The smoke workflow builds ecs-base and
 # dev-base from the same commit and passes them in, so the three are tested together.
-ARG WARREN_ECS_DEV_BASE=ghcr.io/scottcowan/warren-ecs-dev-base:2.0.0
+ARG WARREN_ECS_DEV_BASE=ghcr.io/scottcowan/warren-ecs-dev-base:1.3.0
 FROM ${WARREN_ECS_DEV_BASE}
 
 # openssh-server from Debian's archive. Its postinst generates host keys under
