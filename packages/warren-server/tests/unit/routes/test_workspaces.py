@@ -734,6 +734,53 @@ def test_provision_bedrock_mode_threads_into_spec(env_defaults, auth_headers, te
     assert spec.template_env["CLAUDE_CODE_USE_BEDROCK"] == "1"
 
 
+_DECLARED_PORTS = {"t3": {"port": 3773, "description": ""}, "code": {"port": 8080, "description": "code-server"}}
+
+
+def test_provision_persists_named_ports_and_get_workspaces_returns_them(env_defaults, auth_headers):
+    """Template `ports` reach the spec and spec_json, and GET /workspaces returns
+    them (`warren proxy add --from-template` reads them there)."""
+    import json
+
+    resp, fake_registry = _provision_template(
+        auth_headers, {"ports": {"t3": 3773, "code": {"port": 8080, "description": "code-server"}}}
+    )
+    assert resp.status_code == 202
+    _, spec = fake_registry._do_provision.call_args.args
+    assert spec.ports == _DECLARED_PORTS
+    spec_json = fake_registry.store.insert.call_args.kwargs["spec_json"]
+    assert json.loads(spec_json)["ports"] == _DECLARED_PORTS
+
+    owner_registry = _make_fake_registry()
+    with _lifespan_patches(owner_registry):
+        with TestClient(app, headers=auth_headers) as client:
+            app.state.registry = owner_registry
+            ws = _fake_workspace(status="running", owner_id=_bootstrap_user_id(client))
+            ws.spec_json = spec_json
+            owner_registry.store.list_all = AsyncMock(return_value=[ws])
+            listed = client.get("/workspaces")
+    assert listed.status_code == 200
+    row = listed.json()[0]
+    assert row["ports"] == _DECLARED_PORTS
+    # Nothing else from the persisted spec leaks with it.
+    assert row["spec_json"] is None or json.loads(row["spec_json"]).keys() <= {"app"}
+
+
+def test_workspace_view_ports_tolerate_old_and_malformed_rows():
+    import json
+
+    from warren.registry.models import WorkspaceView
+
+    old = _fake_workspace(status="running")
+    old.spec_json = json.dumps({"app": "bash"})
+    assert WorkspaceView.from_workspace(old).ports == {}
+    bad = _fake_workspace(status="running")
+    bad.spec_json = json.dumps(
+        {"ports": {"ok": {"port": 80}, "big": {"port": 70000}, "flag": {"port": True}, "x": 5}}
+    )
+    assert {k: v.port for k, v in WorkspaceView.from_workspace(bad).ports.items()} == {"ok": 80}
+
+
 def test_provision_bedrock_rejects_claude_oauth_token_secret(env_defaults, auth_headers):
     resp, fake_registry = _provision_template(
         auth_headers, {"app": "claude", "model_access": "bedrock", "secrets": [{"name": "CLAUDE_CODE_OAUTH_TOKEN"}]}

@@ -10,7 +10,7 @@ accumulated parent as we go:
   child's value wins if the child set it, else the parent's carries through.
 - lists (mounts, secrets, docker_networks, harnesses): parent's items first, then the
   child's appended — additive, not replaced.
-- env: key-by-key merge, the child's value wins for a key both set.
+- env, ports: key-by-key merge, the child's value wins for a key both set.
 - scope/aws/ssh: shallow key-merge (child's explicitly-set sub-fields
   override the parent's, parent's other sub-fields carry through) — a child
   adding `ssh: {agent: true}` to a parent's `ssh: {keys: [...]}` must not
@@ -28,7 +28,7 @@ from .models import AgentConfig, AwsConfig, ProjectConfig, ScopeConfig, SshConfi
 _LIST_FIELDS = ("mounts", "secrets", "docker_networks", "harnesses")
 _SHALLOW_MERGE_FIELDS = ("scope", "aws", "ssh", "agent")
 _SHALLOW_MERGE_TYPES = {"scope": ScopeConfig, "aws": AwsConfig, "ssh": SshConfig, "agent": AgentConfig}
-_DICT_MERGE_FIELDS = ("env",)
+_DICT_MERGE_FIELDS = ("env", "ports")
 
 
 def _merge_fields(parent: ProjectConfig, child: ProjectConfig) -> dict:
