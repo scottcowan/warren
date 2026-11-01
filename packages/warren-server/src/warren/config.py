@@ -11,6 +11,7 @@ from typing import Annotated, Literal
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from warren.runtime.ecs_storage import OwnerStorage, parse_owner_storage
+from warren.runtime.userns import DEFAULT_PODMAN_USERNS, parse_podman_userns
 
 # Audit 2026-10-16 P2 #44: both secret_key and bootstrap_token are used as raw key
 # material (secret_key.encode() feeds auth/tokens.py's HMAC pepper derivation and
@@ -58,6 +59,12 @@ class WarrenSettings(BaseSettings):
             raise ValueError("WARREN_BEDROCK_GATEWAY_URL must be an https:// URL with no query or credentials")
         return v
 
+    @field_validator("podman_userns")
+    @classmethod
+    def _validate_podman_userns(cls, v: str) -> str:
+        parse_podman_userns(v)
+        return v.strip()
+
     @field_validator("bootstrap_token")
     @classmethod
     def _validate_bootstrap_token_entropy(cls, v: SecretStr | None) -> SecretStr | None:
@@ -72,6 +79,16 @@ class WarrenSettings(BaseSettings):
         return v
 
     podman_socket: Path = Path("/run/user/1000/podman/podman.sock")
+    # User namespace for rootless podman workspaces (podman only; the docker runtime is
+    # rootful and ignores it). The default `keep-id:uid=1000,gid=1000` (podman >= 4.3)
+    # maps the server's host user to container uid/gid 1000 -- `warren` in warren's
+    # images -- so the checkout and other bind mounts the server writes are owned by
+    # `warren` inside, and what `warren` writes is owned by the server user on the host.
+    # Container root is still an unprivileged subuid on the host. The entrypoint still
+    # starts as the image's USER (root for warren's images). "" or "host" turns it off:
+    # podman's default mapping, host user = container root (the behaviour before this
+    # setting existed). Other podman modes ("keep-id", "auto", "nomap") pass through.
+    podman_userns: str = DEFAULT_PODMAN_USERNS
     max_workspaces: int = 10
     # Issue #11: max_workspaces is a server-wide cap and doesn't stop one owner from
     # exhausting it for everyone. Checked against non-terminal workspaces with

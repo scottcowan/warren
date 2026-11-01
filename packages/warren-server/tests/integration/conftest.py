@@ -139,6 +139,32 @@ def itest_workspace_docker_image() -> Iterator[str]:
         client.close()
 
 
+_DOCKER_SSH_BASE_REF = "ghcr.io/scottcowan/warren-docker-ssh-base:latest"
+
+
+@pytest.fixture(scope="session")
+def itest_docker_ssh_base_image_if_present() -> str:
+    """warren-docker-ssh-base (PR #71), only if podman already has it: the image named by
+    WARREN_ITEST_DOCKER_SSH_BASE, else ghcr.io/scottcowan/warren-docker-ssh-base:latest.
+    Never pulled or built here (it's multi-GB), so the test skips without it."""
+    socket_path = os.environ.get("PODMAN_SOCKET")
+    if not socket_path:
+        pytest.skip("PODMAN_SOCKET not set")
+    ref = os.environ.get("WARREN_ITEST_DOCKER_SSH_BASE", "") or _DOCKER_SSH_BASE_REF
+    if ref == "build":
+        pytest.skip("WARREN_ITEST_DOCKER_SSH_BASE=build is not supported here; name a local image")
+
+    from podman import PodmanClient
+
+    client = PodmanClient(base_url=f"unix://{socket_path}", timeout=30)
+    try:
+        if not client.images.exists(ref):
+            pytest.skip(f"{ref} not available locally")
+    finally:
+        client.close()
+    return ref
+
+
 @pytest.fixture
 def itest_env(
     monkeypatch: pytest.MonkeyPatch,

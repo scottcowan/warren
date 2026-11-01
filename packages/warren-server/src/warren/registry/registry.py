@@ -10,7 +10,6 @@ import asyncio
 import json
 import os
 import re
-import shutil
 import stat
 import uuid
 from dataclasses import dataclass
@@ -239,6 +238,30 @@ _TMUX_CLIENTS = (
 )
 
 
+def _is_permission_error(exc: BaseException) -> bool:
+    """A host-side read refused for ownership (read_nofollow wraps the OSError)."""
+    return isinstance(exc, PermissionError) or isinstance(exc.__cause__, PermissionError)
+
+
+def _state_reader_via_runtime(registry: object, ws: "Workspace"):
+    """A reader for `<harness root>/<relative>` inside `ws`'s container, or None when the
+    runtime can't read container files or the harness dir isn't a podman bind mount."""
+    read_file = getattr(getattr(registry, "runtime", None), "read_file", None)
+    harness_dir = getattr(registry, "_harness_state_dir", None)
+    if read_file is None or harness_dir is None or not ws.container_id:
+        return None
+    if harness_dir(ws.workspace_id) is None:
+        return None
+    from warren_common.harness import SERVER_HARNESS_ROOT  # noqa: PLC0415
+
+    handle = WorkspaceHandle(workspace_id=ws.workspace_id, runtime_id=ws.container_id, root_path=ws.root_path)
+
+    async def _reader(relative: str, max_bytes: int) -> "bytes | None":
+        return await read_file(handle, f"{SERVER_HARNESS_ROOT}/{relative}", max_bytes)
+
+    return _reader
+
+
 class WorkspaceDestroyedError(Exception):
     """Raised by ensure_running()/issue_ssh_credential() for a workspace row
     whose status is "destroyed" (finding 8) -- the owner explicitly deleted
@@ -384,20 +407,34 @@ class WorkspaceRegistry:
         base = self._agent_state_dir(ws)
         if base is None:
             return None
-
-        def _read(name: str, source: str, *sub: str) -> "AgentState | None":
+        # Under a keep-id userns (WARREN_PODMAN_USERNS) a harness running as container
+        # root writes these files as a subuid, mode 0600, which the server user can't
+        # open host-side. Those reads go through the runtime instead (podman's
+        # get_archive, inside the container), only when the host read is refused.
+        def _read_host(name: str, *sub: str) -> "bytes | None | Exception":
             try:
-                raw = read_nofollow(base, (SESSION_DIR, *sub, name), st.MAX_STATE_BYTES)
-                return st.parse_state(raw, source=source)
-            except Exception:
-                return None
+                return read_nofollow(base, (SESSION_DIR, *sub, name), st.MAX_STATE_BYTES)
+            except Exception as exc:
+                return exc
 
-        hook = await asyncio.to_thread(_read, st.STATE_FILE, "hook")
-        osc = None if hook is not None else await asyncio.to_thread(_read, st.OSC_STATE_FILE, "osc")
+        async def _read(name: str, source: str, *sub: str) -> "AgentState | None":
+            raw = await asyncio.to_thread(_read_host, name, *sub)
+            if isinstance(raw, Exception):
+                via_runtime = _state_reader_via_runtime(self, ws) if _is_permission_error(raw) else None
+                if via_runtime is None:
+                    return None
+                try:
+                    raw = await via_runtime("/".join((SESSION_DIR, *sub, name)), st.MAX_STATE_BYTES)
+                except Exception:
+                    return None
+            return st.parse_state(raw, source=source)
+
+        hook = await _read(st.STATE_FILE, "hook")
+        osc = None if hook is not None else await _read(st.OSC_STATE_FILE, "osc")
         # AG2b: a supervised agent reports apart from the shell; whichever is busier holds the workspace.
         agent = st.agent_workspace_state(
-            await asyncio.to_thread(_read, st.SUPERVISOR_STATE_FILE, "supervisor", st.AGENT_DIR),
-            await asyncio.to_thread(_read, st.STATE_FILE, "hook", st.AGENT_DIR),
+            await _read(st.SUPERVISOR_STATE_FILE, "supervisor", st.AGENT_DIR),
+            await _read(st.STATE_FILE, "hook", st.AGENT_DIR),
         )
         return st.busiest(hook or osc, agent)
 
@@ -885,11 +922,12 @@ class WorkspaceRegistry:
             self.event_store.discard(workspace_id)  # T-04-05-02: free ring buffer
         harness_state = self._harness_state_dir(workspace_id)
         if harness_state is not None and harness_state.exists():
-            # AB1: persisted harness history goes with the workspace.
-            try:
-                shutil.rmtree(harness_state)
-            except OSError:
-                log.exception("destroy_harness_state_cleanup_failed", workspace_id=workspace_id)
+            # AB1: persisted harness history goes with the workspace. remove_tree also
+            # clears what container root wrote under a keep-id userns (subuid-owned).
+            from warren.runtime.userns import remove_tree  # noqa: PLC0415
+
+            if not await asyncio.to_thread(remove_tree, harness_state):
+                log.error("destroy_harness_state_cleanup_failed", workspace_id=workspace_id)
         if self.git_manager is not None:
             # Finding #25: without this, every destroyed workspace's
             # cloned repos (private repo clones included) accumulate on
