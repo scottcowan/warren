@@ -11,6 +11,11 @@ those paths. The bump is the largest any of those commits asks for: ``!`` after
 the type or a ``BREAKING CHANGE:`` footer is major, ``feat`` is minor, anything
 else is patch.
 
+A ``Release-As: <name> <X.Y.Z>`` line in any commit since the last release sets that
+image's next version outright (the newest such line wins), for when the commit types
+ask for the wrong bump, e.g. a squash merge whose ``!`` was meant for another image.
+It must be above the current version.
+
 Usage:
     scripts/release.py plan                          # print pending releases
     scripts/release.py prepare --title PATH --body PATH
@@ -44,6 +49,7 @@ CHANGELOG_HEADER = "# Changelog\n\nImage releases, newest first. Written by scri
 PATCH, MINOR, MAJOR = 0, 1, 2
 _SUBJECT_RE = re.compile(r"^(?P<type>[A-Za-z]+)(?:\([^)]*\))?(?P<bang>!)?:")
 _BREAKING_RE = re.compile(r"^BREAKING[ -]CHANGE:", re.MULTILINE)
+_RELEASE_AS_RE = re.compile(r"^Release-As:\s*(\S+)\s+(\S+)\s*$", re.MULTILINE)
 _VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 _COPY_RE = re.compile(r"^(?:COPY|ADD)\s+(.*)$", re.IGNORECASE)
 _FLAG_RE = re.compile(r"^--(\S+)\s*")
@@ -131,12 +137,33 @@ def release_base(root: Path, config: dict, name: str) -> str:
     return config["baseline"]
 
 
+def _version_key(version: str) -> tuple[int, int, int]:
+    m = _VERSION_RE.match(version)
+    if not m:
+        raise ReleaseError(f"version {version!r} is not X.Y.Z")
+    return tuple(int(g) for g in m.groups())
+
+
+def release_as(commits: list[Commit], name: str) -> str | None:
+    for commit in commits:
+        for target, version in reversed(_RELEASE_AS_RE.findall(commit.body)):
+            if target == name:
+                return version
+    return None
+
+
 def plan(root: Path, config: dict) -> list[Pending]:
     pending = []
     for name, component in config["components"].items():
         base = release_base(root, config, name)
-        hits = [c for c in commits_since(root, base) if touches(component, c.files)]
-        if hits:
+        commits = commits_since(root, base)
+        hits = [c for c in commits if touches(component, c.files)]
+        forced = release_as(commits, name)
+        if forced is not None:
+            if _version_key(forced) <= _version_key(component["version"]):
+                raise ReleaseError(f"Release-As {name} {forced} is not above {component['version']}")
+            pending.append(Pending(name, component["version"], forced, hits))
+        elif hits:
             kind = max(bump_kind(c) for c in hits)
             pending.append(Pending(name, component["version"], next_version(component["version"], kind), hits))
     return pending
