@@ -213,3 +213,54 @@ def inspect_all(targets: Sequence[RepoTarget], shadow_root: Path) -> tuple[list[
         except (SafeGitError, CaptureError, OSError) as exc:
             errors.append(f"git[{t.mount or '.'}]: {exc}")
     return results, errors
+
+
+def collect_repo_raw(target: RepoTarget, shadow_root: Path, max_bytes: int = 131072) -> dict[str, str]:
+    """Raw git output a run's result summarizes (registry/runs.py), in the same shape
+    ecs-base's warren-run-result records inside an EBS task: head, branch, base,
+    `diff --numstat -z <base>` and `status --porcelain=v1 -z`, plus the remote-tracking
+    ref of the branch (refs/remotes/origin/<branch>) when there is one."""
+    raw: dict[str, str] = {"mount": target.mount, "base_branch": target.base_branch or ""}
+    with readonly_shadow_git_dir(
+        target.git_dir, shadow_root, common_dir=target.common_dir, work_tree=target.work_tree
+    ) as shadow:
+        env = shadow.env()
+
+        def git(*args: str) -> str:
+            return run_git(
+                "--no-optional-locks", *args, extra_env=env, isolated=True, timeout=_GIT_TIMEOUT_S
+            )
+
+        def maybe(*args: str) -> str:
+            try:
+                return git(*args).strip()
+            except SafeGitError:
+                return ""
+
+        raw["head"] = git("rev-parse", "--verify", "HEAD^{commit}").strip()
+        raw["branch"] = maybe("symbolic-ref", "--quiet", "--short", "HEAD")
+        base = ""
+        if target.base_branch:
+            for ref in (f"refs/remotes/origin/{target.base_branch}", f"refs/heads/{target.base_branch}"):
+                base = maybe("merge-base", "HEAD", ref)
+                if base:
+                    break
+        raw["base"] = base
+        raw["numstat"] = git("diff", "--numstat", "-z", base or "HEAD")[:max_bytes]
+        raw["status"] = git(
+            "status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"
+        )[:max_bytes]
+        if raw["branch"]:
+            raw["remote"] = maybe("rev-parse", "-q", "--verify", f"refs/remotes/origin/{raw['branch']}")
+    return raw
+
+
+def collect_all_raw(targets: Sequence[RepoTarget], shadow_root: Path) -> tuple[list[dict[str, str]], list[str]]:
+    results: list[dict[str, str]] = []
+    errors: list[str] = []
+    for t in targets:
+        try:
+            results.append(collect_repo_raw(t, shadow_root))
+        except (SafeGitError, CaptureError, OSError) as exc:
+            errors.append(f"changes[{t.mount or '.'}]: {exc}")
+    return results, errors

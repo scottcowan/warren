@@ -177,6 +177,11 @@ workspace's EFS directory, so it needs the file system root mounted on the contr
 (`WARREN_EFS_LOCAL_MOUNT_PATH`, e.g. Terraform `efs_delete_workspace_data_on_destroy`).
 Without it the event carries only `exit_code`.
 
+Every single-turn workspace is also recorded as a run, kept in the registry after the
+workspace is destroyed: `POST /runs` starts one on a prompt and `GET /runs/{id}/result` returns
+its structured result. EBS-backed ECS workspaces report their own result from inside the task.
+See [docs/runs.md](../../docs/runs.md).
+
 ## Configuration
 
 All settings are `WARREN_*` environment variables, loaded by `src/warren/config.py`. Key ones:

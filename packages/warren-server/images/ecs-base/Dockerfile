@@ -125,6 +125,8 @@ COPY --chown=0:0 --chmod=0755 packages/warren-common/src/warren_common/assets/wa
 COPY --chown=0:0 --chmod=0755 packages/warren-common/src/warren_common/agent_supervisor.py /usr/local/bin/warren-agent-supervisor
 # AH1: run as the task's `git-init` container (runtime/ecs_git.py), never by the workspace.
 COPY --chown=0:0 --chmod=0755 packages/warren-server/images/ecs-base/git-materialize.sh /usr/local/bin/warren-git-materialize
+# Single-turn runs on EBS volumes: the run's result, recorded in the task for the control plane.
+COPY --chown=0:0 --chmod=0755 packages/warren-server/images/ecs-base/warren-run-result.sh /usr/local/bin/warren-run-result
 # Reader for the secrets file the control plane drops on the EFS volume (runtime/ecs_secrets.py),
 # and for warren-secrets-decrypt's output in EBS mode, sourced by entrypoint.sh, warren-session and warren-git-materialize.
 COPY --chown=0:0 --chmod=0644 packages/warren-server/images/ecs-base/warren-secrets.sh /usr/local/lib/warren/secrets.sh

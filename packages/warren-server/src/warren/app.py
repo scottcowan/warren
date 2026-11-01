@@ -226,6 +226,10 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
     app.state.event_store = event_store
     app.state.auth_store = auth_store
     app.state.operation_store = OperationStore(db)
+    from warren.registry.runs import RunStore  # noqa: PLC0415
+
+    app.state.run_store = RunStore(db)
+    registry.run_store = app.state.run_store
     from warren.git.token_issuer import control_plane_issuer  # noqa: PLC0415
 
     app.state.github_token_issuer = control_plane_issuer(settings)
@@ -465,6 +469,8 @@ from warren.routes import workspace_tokens as workspace_tokens_routes  # noqa: E
 app.include_router(workspace_tokens_routes.router)
 from warren.routes import git_credentials as git_credentials_routes  # noqa: E402
 app.include_router(git_credentials_routes.router)
+from warren.routes import runs as runs_routes  # noqa: E402
+app.include_router(runs_routes.router)
 # AI8: the control-plane MCP endpoint (streamable HTTP). A plain Route, not a Mount, so
 # scope["app"] stays this app and AuthMiddleware's scope state reaches the tools.
 from starlette.routing import Route  # noqa: E402
