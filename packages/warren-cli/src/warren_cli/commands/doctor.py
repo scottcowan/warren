@@ -34,8 +34,14 @@ Out = Callable[[str], None]
 # weekly; raise this by hand when warren starts depending on a newer feature.
 # binary -> minimum "X.Y.Z"
 # claude 2.1.79: StopFailure hook (2.1.78) and SessionEnd firing on /resume.
+# opencode 1.19.5: the version warren's profile was checked against (`acp`, `serve`,
+#   OPENCODE_DB, XDG data/state dirs, the amazon-bedrock `endpoint` option).
+# codex 0.166.0: `[features] hooks` (was codex_hooks) and hook trust by hash in
+#   config.toml, which warren's generated config relies on; `app-server --listen`.
 _HARNESS_MIN_VERSIONS: dict[str, str] = {
     "claude": "2.1.79",
+    "opencode": "1.19.5",
+    "codex": "0.166.0",
 }
 _SEMVER_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
 

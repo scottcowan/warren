@@ -176,7 +176,7 @@ def _strip_json(data: bytes, keys: tuple[str, ...]) -> bytes | None:
     return json.dumps({k: v for k, v in obj.items() if k not in keys}, indent=2).encode()
 
 
-def _prepare_one(p: HarnessProfile, root: Path, home: Path) -> None:
+def _prepare_one(p: HarnessProfile, root: Path, home: Path, env: Mapping[str, str]) -> None:
     hdir = _HarnessDir(root, p.name)
     try:
         for rel in (*p.writable, *p.persist, *p.readonly):
@@ -196,7 +196,10 @@ def _prepare_one(p: HarnessProfile, root: Path, home: Path) -> None:
             seeded[dst_rel] = data
             if dst_rel in readonly or not hdir.exists(dst_rel):
                 hdir.write(dst_rel, data, readonly=dst_rel in readonly)
-        for rel, text in p.generated.items():
+        generated = dict(p.generated)
+        if p.dynamic_config is not None:
+            generated.update(p.dynamic_config(str(hdir.path), env))
+        for rel, text in generated.items():
             if rel in readonly or not hdir.exists(rel):
                 hdir.write(rel, text.encode(), readonly=rel in readonly)
         if p.state_hook is not None:
@@ -221,14 +224,17 @@ def _hook_file(text: str, seeded: bytes | None) -> bytes:
     return json.dumps(base, indent=2).encode()
 
 
-def prepare_harness_dirs(names: Iterable[str], root: str | Path, *, home: str | Path) -> None:
+def prepare_harness_dirs(
+    names: Iterable[str], root: str | Path, *, home: str | Path, env: Mapping[str, str] | None = None
+) -> None:
     """Create and seed `<root>/<name>/` for each selected harness. Readonly
     seeds and generated config are rewritten every call; other seeds only
-    when missing, so the harness's own state is kept."""
+    when missing, so the harness's own state is kept. `env` is the workspace's
+    env (template env), which model-provider config is generated from."""
     prepared = False
     for p in profiles_for(names):
         if p.kind != "custom":
-            _prepare_one(p, Path(root), Path(home))
+            _prepare_one(p, Path(root), Path(home), env or {})
             prepared = True
     if prepared:
         _HarnessDir(Path(root), SESSION_DIR).close()

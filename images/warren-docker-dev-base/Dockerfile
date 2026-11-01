@@ -15,7 +15,8 @@
 # install path for each), and the npm registry for the Claude Code CLI itself
 # (`@anthropic-ai/claude-code`, the official first-party Anthropic package, pinned to a
 # major version so an unreviewed CLI upgrade can't silently change agent behavior inside
-# every future workspace built from this tag). The plain warren-docker-base remains
+# every future workspace built from this tag), and opencode's GitHub release tarball
+# (version and sha256 pinned below). The plain warren-docker-base remains
 # available and untouched for anyone who prefers to decline this layer's supply-chain
 # surface.
 FROM ghcr.io/scottcowan/warren-docker-base:latest@sha256:6102cea6f4a8a3668bd14c8aa87d14238b97e132b7efdb5960341107667e6990
@@ -79,6 +80,31 @@ RUN curl -fsSL "https://raw.githubusercontent.com/pyenv/pyenv-installer/bdd89156
 # symlinked into /usr/local/bin so it's on PATH the same way node/npm/npx are.
 RUN curl -fsSL https://claude.ai/install.sh | bash -s 2.1.308 \
     && ln -sf /root/.local/bin/claude /usr/local/bin/claude
+
+# opencode (github.com/anomalyco/opencode): the release's single static-ish binary,
+# pinned by version and sha256, not npm (whose opencode-ai package fetches the binary
+# in a postinstall script, the same failure mode as Claude Code's npm package above).
+# The glibc builds, matching this image's Debian base (python:3.11-slim); the -musl
+# assets are for Alpine. The sha256s are the release assets' digests from GitHub's
+# release API (`gh api repos/anomalyco/opencode/releases/tags/v1.19.5`). warren's
+# opencode profile was checked against this version (docs/harnesses.md).
+ARG TARGETARCH
+ARG OPENCODE_VERSION=1.19.5
+ARG OPENCODE_SHA256_AMD64=588310a336fa3b9df36b3f0225b26f679d453efaad0cf3d66c3651ef3ec1647a
+ARG OPENCODE_SHA256_ARM64=fae5be262d693b7c5e562856cc473e59e741772936db0c0600ac0d5ed5bd088b
+RUN case "${TARGETARCH}" in \
+         amd64) _OC_ARCH=x64; _OC_SHA256="${OPENCODE_SHA256_AMD64}" ;; \
+         arm64) _OC_ARCH=arm64; _OC_SHA256="${OPENCODE_SHA256_ARM64}" ;; \
+         *) echo "unsupported TARGETARCH for opencode: ${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
+    && _OC_DIR="$(mktemp -d)" \
+    && curl -fsSL --retry 3 -o "${_OC_DIR}/opencode.tar.gz" \
+         "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${_OC_ARCH}.tar.gz" \
+    && echo "${_OC_SHA256}  ${_OC_DIR}/opencode.tar.gz" | sha256sum -c - \
+    && tar -xzf "${_OC_DIR}/opencode.tar.gz" -C "${_OC_DIR}" opencode \
+    && install -m 0755 "${_OC_DIR}/opencode" /usr/local/bin/opencode \
+    && rm -rf "${_OC_DIR}" \
+    && [ "$(opencode --version)" = "${OPENCODE_VERSION}" ]
 
 # Deliberately NOT here: anything agent-specific — purpose-built agent images
 # (warren-agent-base and friends) are separate, layered on top of this tag instead.

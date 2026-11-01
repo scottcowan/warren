@@ -14,6 +14,7 @@ sidecar records it as `osc-state.json`. Precedence: hook > OSC > unverifiable.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -149,7 +150,12 @@ CLAUDE_EVENTS = (
     "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PostToolUseFailure",
     "PermissionRequest", "SubagentStart", "SubagentStop", "PostCompact", "Stop", "StopFailure", "SessionEnd",
 )
-CODEX_EVENTS = ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop")
+# codex 0.166.0 hook events (hooks.json); SubagentStart/Stop and PostCompact keep a
+# long turn "working", PermissionRequest only fires when approvals are on.
+CODEX_EVENTS = (
+    "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest",
+    "SubagentStart", "SubagentStop", "PostCompact", "Stop", "SessionEnd",
+)
 CURSOR_EVENTS = ("sessionStart", "beforeSubmitPrompt", "stop")
 _TOOL_EVENTS = frozenset({"PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest"})
 
@@ -170,6 +176,40 @@ def claude_settings() -> str:
 
 def codex_hooks() -> str:
     return json.dumps(_command_hooks("codex", CODEX_EVENTS))
+
+
+def _snake(event: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", event).lower()
+
+
+def codex_hook_trust(hooks_json: str) -> str:
+    """config.toml `[hooks.state]` entries trusting warren's own codex hooks.
+
+    codex (0.16x) runs a user hook only once its `trusted_hash` matches: the sha256
+    of the hook's normalized identity (event key, matcher, handler with its default
+    timeout 600 and async false) as sorted compact JSON, keyed by
+    `<hooks.json path>:<event key>:<group>:<handler>` (codex-rs hooks discovery.rs,
+    config fingerprint.rs). A changed hook gets a new hash and stays untrusted, so
+    a stale entry never trusts anything else. Empty for a path TOML can't quote plainly."""
+    if not hooks_json.startswith("/") or any(c in hooks_json for c in '"\\\n'):
+        return ""
+    groups = json.loads(codex_hooks())["hooks"]
+    out = []
+    for event, entries in groups.items():
+        for gi, group in enumerate(entries):
+            for hi, handler in enumerate(group["hooks"]):
+                identity: dict = {
+                    "event_name": _snake(event),
+                    "hooks": [{"type": "command", "command": handler["command"], "timeout": 600, "async": False}],
+                }
+                if group.get("matcher") is not None:
+                    identity["matcher"] = group["matcher"]
+                digest = hashlib.sha256(
+                    json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+                ).hexdigest()
+                key = f"{hooks_json}:{_snake(event)}:{gi}:{hi}"
+                out.append(f'\n[hooks.state."{key}"]\ntrusted_hash = "sha256:{digest}"\n')
+    return "".join(out)
 
 
 def cursor_hooks() -> str:

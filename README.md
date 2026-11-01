@@ -210,6 +210,8 @@ templates:
     # harness still running; a harness cut off by a task relaunch (or, locally, a
     # closed terminal: local sandboxes have no tmux) restarts on the same
     # conversation by session id; `--new` ignores that and opens the shell.
+    # docs/harnesses.md: per-harness modes (opencode serve, codex app-server), ACP,
+    # state hooks, persisted paths and Bedrock config.
     harnesses: [claude, codex]
     # false rejects harnesses that can hand a session to the vendor's cloud.
     allow_vendor_cloud: true
