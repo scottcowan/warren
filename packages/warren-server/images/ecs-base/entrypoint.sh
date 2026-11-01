@@ -118,6 +118,35 @@ if [ -n "${WARREN_AGENT_SPEC:-}" ]; then
     exec "$_py" /usr/local/bin/warren-agent-supervisor
 fi
 
+if [ -n "$WARREN_APP_CMD" ] && [ "${WARREN_RUN_RESULT:-}" = 1 ] \
+    && [ -x /usr/local/bin/warren-run-result ]; then
+    # Single-turn run on an EBS volume, which the control plane can't read: run the app
+    # as a child, record its result in the task (warren-run-result), then stay up for
+    # WARREN_RUN_RESULT_HOLD_SECONDS so the control plane can collect it over ECS Exec
+    # and destroy the task. A TERM/INT is passed on to the app and ends the hold.
+    sh -c "$WARREN_APP_CMD" &
+    _app=$!
+    _stop=""
+    trap '_stop=1; kill -TERM "$_app" 2>/dev/null' TERM INT
+    _rc=0
+    while :; do
+        wait "$_app"
+        _rc=$?
+        kill -0 "$_app" 2>/dev/null || break
+    done
+    trap - TERM INT
+    /usr/local/bin/warren-run-result write "$_rc" \
+        || echo "entrypoint: warren-run-result failed" >&2
+    _hold=${WARREN_RUN_RESULT_HOLD_SECONDS:-300}
+    case "$_hold" in ''|*[!0-9]*) _hold=300 ;; esac
+    trap 'exit "$_rc"' TERM INT
+    while [ -z "$_stop" ] && [ "$_hold" -gt 0 ]; do
+        sleep 1
+        _hold=$((_hold - 1))
+    done
+    exit "$_rc"
+fi
+
 if [ -n "$WARREN_APP_CMD" ]; then
     # exec, not a backgrounded job: this process is PID 1 (no init layer in this image —
     # ECSRuntime.provision() sets Fargate's own initProcessEnabled for zombie reaping

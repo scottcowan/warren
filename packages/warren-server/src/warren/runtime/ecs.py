@@ -712,6 +712,13 @@ class ECSRuntime:
             env_dict.update(seed_env(spec.app, spec.harnesses, spec.seed_prompt))
         elif spec.app:
             env_dict["WARREN_APP_CMD"] = app_command_with_seed(spec.app, spec.seed_prompt)
+            if spec.mode == "single-turn" and self._spec_storage(spec) == "ebs":
+                # The control plane can't read an EBS volume: the task records its own
+                # run result and holds for collection (runtime/ecs_run_result.py).
+                from warren.runtime.ecs_run_result import DEFAULT_HOLD_SECONDS, run_result_env  # noqa: PLC0415
+
+                hold = getattr(self._settings, "run_result_hold_seconds", DEFAULT_HOLD_SECONDS)
+                env_dict.update(run_result_env(spec.folders, int(hold or 0)))
         # Read by the shared banner/prompt zsh snippet baked into ecs-base's
         # .zshrc (warren_common/assets/warren_banner.zsh) at shell-start time --
         # UX-1: never set for ECS tasks before this, so a zsh-templated

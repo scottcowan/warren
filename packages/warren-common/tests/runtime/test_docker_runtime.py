@@ -261,6 +261,27 @@ def test_status_reloads_before_read(mock_docker_client, tmp_path):
     assert asyncio.run(rt.status(handle)) == "unknown"
 
 
+def test_exit_code_of_an_exited_container(mock_docker_client, tmp_path):
+    """Headless runs on the docker runtime: the run's exit code comes from State.ExitCode."""
+    import docker.errors
+
+    root = str(tmp_path / "ws")
+    spec = _spec(root)
+    _mkdirs(root, spec)
+    container = MagicMock(id="cid-exit")
+    container.attrs = {"State": {"Status": "running", "ExitCode": 0}}
+    mock_docker_client.containers.run.return_value = container
+    mock_docker_client.containers.get.return_value = container
+    rt = _make_runtime(mock_docker_client)
+    handle = asyncio.run(rt.provision(spec))
+
+    assert asyncio.run(rt.exit_code(handle)) is None
+    container.attrs = {"State": {"Status": "exited", "ExitCode": 3}}
+    assert asyncio.run(rt.exit_code(handle)) == 3
+    mock_docker_client.containers.get.side_effect = docker.errors.NotFound("gone")
+    assert asyncio.run(rt.exit_code(handle)) is None
+
+
 def test_destroy_stops_then_removes(mock_docker_client, tmp_path):
     root = str(tmp_path / "ws")
     spec = _spec(root)

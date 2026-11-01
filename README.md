@@ -53,6 +53,11 @@ starting the SSM tunnel when something first connects and restarting it when the
 workspace's task changes (for desktop apps such as T3 Code that remember a server
 address). See [docs/proxy.md](docs/proxy.md).
 
+`warren run <project>/<template> --prompt TEXT [--wait] [--json]` runs a template headless on a
+prompt and keeps the result (status, exit code, final message, changed files, PR links) on the
+server after the workspace is destroyed; `warren run status|result <id>` reads it. See
+[docs/runs.md](docs/runs.md).
+
 Or run entirely local (no server) against a `config.toml` project definition — see `warren
 init` to scaffold one:
 

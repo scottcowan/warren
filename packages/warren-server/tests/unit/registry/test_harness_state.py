@@ -90,3 +90,21 @@ async def test_no_mount_without_harnesses_or_on_ecs(sqlite_path, tmp_path):
         runtime=runtime, store=registry.store, server_id="t", settings=SimpleNamespace(runtime_type="ecs", data_dir=tmp_path)
     )._harness_state_dir(WS) is None
     assert registry._harness_state_dir("../escape") is None
+
+
+@pytest.mark.asyncio
+async def test_single_turn_run_always_mounts_the_harness_state(sqlite_path, tmp_path):
+    """Headless runs: the app's stdout lands in the harness dir, which the server reads
+    host-side at completion, so a run gets the mount whatever its app is."""
+    runtime = _runtime()
+    registry, _ = await _registry(sqlite_path, tmp_path, runtime, harnesses=())
+    spec = WorkspaceSpec(
+        workspace_id=WS, project="p", intent="i", image="img", root_path="", app="./task.sh x",
+        mode="single-turn",
+    )
+
+    await registry._do_provision(WS, spec)
+
+    state = tmp_path / "data" / "harness" / WS
+    assert (str(state), "/var/lib/warren/harness", "rw") in runtime.provision.call_args.args[0].bind_mounts
+    assert state.is_dir()

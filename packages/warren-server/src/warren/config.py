@@ -362,6 +362,19 @@ class WarrenSettings(BaseSettings):
     # workspace.completed) stay replayable via GET /workspaces/{id}/events?since=.
     single_turn_event_retention_seconds: float = 3600.0
 
+    # Headless runs (routes/runs.py, docs/runs.md): every single-turn workspace's result
+    # is kept in the registry after the workspace is destroyed, for this long and at most
+    # this many per owner (oldest finished runs go first).
+    run_retention_seconds: float = Field(default=30 * 86400.0, gt=0)
+    run_max_per_owner: int = Field(default=500, ge=1)
+    # A run still going after its timeout is destroyed and recorded as timed_out.
+    run_default_timeout_seconds: float = Field(default=3600.0, gt=0)
+    run_max_timeout_seconds: float = Field(default=86400.0, gt=0)
+    # EBS-backed ECS runs: how long the finished task waits for the control plane to read
+    # its result over ECS Exec, and how often the control plane looks (runtime/ecs_run_result.py).
+    run_result_hold_seconds: int = Field(default=300, ge=0, le=3600)
+    run_result_probe_seconds: float = Field(default=20.0, gt=0)
+
     # #59: bounds on POST /workspaces/{id}/exec (and the MCP exec_command tool).
     exec_max_output_bytes: int = Field(default=1_048_576, ge=1024)
     exec_default_timeout_seconds: float = Field(default=60.0, gt=0)

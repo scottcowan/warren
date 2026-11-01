@@ -106,6 +106,15 @@ async def run_reaper(
                         await registry.mark_stopped(ws.workspace_id)
                 else:
                     unknown_counts.pop(ws.workspace_id, None)
+                    # Headless runs: timeouts, and an EBS task's own result record.
+                    tick = getattr(registry, "tick_single_turn", None) if single_turn else None
+                    if status == "running" and tick is not None:
+                        try:
+                            await tick(ws.workspace_id)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            log.exception("run_tick_failed", workspace_id=ws.workspace_id)
 
         except asyncio.CancelledError:
             log.info("reaper_cancelled")

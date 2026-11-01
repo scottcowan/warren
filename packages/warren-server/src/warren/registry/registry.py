@@ -23,7 +23,10 @@ from warren_common.models import FolderSpec
 from warren_common.runtime.base import WorkspaceHandle
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from warren.config import WarrenSettings
+    from warren.registry.runs import RunStore
     from warren.git.manager import GitManager
     from warren.registry.events import WorkspaceEventStore
     from warren.registry.models import Workspace
@@ -308,6 +311,9 @@ class WorkspaceRegistry:
         # same process — e.g. across test cases — never share lock state.
         self._locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
+        # Headless runs (registry/runs.py): set by app.py; None keeps runs unrecorded.
+        self.run_store: "RunStore | None" = None
+        self._run_probe_at: dict[str, float] = {}
         # Audit 2026-10-16 P1 #33: a bare `asyncio.create_task(...)` with no
         # reference kept anywhere can be garbage-collected mid-run on some
         # Python/asyncio implementations -- keyed by workspace_id so a later
@@ -620,7 +626,11 @@ class WorkspaceRegistry:
         github_pat = spec.env.get("GITHUB_PAT") or None
         branch_applied = False
 
-        harness_state = self._harness_state_dir(workspace_id) if spec.harnesses else None
+        # Single-turn runs always get it: the app's stdout lands there (warren_common/headless.py)
+        # and the result is read host-side (registry/runs.py), whatever the app.
+        harness_state = (
+            self._harness_state_dir(workspace_id) if spec.harnesses or spec.mode == "single-turn" else None
+        )
         if harness_state is not None:
             from warren_common.harness import SERVER_HARNESS_ROOT  # noqa: PLC0415
 
@@ -1229,25 +1239,37 @@ class WorkspaceRegistry:
         )
         return ssh_port, private_pem
 
-    async def complete_single_turn(self, workspace_id: str) -> None:
+    async def complete_single_turn(
+        self,
+        workspace_id: str,
+        *,
+        workspace_result: "dict | None" = None,
+        timed_out: bool = False,
+    ) -> None:
         """AH2: a single-turn workspace's app exited. Emit workspace.completed, then destroy.
 
         Capture is best-effort: any failure is logged and listed in the event's
         `capture_errors`; the event still fires and the workspace is still destroyed.
+        `workspace_result`: the record an EBS task made of itself (runtime/ecs_run_result.py).
+        `timed_out`: the run passed its timeout and is being ended (tick_single_turn).
+        The run's result is stored in the registry (registry/runs.py).
         """
         async with await self._lock_for(workspace_id):
             ws = await self.store.get(workspace_id)
             if ws is None or ws.status == "destroyed":
                 return
-            await self._complete_locked(ws)
+            await self._complete_locked(ws, workspace_result=workspace_result, timed_out=timed_out)
 
-    async def _complete_locked(self, ws: "Workspace") -> None:
+    async def _complete_locked(
+        self, ws: "Workspace", *, workspace_result: "dict | None" = None, timed_out: bool = False
+    ) -> None:
         handle = WorkspaceHandle(
             workspace_id=ws.workspace_id,
             runtime_id=ws.container_id or "",
             root_path=ws.root_path,
         )
-        event = await self._completion_event(ws, handle)
+        extras: dict = {"errors": []}
+        event = await self._completion_event(ws, handle, workspace_result=workspace_result, extras=extras)
         await self.event_store.get_or_create(ws.workspace_id).push(json.dumps(event))
         log.info(
             "workspace_completed",
@@ -1255,14 +1277,171 @@ class WorkspaceRegistry:
             exit_code=event["exit_code"],
             capture_errors=len(event["capture_errors"]),
         )
+        await self._record_run(ws, event, extras, timed_out=timed_out)
         retention = float(getattr(self.settings, "single_turn_event_retention_seconds", 3600.0))
         await self._destroy_locked(ws.workspace_id, keep_events_for=retention)
 
-    async def _completion_event(self, ws: "Workspace", handle: WorkspaceHandle) -> dict:
+    async def _record_run(self, ws: "Workspace", event: dict, extras: dict, *, timed_out: bool) -> None:
+        """Store the run's result (registry/runs.py). Never fails the completion."""
+        run_store = self.run_store
+        if run_store is None:
+            return
+        from warren.registry import runs  # noqa: PLC0415
+        from warren_common.headless import run_harness  # noqa: PLC0415
+
+        try:
+            extra = deserialize_spec_extra(ws.spec_json)
+            run = await run_store.get(ws.workspace_id)
+            if run is None:
+                # A single-turn workspace from before runs were recorded.
+                await run_store.create(
+                    run_id=ws.workspace_id, owner_id=ws.owner_id or "", project=ws.project,
+                    template=ws.intent, timeout_seconds=None, started_at=ws.created_at,
+                )
+                run = await run_store.get(ws.workspace_id)
+            storage = ""
+            if getattr(self.settings, "runtime_type", "podman") == "ecs":
+                from warren.runtime.ebs import storage_from_extra  # noqa: PLC0415
+
+                storage = storage_from_extra(extra)
+            ended_at = runs.utcnow()
+            status, result = runs.build_result(
+                run=run,
+                workspace=ws,
+                event=event,
+                repos_raw=extras.get("repos_raw"),
+                output=extras.get("output"),
+                harness=run_harness(str(extra.get("app") or "")),
+                storage=storage,
+                source=extras.get("source", "control-plane"),
+                errors=extras.get("errors", []),
+                timed_out=timed_out,
+                ended_at=ended_at,
+                recorded_exit_code=extras.get("recorded_exit_code"),
+            )
+            await run_store.finish(ws.workspace_id, status=status, result=result, ended_at=ended_at)
+            await run_store.prune(
+                retention_seconds=float(getattr(self.settings, "run_retention_seconds", 30 * 86400.0)),
+                max_per_owner=int(getattr(self.settings, "run_max_per_owner", 500)),
+            )
+            log.info("run_finished", run_id=ws.workspace_id, status=status, source=result["result_source"])
+        except Exception:
+            log.exception("run_record_failed", run_id=ws.workspace_id)
+
+    def _needs_workspace_result(self, ws: "Workspace") -> bool:
+        """An EBS-backed ECS single-turn workspace: its result comes from the task."""
+        if getattr(self.settings, "runtime_type", "podman") != "ecs":
+            return False
+        from warren.runtime.ebs import storage_from_extra  # noqa: PLC0415
+
+        try:
+            return storage_from_extra(deserialize_spec_extra(ws.spec_json)) == "ebs"
+        except Exception:
+            return False
+
+    async def tick_single_turn(self, workspace_id: str, *, now: "datetime | None" = None) -> None:
+        """A running single-turn workspace, once per reaper poll: end it as timed_out once
+        its run's timeout has passed; for an EBS task, collect the result record it makes
+        of itself once its app exits (runtime/ecs_run_result.py), at most every
+        run_result_probe_seconds."""
+        import time  # noqa: PLC0415
+
+        from warren.registry import runs  # noqa: PLC0415
+        from warren.runtime import ecs_run_result as rr  # noqa: PLC0415
+
+        ws = await self.store.get(workspace_id)
+        if ws is None or ws.status != "running" or not ws.container_id:
+            return
+        handle = WorkspaceHandle(workspace_id=workspace_id, runtime_id=ws.container_id, root_path=ws.root_path)
+        needs_result = self._needs_workspace_result(ws)
+        run = await self.run_store.get(workspace_id) if self.run_store is not None else None
+        timeout = (run or {}).get("timeout_seconds")
+        started = runs.parse_iso((run or {}).get("started_at"))
+        current = now or runs.utcnow()
+        if timeout and started is not None and (current - started).total_seconds() >= float(timeout):
+            record = None
+            if needs_result:
+                try:
+                    record = rr.parse_record(await rr.read_result(self.runtime, handle, snapshot=True))
+                except rr.ResultUnavailable as exc:
+                    log.info("run_snapshot_unavailable", run_id=workspace_id, error=str(exc))
+            log.info("run_timed_out", run_id=workspace_id, timeout_seconds=timeout)
+            await self.complete_single_turn(workspace_id, workspace_result=record, timed_out=True)
+            return
+        if not needs_result:
+            return
+        probe_every = float(getattr(self.settings, "run_result_probe_seconds", 20.0))
+        mono = time.monotonic()
+        last = self._run_probe_at.get(workspace_id)
+        if last is not None and mono - last < probe_every:
+            return
+        self._run_probe_at[workspace_id] = mono
+        try:
+            record = rr.parse_record(await rr.read_result(self.runtime, handle))
+        except rr.ResultUnavailable as exc:
+            log.debug("run_result_not_ready", run_id=workspace_id, error=str(exc))
+            return
+        self._run_probe_at.pop(workspace_id, None)
+        await self.complete_single_turn(workspace_id, workspace_result=record)
+
+    @staticmethod
+    def _apply_workspace_result(record: dict, event: dict, extras: dict, failed) -> None:
+        """Fill the completion event from an EBS task's own record (runtime/ecs_run_result.py).
+        The record is the workspace's report: its values are capped strings, parsed as data."""
+        if event.get("exit_code") is None:
+            code = str(record.get("exit_code", "")).strip()
+            if code.isdigit():
+                event["exit_code"] = int(code)
+        repos = [r for r in record.get("repos", []) if isinstance(r, dict)][:50]
+        extras["repos_raw"] = repos
+        folders = []
+        for r in repos:
+            if r.get("error"):
+                event["capture_errors"].append(f"git[{r.get('mount') or '.'}]: {r['error'][:200]}")
+                continue
+            branch = r.get("branch") or None
+            base = r.get("base_branch") or None
+            folders.append({
+                "mount": r.get("mount", ""),
+                "branch": branch,
+                "head_commit": r.get("head") or None,
+                "base_commit": r.get("base") or None,
+                "branch_safe": bool(branch) and (branch != base if base else branch.startswith("warren/")),
+                "is_clean": not r.get("status"),
+            })
+        event["git_folders"] = folders
+        if folders:
+            event["git"] = {k: v for k, v in folders[0].items() if k != "mount"}
+        if record.get("output"):
+            extras["output"] = record["output"]
+        verdict = record.get("verdict")
+        if verdict:
+            from warren.registry.completion import MAX_VERDICT_BYTES  # noqa: PLC0415
+
+            raw = verdict.encode("utf-8")
+            if len(raw) > MAX_VERDICT_BYTES:
+                failed("verdict", ValueError(f"verdict.json exceeds {MAX_VERDICT_BYTES} bytes"))
+            else:
+                extras["_verdict_raw"] = raw
+
+    async def _completion_event(
+        self,
+        ws: "Workspace",
+        handle: WorkspaceHandle,
+        *,
+        workspace_result: "dict | None" = None,
+        extras: "dict | None" = None,
+    ) -> dict:
+        """`extras` (when given) collects what only the run result uses: raw git changes
+        (`repos_raw`), the app's stdout (`output`), where they came from (`source`) and
+        their own capture `errors`. The event itself doesn't carry them."""
         import time  # noqa: PLC0415
 
         from warren.registry import completion  # noqa: PLC0415
+        from warren_common.headless import EXIT_NAME, EXIT_REL, OUTPUT_DIR, OUTPUT_PATH, OUTPUT_REL  # noqa: PLC0415
 
+        extras = extras if extras is not None else {"errors": []}
+        run_errors: list[str] = extras.setdefault("errors", [])
         errors: list[str] = []
         event: dict = {
             "type": "workspace.completed",
@@ -1279,6 +1458,10 @@ class WorkspaceRegistry:
             log.warning("single_turn_capture_failed", workspace_id=ws.workspace_id, part=what, error=str(exc))
             errors.append(f"{what}: {exc}")
 
+        def run_failed(what: str, exc: BaseException) -> None:
+            log.info("run_capture_failed", workspace_id=ws.workspace_id, part=what, error=str(exc))
+            run_errors.append(f"{what}: {exc}")
+
         try:
             if hasattr(self.runtime, "exit_code"):
                 event["exit_code"] = await self.runtime.exit_code(handle)
@@ -1292,9 +1475,24 @@ class WorkspaceRegistry:
             folders = []
 
         verdict_raw: bytes | None = None
+        output_raw: bytes | None = None
+        exit_raw: bytes | None = None
+        max_output = 4 * 1024 * 1024
         targets: list = []
         shadow_root: Path | None = None
-        if getattr(self.settings, "runtime_type", "podman") == "ecs":
+        if self._needs_workspace_result(ws):
+            # EBS: the control plane can't read the volume; use the task's own record.
+            if workspace_result is None:
+                errors.append(
+                    "git/verdict: the EBS volume isn't readable by the control plane and the "
+                    "task's run result wasn't collected (an image without warren-run-result, no "
+                    "ECS Exec on the control plane, or the hold ended first; see docs/runs.md)"
+                )
+            else:
+                extras["source"] = "workspace"
+                self._apply_workspace_result(workspace_result, event, extras, failed)
+                verdict_raw = extras.pop("_verdict_raw", None)
+        elif getattr(self.settings, "runtime_type", "podman") == "ecs":
             mount = self._ecs_mount(ws)
             if not mount:
                 errors.append(
@@ -1320,6 +1518,15 @@ class WorkspaceRegistry:
                     )
                 except Exception as exc:
                     failed("verdict", exc)
+                try:
+                    output_raw = await asyncio.to_thread(
+                        completion.read_nofollow, volume_root, ("harness", *OUTPUT_REL), max_output
+                    )
+                    exit_raw = await asyncio.to_thread(
+                        completion.read_nofollow, volume_root, ("harness", *EXIT_REL), 64
+                    )
+                except Exception as exc:
+                    run_failed("output", exc)
         elif self.git_manager is not None:
             shadow_root = self.git_manager.shadow_root
             root = self.git_manager.worktree_path(ws.workspace_id)
@@ -1340,6 +1547,20 @@ class WorkspaceRegistry:
                     )
             except Exception as exc:
                 failed("verdict", exc)
+        if getattr(self.settings, "runtime_type", "podman") != "ecs":
+            try:
+                harness_dir = self._harness_state_dir(ws.workspace_id)
+                if harness_dir is not None and os.path.lexists(harness_dir):
+                    # The bind-mounted harness dir (_materialize_and_provision), read host-side.
+                    output_raw = await asyncio.to_thread(
+                        completion.read_nofollow, harness_dir, OUTPUT_REL, max_output
+                    )
+                    exit_raw = await asyncio.to_thread(completion.read_nofollow, harness_dir, EXIT_REL, 64)
+                elif hasattr(self.runtime, "read_file") and handle.runtime_id:
+                    output_raw = await self.runtime.read_file(handle, OUTPUT_PATH, max_output)
+                    exit_raw = await self.runtime.read_file(handle, f"{OUTPUT_DIR}/{EXIT_NAME}", 64)
+            except Exception as exc:
+                run_failed("output", exc)
 
         if targets and shadow_root is not None:
             try:
@@ -1350,6 +1571,22 @@ class WorkspaceRegistry:
                     event["git"] = {k: v for k, v in results[0].items() if k != "mount"}
             except Exception as exc:
                 failed("git", exc)
+            try:
+                raw_changes, change_errors = await asyncio.to_thread(
+                    completion.collect_all_raw, targets, shadow_root
+                )
+                extras["repos_raw"] = raw_changes
+                run_errors.extend(change_errors)
+            except Exception as exc:
+                run_failed("changes", exc)
+
+        if output_raw is not None:
+            extras["output"] = output_raw.decode("utf-8", "replace")
+        recorded = (exit_raw or b"").decode("ascii", "replace").strip()
+        if recorded.isdigit() and int(recorded) <= 255:
+            # The app's own exit code, which the run reports: on podman/docker the image runs
+            # the app inside tmux, so the container's exit code (the event's) is tmux's.
+            extras["recorded_exit_code"] = int(recorded)
 
         if verdict_raw is not None:
             try:

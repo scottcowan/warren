@@ -173,3 +173,21 @@ CREATE TABLE IF NOT EXISTS workspace_tokens (
 );
 
 CREATE INDEX IF NOT EXISTS idx_workspace_tokens_workspace ON workspace_tokens(workspace_id);
+
+-- Headless runs (registry/runs.py): one row per single-turn workspace, keyed by its
+-- workspace id, kept after the workspace is destroyed so its result stays readable.
+-- Pruned by age (run_retention_seconds) and per-owner count (run_max_per_owner).
+CREATE TABLE IF NOT EXISTS runs (
+    run_id           TEXT PRIMARY KEY,
+    owner_id         TEXT NOT NULL,
+    project          TEXT NOT NULL,
+    template         TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    started_at       TEXT NOT NULL,
+    ended_at         TEXT,
+    timeout_seconds  REAL,
+    result_json      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_runs_owner ON runs(owner_id, created_at);
