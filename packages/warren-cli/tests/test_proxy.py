@@ -8,6 +8,7 @@ No AWS: sessions come from a fake forwarder (an in-process echo server per
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 import stat
@@ -66,20 +67,41 @@ async def _echo(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> N
 class FakeSession:
     """Stands in for one `aws ssm start-session`: a local echo server."""
 
-    def __init__(self, target: proxy.Target) -> None:
+    def __init__(self, target: proxy.Target, gate: asyncio.Event | None = None) -> None:
         self.target = target
         self.accepted = 0
         self.stopped = False
         self._dead = False
         self._server: asyncio.AbstractServer | None = None
         self._writers: list[asyncio.StreamWriter] = []
+        self._tasks: set[asyncio.Task] = set()
         self.local_port = 0
+        # With a gate, each connection reads its whole request (to EOF), reports
+        # it in ``half_closed``, and answers only once the gate is set.
+        self.gate = gate
+        self.half_closed = 0
+        self.half_closed_changed = asyncio.Event()
 
     async def start(self) -> None:
         async def handle(r, w):
+            self._tasks.add(asyncio.current_task())
             self.accepted += 1
             self._writers.append(w)
-            await _echo(r, w)
+            if self.gate is None:
+                await _echo(r, w)
+                return
+            try:
+                data = await r.read()
+                self.half_closed += 1
+                self.half_closed_changed.set()
+                await self.gate.wait()
+                w.write(data)
+                await w.drain()
+                w.write_eof()
+            except (ConnectionError, OSError):
+                pass
+            finally:
+                w.close()
 
         self._server = await asyncio.start_server(handle, "127.0.0.1", 0)
         self.local_port = self._server.sockets[0].getsockname()[1]
@@ -104,17 +126,20 @@ class FakeSession:
 
 
 class FakeForwarder:
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(self, error: Exception | None = None, gate: asyncio.Event | None = None) -> None:
         self.sessions: list[FakeSession] = []
         self.error = error
+        self.gate = gate
+        self.started = asyncio.Event()
 
     async def start(self, target: proxy.Target, remote_port: int) -> FakeSession:
         await asyncio.sleep(0.05)  # a real session takes a while; lets concurrent callers pile up
         if self.error is not None:
             raise self.error
-        session = FakeSession(target)
+        session = FakeSession(target, self.gate)
         await session.start()
         self.sessions.append(session)
+        self.started.set()
         return session
 
 
@@ -325,10 +350,25 @@ async def test_relay_carries_a_long_bidirectional_stream():
 
 @pytest.mark.asyncio
 async def test_concurrent_connections_share_one_session():
-    resolver, forwarder = FakeResolver(_TASK1), FakeForwarder()
+    """Eight clients each send a request and half-close, then wait for the
+    answer. The workspace answers only once all eight requests have arrived,
+    and a garbage collection runs while every connection is half-closed: a
+    connection task the proxy doesn't hold on to is unreachable then (its
+    client transport has stopped reading) and would be destroyed mid-relay,
+    leaving its client an empty response."""
+    gate = asyncio.Event()
+    resolver, forwarder = FakeResolver(_TASK1), FakeForwarder(gate=gate)
     mp = await _started(resolver, forwarder)
     try:
-        results = await asyncio.gather(*[_roundtrip(mp.mapping.local_port, f"c{i}".encode()) for i in range(8)])
+        clients = [asyncio.ensure_future(_roundtrip(mp.mapping.local_port, f"c{i}".encode())) for i in range(8)]
+        await asyncio.wait_for(forwarder.started.wait(), timeout=5)
+        session = forwarder.sessions[0]
+        while session.half_closed < 8:
+            session.half_closed_changed.clear()
+            await asyncio.wait_for(session.half_closed_changed.wait(), timeout=5)
+        gc.collect()
+        gate.set()
+        results = await asyncio.gather(*clients)
         assert results == [f"c{i}".encode() for i in range(8)]
         assert resolver.calls == 1 and len(forwarder.sessions) == 1
         assert forwarder.sessions[0].accepted == 8

@@ -26,6 +26,7 @@ async def _handshake(c: Client, cwd: str) -> list:
     return notes
 
 
+@pytest.mark.asyncio
 async def test_native_acp_is_passed_through_from_stdio(tmp_path):
     spec = make_spec(tmp_path, [sys.executable, FAKE])
     sup = sv.Supervisor(spec)
@@ -40,6 +41,7 @@ async def test_native_acp_is_passed_through_from_stdio(tmp_path):
     await finish(sup, task)
 
 
+@pytest.mark.asyncio
 async def test_tcp_adapter_is_proxied_and_peers_are_capped(tmp_path):
     spec = make_spec(
         tmp_path, ["claude", "-p"], transport="tcp", max_peers=2,
@@ -58,6 +60,7 @@ async def test_tcp_adapter_is_proxied_and_peers_are_capped(tmp_path):
     await finish(sup, task)
 
 
+@pytest.mark.asyncio
 async def test_stdio_endpoint_takes_one_peer_and_bounds_lines(tmp_path):
     spec = make_spec(tmp_path, [sys.executable, FAKE], max_line_bytes=2048, max_peers=4)
     assert spec["max_peers"] == 1
@@ -77,6 +80,7 @@ async def test_stdio_endpoint_takes_one_peer_and_bounds_lines(tmp_path):
     await finish(sup, task)
 
 
+@pytest.mark.asyncio
 async def test_a_wide_listener_stops_the_agent_for_good(tmp_path):
     spec = make_spec(tmp_path, [sys.executable, FAKE], restart={"policy": "always", "max_restarts": 5})
     sup = sv.Supervisor(spec, listeners=lambda pid: [("127.0.0.1", 1), ("0.0.0.0", spec["inner_port"])],
@@ -90,6 +94,7 @@ async def test_a_wide_listener_stops_the_agent_for_good(tmp_path):
     assert state(tmp_path)["state"] == "exited"
 
 
+@pytest.mark.asyncio
 @pytest.mark.skipif(not Path("/proc/net/tcp").exists(), reason="needs Linux /proc")
 async def test_an_adapter_binding_all_interfaces_fails_startup(tmp_path):
     spec = make_spec(tmp_path, ["x"], transport="tcp", adapter=[sys.executable, FAKE, "tcp", "0.0.0.0", "{port}"])
