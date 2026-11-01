@@ -344,7 +344,7 @@ class ProjectConfig(BaseModel):
     # First turn handed to the app on provision, where the app supports one
     # (warren_common/seed_prompt.py lists which); ignored otherwise. Not a secret.
     seed_prompt: str | None = None
-    ecs_image: str = "ghcr.io/scottcowan/warren-ecs-base:latest"  # used for ecs runtimes — a distinct, Debian-based image (Alpine before 2.0.0) built in images/ecs-base/ (no sshd; ECS Exec/SSM instead) — set independently of docker_image, no fallback between them
+    ecs_image: str = "ghcr.io/scottcowan/warren-ecs-base:latest"  # used for ecs runtimes — a distinct, Debian-based image (Alpine before 1.5.0) built in images/ecs-base/ (no sshd; ECS Exec/SSM instead) — set independently of docker_image, no fallback between them
 
     templates: dict[str, "ProjectConfig"] = {}
 
