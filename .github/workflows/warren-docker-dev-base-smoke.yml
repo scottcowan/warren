@@ -52,3 +52,4 @@ jobs:
           docker run --rm --entrypoint npm warren-docker-dev-base:smoke --version
           docker run --rm --entrypoint python warren-docker-dev-base:smoke --version
           docker run --rm --entrypoint claude warren-docker-dev-base:smoke --version
+          docker run --rm --entrypoint opencode warren-docker-dev-base:smoke --version

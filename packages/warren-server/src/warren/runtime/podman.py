@@ -214,6 +214,8 @@ class PodmanRuntime:
         # AG2b: an agent workspace runs the supervisor next to that shell.
         if spec.agent is not None:
             env[AGENT_SPEC_ENV] = json.dumps(spec.agent, separators=(",", ":"))
+            # The loopback port the supervised harness (or its ACP endpoint) answers on.
+            env["WARREN_APP_PORT"] = str(spec.agent["port"])
             env["WARREN_APP"] = workspace_shell(spec.app)
             env["WARREN_SHELL_FIRST"] = "1"
         elif shell_first(spec.app, spec.mode):

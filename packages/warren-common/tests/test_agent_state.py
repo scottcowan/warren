@@ -129,7 +129,7 @@ def test_profiles_install_hooks_into_readonly_config():
     assert claude["PreToolUse"][0]["matcher"] == "*"
     cursor = json.loads(PROFILES["cursor-agent"].state_hook.files["hooks.json"])
     assert cursor["version"] == 1 and set(cursor["hooks"]) >= {"sessionStart", "stop"}
-    assert "codex_hooks = true" in PROFILES["codex"].generated["config.toml"]
+    assert "\n[features]\nhooks = true\n" in PROFILES["codex"].generated["config.toml"]
     assert "WARREN_STATE_HOOK" in PROFILES["opencode"].state_hook.files["config/plugins/warren-state.js"]
     assert "WARREN_STATE_HOOK" in PROFILES["pi"].state_hook.files["extensions/warren-state.ts"]
 

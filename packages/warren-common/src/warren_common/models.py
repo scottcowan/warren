@@ -228,6 +228,9 @@ class AgentConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     port: int = Field(default=8765, ge=1024, le=65535)
+    # A named agent mode of the harness profile (harness.agent_modes), e.g.
+    # opencode `serve` or codex `app-server`; None is the profile's default.
+    mode: str | None = None
     adapter: str | None = None
     adapter_transport: Literal["tcp", "stdio"] = "tcp"
     use_adapter: bool = False

@@ -336,9 +336,12 @@ def _local_harness_root(workspace_id: str) -> Path:
     return workspace_state_dir(workspace_id) / "harness"
 
 
-def _prepare_local_harness_dirs(harnesses: Any, harness_root: str, *, bedrock: bool = False) -> None:
+def _prepare_local_harness_dirs(
+    harnesses: Any, harness_root: str, *, bedrock: bool = False, env: dict | None = None
+) -> None:
     """Seed the per-workspace harness dirs and copy credentials in (AG3). In
-    bedrock mode no model login is handed over, and old copies are removed."""
+    bedrock mode no model login is handed over, and old copies are removed.
+    `env` (the template's) drives generated model-provider config (opencode, codex)."""
     from warren_common.harness_config import (  # noqa: PLC0415
         copy_in_credentials,
         prepare_harness_dirs,
@@ -346,7 +349,7 @@ def _prepare_local_harness_dirs(harnesses: Any, harness_root: str, *, bedrock: b
     )
 
     home = Path.home()
-    prepare_harness_dirs(harnesses, harness_root, home=home)
+    prepare_harness_dirs(harnesses, harness_root, home=home, env=env)
     if bedrock:
         remove_credentials(harnesses, harness_root)
     else:
@@ -625,7 +628,7 @@ def provision_local(
         rt = runtime if runtime is not None else get_runtime(cfg)
         handle = await rt.provision(spec)
         if local_harness_dirs:
-            _prepare_local_harness_dirs(harnesses, harness_root, bedrock=bedrock)
+            _prepare_local_harness_dirs(harnesses, harness_root, bedrock=bedrock, env=env)
 
         state: dict[str, Any] = {
             "workspace_id": workspace_id,
@@ -877,7 +880,9 @@ def _connect_via_execvp(state: dict, *, harness: str | None = None, new: bool = 
     _refresh_local_git_credentials(state)
     bedrock = _state_bedrock(state)
     if runtime_type in _LOCAL_SANDBOXES and state.get("harness_root"):
-        _prepare_local_harness_dirs(harnesses, state["harness_root"], bedrock=bedrock)
+        _prepare_local_harness_dirs(
+            harnesses, state["harness_root"], bedrock=bedrock, env=state.get("env_snapshot") or {}
+        )
     for warning in cloud_handoff_warnings(harnesses):
         typer.echo(warning, err=True)
     write_turn_sessions(state)

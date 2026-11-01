@@ -18,8 +18,9 @@ Values come from upstream source/docs checked 2026-10-18; every profile is
 from __future__ import annotations
 
 import json
+import re
 import shlex
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath, PurePosixPath
 from types import MappingProxyType
@@ -53,19 +54,32 @@ class StateHook:
     merge_hooks: bool = False
 
 
+# Protocols of a harness that serves its own endpoint on the agent port (`{port}`
+# in its args): the supervisor runs and restarts it but proxies nothing.
+SELF_SERVING_PROTOCOLS = frozenset({"http", "ws"})
+
+
 @dataclass(frozen=True)
 class AgentMode:
     """AG2b/AM3: how the harness runs headless in an agent workspace. Protocol
-    "acp" is native ACP on stdio, passed straight through; any other protocol
-    goes through the template's `agent.adapter` command."""
+    "acp" is native ACP on stdio, passed straight through; "http"/"ws" is the
+    harness's own server on loopback `{port}` (opencode serve, codex app-server);
+    any other protocol goes through the template's `agent.adapter` command."""
 
     args: tuple[str, ...]
     protocol: str
     env: Mapping[str, str] = field(default_factory=dict)
+    name: str = ""
+    # Append the profile's launch_args (codex's --sandbox is a TUI/exec flag only).
+    profile_args: bool = True
 
     @property
     def native_acp(self) -> bool:
         return self.protocol == "acp"
+
+    @property
+    def serves(self) -> bool:
+        return self.protocol in SELF_SERVING_PROTOCOLS
 
 
 @dataclass(frozen=True)
@@ -105,7 +119,16 @@ class HarnessProfile:
     # AB1: (generated JSON file, key) that gets `<command> --version` when warren
     # regenerates it at container start, so the harness skips onboarding.
     onboarding_version: tuple[str, str] = ()
-    agent_mode: AgentMode | None = None  # AG2b
+    agent_mode: AgentMode | None = None  # AG2b: the default
+    # Other named modes a template picks with `agent.mode` (server modes and the like).
+    agent_modes: tuple[AgentMode, ...] = ()
+    # Env (relative paths, like config_env) set only on the harness's own process,
+    # never exported into the shell: XDG dirs that would move other tools' files too.
+    process_env: Mapping[str, str] = field(default_factory=dict)
+    # (harness dir, env) -> {rel: content}: generated config that depends on where
+    # the dir is and on the workspace env (model gateway). Overrides `generated`; the
+    # init script has the same logic in shell (harness_shell, kept equal by a test).
+    dynamic_config: Callable[[str, Mapping[str, str]], dict[str, str]] | None = None
     state_hook: StateHook | None = None  # AG5
     cloud_handoff: CloudHandoff = CloudHandoff(False)
     verified: bool = False
@@ -115,7 +138,84 @@ def _ro(mapping: dict[str, str]) -> Mapping[str, str]:
     return MappingProxyType(mapping)
 
 
-_CLAUDE_SETTINGS_SECRETS = ("env", "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "otelHeadersHelper")
+# --- model access from the workspace env (Bedrock / a Bedrock gateway) ---
+# The same env Claude Code reads (CLAUDE_CODE_USE_BEDROCK, ANTHROPIC_BEDROCK_BASE_URL,
+# CLAUDE_CODE_SKIP_BEDROCK_AUTH + ANTHROPIC_AUTH_TOKEN, ANTHROPIC_MODEL, AWS_REGION),
+# turned into each harness's own provider config. Values outside these character sets
+# are ignored rather than escaped, so the shell twin in warren-harness-init can emit
+# them verbatim.
+_SAFE_URL = re.compile(r"https?://[A-Za-z0-9._~:/%+-]{1,512}")
+_SAFE_MODEL = re.compile(r"[A-Za-z0-9._:/-]{1,200}")
+_SAFE_REGION = re.compile(r"[a-z0-9-]{1,32}")
+OPENCODE_BASE_CONFIG = {"$schema": "https://opencode.ai/config.json", "autoupdate": False}
+CODEX_BASE_CONFIG = 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n\n[features]\nhooks = true\n'
+
+
+def _truthy(value: str | None) -> bool:
+    return (value or "").lower() not in ("", "0", "false", "no")
+
+
+def _safe(env: Mapping[str, str], key: str, pattern: re.Pattern) -> str:
+    value = env.get(key) or ""
+    return value if pattern.fullmatch(value) else ""
+
+
+def opencode_config(env: Mapping[str, str]) -> str:
+    """opencode.json: Amazon Bedrock as the only provider in bedrock mode, through
+    the gateway when ANTHROPIC_BEDROCK_BASE_URL is set (opencode's amazon-bedrock
+    `endpoint`; the bearer token from ANTHROPIC_AUTH_TOKEN via `{env:}` when
+    CLAUDE_CODE_SKIP_BEDROCK_AUTH is set, else SigV4 with the workspace's AWS
+    identity). Checked against opencode 1.19.5."""
+    cfg: dict = dict(OPENCODE_BASE_CONFIG)
+    gateway = _safe(env, "ANTHROPIC_BEDROCK_BASE_URL", _SAFE_URL)
+    if not (_truthy(env.get("CLAUDE_CODE_USE_BEDROCK")) or gateway):
+        return json.dumps(cfg)
+    cfg["enabled_providers"] = ["amazon-bedrock"]
+    model = _safe(env, "ANTHROPIC_MODEL", _SAFE_MODEL)
+    if model:
+        cfg["model"] = f"amazon-bedrock/{model}"
+    small = _safe(env, "ANTHROPIC_DEFAULT_HAIKU_MODEL", _SAFE_MODEL)
+    if small:
+        cfg["small_model"] = f"amazon-bedrock/{small}"
+    options: dict = {}
+    region = _safe(env, "AWS_REGION", _SAFE_REGION)
+    if region:
+        options["region"] = region
+    if gateway:
+        options["endpoint"] = gateway
+        if _truthy(env.get("CLAUDE_CODE_SKIP_BEDROCK_AUTH")):
+            options["apiKey"] = "{env:ANTHROPIC_AUTH_TOKEN}"
+    if options:
+        cfg["provider"] = {"amazon-bedrock": {"options": options}}
+    return json.dumps(cfg)
+
+
+def codex_config(hooks_json: str, env: Mapping[str, str]) -> str:
+    """config.toml: warren's defaults, the Amazon Bedrock provider in bedrock mode
+    without a gateway (codex calls Bedrock's OpenAI-compatible Mantle endpoint, not
+    the InvokeModel/Converse API a Claude gateway proxies, so a gateway is left
+    unwired), and trust for warren's own state hooks at `hooks_json` (codex runs
+    an untrusted hook never; the hash is its sha256 of the normalized hook)."""
+    from warren_common.agent_state import codex_hook_trust  # noqa: PLC0415
+
+    out = CODEX_BASE_CONFIG
+    if _truthy(env.get("CLAUDE_CODE_USE_BEDROCK")) and not env.get("ANTHROPIC_BEDROCK_BASE_URL"):
+        out = 'model_provider = "amazon-bedrock"\n' + out
+        region = _safe(env, "AWS_REGION", _SAFE_REGION)
+        if region:
+            out += f'\n[model_providers.amazon-bedrock.aws]\nregion = "{region}"\n'
+    return out + codex_hook_trust(hooks_json)
+
+
+def _codex_dynamic(base: str, env: Mapping[str, str]) -> dict[str, str]:
+    return {"config.toml": codex_config(f"{base.rstrip('/')}/hooks.json", env)}
+
+
+def _opencode_dynamic(base: str, env: Mapping[str, str]) -> dict[str, str]:
+    return {"config/opencode.json": opencode_config(env)}
+
+
+_CLAUDE_SETTINGS_SECRETS =("env", "apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "otelHeadersHelper")
 
 _PROFILES: tuple[HarnessProfile, ...] = (
     HarnessProfile(
@@ -156,7 +256,7 @@ _PROFILES: tuple[HarnessProfile, ...] = (
         resume_by_id_args=("--resume", "{id}"),
         session_store=("projects", "*.jsonl", r"s/\.jsonl$//p"),
         session_cwd_dir="projects/{slug}",
-        agent_mode=AgentMode(("-p", "--output-format", "stream-json", "--verbose"), "stream-json"),
+        agent_mode=AgentMode(("-p", "--output-format", "stream-json", "--verbose"), "stream-json", name="stream-json"),
         state_hook=StateHook(_ro({"settings.json": agent_state.claude_settings()}), merge_hooks=True),
         cloud_handoff=CloudHandoff(True, "`--remote` / teleport to Claude Code on the web (to verify)"),
     ),
@@ -173,9 +273,9 @@ _PROFILES: tuple[HarnessProfile, ...] = (
         deny_read=(".codex/auth.json",),
         seed=((".codex/AGENTS.md", "AGENTS.md"),),
         auth="OPENAI_API_KEY / CODEX_API_KEY secret; auth.json copy-in not implemented yet",
-        generated=_ro({
-            "config.toml": 'approval_policy = "never"\nsandbox_mode = "danger-full-access"\n\n[features]\ncodex_hooks = true\n'
-        }),
+        # Without dynamic_config (no harness dir known) the base config, untrusted hooks.
+        generated=_ro({"config.toml": CODEX_BASE_CONFIG}),
+        dynamic_config=_codex_dynamic,
         launch_args=("--sandbox", "danger-full-access"),
         resume_args=("resume", "--last"),
         resume_by_id_args=("resume", "{id}"),
@@ -184,7 +284,15 @@ _PROFILES: tuple[HarnessProfile, ...] = (
             "rollout-*.jsonl",
             r"s/^.*\([0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}\)\.jsonl$/\1/p",
         ),
-        agent_mode=AgentMode(("exec", "--json"), "jsonl"),
+        agent_mode=AgentMode(("exec", "--json"), "jsonl", name="exec"),
+        agent_modes=(
+            # Its own JSON-RPC server on loopback websocket; `codex --remote ws://...` attaches.
+            AgentMode(("app-server", "--listen", "ws://127.0.0.1:{port}"), "ws", name="app-server", profile_args=False),
+            # The same protocol on stdio, for an adapter (e.g. an ACP bridge) to drive.
+            AgentMode(
+                ("app-server", "--listen", "stdio://"), "codex-app-server", name="app-server-stdio", profile_args=False
+            ),
+        ),
         state_hook=StateHook(_ro({"hooks.json": agent_state.codex_hooks()})),
         cloud_handoff=CloudHandoff(True, "`codex cloud` tasks (to verify)"),
     ),
@@ -193,9 +301,12 @@ _PROFILES: tuple[HarnessProfile, ...] = (
         command=("opencode",),
         host_config=(".config/opencode", ".local/share/opencode"),
         config_env=_ro({"OPENCODE_CONFIG_DIR": "config", "OPENCODE_DB": "data/opencode.db"}),
+        # OPENCODE_CONFIG_DIR adds a config dir but moves nothing else: data (auth.json,
+        # logs, snapshots) and state (prompt history) follow XDG (checked on 1.19.5).
+        process_env=_ro({"XDG_DATA_HOME": "data", "XDG_STATE_HOME": "state"}),
         install_read=(".opencode",),
-        persist=("data/",),
-        writable=("data/",),
+        persist=("data/", "state/"),
+        writable=("data/", "state/"),
         readonly=(
             "config/opencode.json", "config/opencode.jsonc", "config/tui.json",
             "config/plugins/", "config/tools/", "config/agents/", "config/commands/", "config/skills/",
@@ -203,7 +314,8 @@ _PROFILES: tuple[HarnessProfile, ...] = (
         deny_read=(".local/share/opencode/auth.json",),
         seed=((".config/opencode/tui.json", "config/tui.json"),),
         auth="provider API key secrets; auth.json copy-in not implemented yet",
-        generated=_ro({"config/opencode.json": json.dumps({"$schema": "https://opencode.ai/config.json", "autoupdate": False})}),
+        generated=_ro({"config/opencode.json": json.dumps(OPENCODE_BASE_CONFIG)}),
+        dynamic_config=_opencode_dynamic,
         env=_ro({
             "OPENCODE_DISABLE_CLAUDE_CODE": "1",
             "OPENCODE_DISABLE_AUTOUPDATE": "1",
@@ -211,7 +323,12 @@ _PROFILES: tuple[HarnessProfile, ...] = (
         }),
         resume_args=("--continue",),
         resume_by_id_args=("--session", "{id}"),
-        agent_mode=AgentMode(("acp",), "acp", _ro({"OPENCODE_CLIENT": "acp", "OPENCODE_ENABLE_QUESTION_TOOL": "false"})),
+        agent_mode=AgentMode(
+            ("acp",), "acp", _ro({"OPENCODE_CLIENT": "acp", "OPENCODE_ENABLE_QUESTION_TOOL": "false"}), name="acp"
+        ),
+        # Its HTTP API on loopback; `opencode attach http://127.0.0.1:<port>` and other
+        # clients (T3) use it. OPENCODE_SERVER_PASSWORD (a template secret) adds basic auth.
+        agent_modes=(AgentMode(("serve", "--hostname", "127.0.0.1", "--port", "{port}"), "http", name="serve"),),
         state_hook=StateHook(_ro({"config/plugins/warren-state.js": agent_state.OPENCODE_PLUGIN})),
         cloud_handoff=CloudHandoff(False, "none known; `/share` publishes a transcript to opencode.ai (to verify)"),
     ),
@@ -230,7 +347,7 @@ _PROFILES: tuple[HarnessProfile, ...] = (
         env=_ro({"AGENT_CLI_CREDENTIAL_STORE": "file"}),
         resume_args=("--continue",),
         resume_by_id_args=("--resume", "{id}"),
-        agent_mode=AgentMode(("acp",), "acp"),
+        agent_mode=AgentMode(("acp",), "acp", name="acp"),
         state_hook=StateHook(_ro({"hooks.json": agent_state.cursor_hooks()})),
         cloud_handoff=CloudHandoff(True, "prefixing a prompt with `&` hands the session to Cursor Cloud Agents"),
     ),
@@ -250,7 +367,7 @@ _PROFILES: tuple[HarnessProfile, ...] = (
         resume_args=("--continue",),
         resume_by_id_args=("--session", "{id}"),
         session_store=("sessions", "*.jsonl", r"s/^.*_//; s/\.jsonl$//p"),
-        agent_mode=AgentMode(("--mode", "rpc"), "jsonl-rpc"),
+        agent_mode=AgentMode(("--mode", "rpc"), "jsonl-rpc", name="rpc"),
         state_hook=StateHook(_ro({"extensions/warren-state.ts": agent_state.PI_EXTENSION})),
     ),
     # AJ1: a framework program the template supplies. No grants of its own.
@@ -411,6 +528,19 @@ def harness_env(names: Iterable[str], root: str | Path) -> dict[str, str]:
     return env
 
 
+def process_env(name: str, root: str | Path) -> dict[str, str]:
+    """`process_env` of one harness, absolute: only for that harness's own process."""
+    p = PROFILES[name]
+    base = harness_dir(root, p.name)
+    return {var: _join(base, rel) for var, rel in p.process_env.items()}
+
+
+def agent_modes(p: HarnessProfile) -> dict[str, AgentMode]:
+    """A profile's agent modes by name, the default first."""
+    modes = [m for m in (p.agent_mode, *p.agent_modes) if m is not None]
+    return {m.name or m.protocol: m for m in modes}
+
+
 def harness_dirs(names: Iterable[str], root: str | Path) -> list[str]:
     """Directories to create before a harness starts (some refuse a missing config dir)."""
     dirs: list[str] = []
@@ -419,7 +549,7 @@ def harness_dirs(names: Iterable[str], root: str | Path) -> list[str]:
             continue
         base = harness_dir(root, p.name)
         dirs.append(base)
-        for rel in p.config_env.values():
+        for rel in (*p.config_env.values(), *p.process_env.values()):
             pp = PurePosixPath(rel)
             dirs.append(_join(base, str(pp.parent if pp.suffix else pp)))
         dirs += [_join(base, rel) for rel in (*p.writable, *p.persist) if rel.endswith("/")]

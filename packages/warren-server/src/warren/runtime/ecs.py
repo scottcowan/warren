@@ -708,6 +708,8 @@ class ECSRuntime:
         # PID 1); a human still attaches the warren shell over ECS Exec next to it.
         if spec.agent is not None:
             env_dict[AGENT_SPEC_ENV] = json.dumps(spec.agent, separators=(",", ":"))
+            # The loopback port the supervised harness (or its ACP endpoint) answers on.
+            env_dict["WARREN_APP_PORT"] = str(spec.agent["port"])
         elif shell_first(spec.app, spec.mode):
             env_dict.update(seed_env(spec.app, spec.harnesses, spec.seed_prompt))
         elif spec.app:
