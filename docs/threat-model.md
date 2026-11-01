@@ -138,6 +138,7 @@ credentials endpoint `169.254.170.2` from the agent. So:
 | T15 | Repudiation: no record of who issued a secret or token | Structured `event="audit"` records for secret write/delete/delivery, provision/connect/destroy, credential issuance; caller identity from the server, never the client; secret values rejected as fields | #33 |
 | T17 | An agent driving warren over MCP provisions, execs in or destroys workspaces beyond its own | `/mcp` sits behind the same AuthMiddleware; each tool calls the REST handler (owner check, audit). A workspace-scoped token's tools only take its own workspace id; only a reservation token (`POST /workspace-tokens`) can provision, exactly once, the id the server chose for it. After a single-turn completion the token can only read status/events and make the idempotent destroy call. Exec output and time are capped (`WARREN_EXEC_MAX_*`) | this PR |
 | T18 | Agent steals the operator's Claude login, or uses it to bypass a template meant to run on Bedrock | The sandbox can't read the Keychain or host `~/.claude`. In subscription mode, warren copies in the access token without the refresh token on each connect, so a stolen copy expires and a sandbox refresh can't rotate the host's token. In Bedrock mode (`model_access: bedrock`, or `CLAUDE_CODE_USE_BEDROCK`/`ANTHROPIC_BEDROCK_BASE_URL` in env), warren reads no Keychain item, deletes any earlier copy, rejects a `CLAUDE_CODE_OAUTH_TOKEN` secret, and only connects with the workspace's own AWS credentials (`export` endpoint locally, task role on ECS) | this PR |
+| T19 | An sshd in a workspace (opt-in `warren-ecs-ssh-base` / `warren-docker-ssh-base`, for editor remoting) becomes a network entry point, a way past ECS Exec's IAM check, or a root foothold | sshd listens on the task's `127.0.0.1:2222` only (no port mapping, inbound rule or load balancer); the only path to it is an SSM port-forward to the task, which needs `ssm:StartSession` on that task, the permission ECS Exec already needs (and that already gives a root shell), so it admits no one ECS Exec doesn't. sshd runs as uid 1000, started after the entrypoint's privilege drop, so a compromise of it yields the workload's own privileges. Public keys only (`AuthenticationMethods publickey`, no password/keyboard-interactive/PAM/host-based/GSSAPI), `AllowUsers warren`, `PermitRootLogin no`, local TCP forwarding only (no remote/Unix-socket/tun forwarding), no X11 or agent forwarding unless a derived image opts in. No host key in the image: one per workspace, generated on its volume. Authorized keys come from the owner's own secret (or the template's plain env), never RunTask overrides. Asserted with `sshd -T` and live logins by the image smoke test ([workspace-ssh.md](workspace-ssh.md)). The podman counterpart, opt-in `warren-docker-ssh-base`, carries the same sshd hardening and adds no server path: the server publishes its port 22 on the host's loopback only with `WARREN_SSH_ACCESS_ENABLED=true`, the key is the owner-gated `POST /workspaces/{id}/connect` mint (one per workspace, emptied on stop/destroy), and `warren ssh-config` keeps that private key client-side in `~/.warren/ssh/` (owner-only, replaced and invalidated by the next mint). Its sshd runs as container root (two login users), with root logins refused; container root is the agent's own identity there, so this grants nothing new | this PR |
 | T16 | Data exfiltration over the network | **Observed, not blocked.** Podman egress byte counters feed the idle reaper only (D-05). Fail-closed egress (NET-01) is future work; see residual risks | — |
 
 ## Known residual risks
@@ -187,10 +188,19 @@ credentials endpoint `169.254.170.2` from the agent. So:
    control-plane issuer only.
 10. **Runtime threat detection is not in place** (AF1, deferred).
 11. **Images built FROM a bumped base by digest** (`warren-agent-base`,
-    `warren-ecs-agent-base`) lag a harness bump until the base is republished and the digest
+    `warren-ecs-agent-base`, `warren-docker-ssh-base`, and `warren-ecs-ssh-base` once its dev-base pin is a digest) lag a harness bump until the base is republished and the digest
     updated.
 12. **`warren proxy` listeners have no authentication of their own.** They bind loopback
     only, and refuse anything else, but any process or other user on the operator's
     machine that can connect to `127.0.0.1:<port>` reaches that workspace port over the
     operator's SSM session. Whatever the app on that port enforces (for example T3 Code's
     pairing) is the only remaining check. Don't run the proxy on a shared host.
+13. **The workspace sshd is agent-controlled** (`warren-ecs-ssh-base`/`warren-docker-ssh-base`,
+    T19). It runs as the agent's own identity (uid 1000 on ECS, container root on podman), so the agent can read its host key, add keys to
+    `authorized_keys` (still usable only through `ssm:StartSession` on the task, or SSH
+    access to the podman host), or
+    replace the sshd and see what an SSH session does. An editor session is therefore
+    as exposed to the agent as an ECS Exec session is: don't forward your agent
+    (off by default) or type credentials into a workspace you don't trust. The ssh
+    client is set to publickey only (`warren ssh-config`), so an impostor sshd can't
+    prompt for a password. On EBS the host key is in the volume's snapshots.

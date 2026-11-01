@@ -1,0 +1,63 @@
+# warren-ecs-ssh-base sshd configuration (/etc/ssh/sshd_config). See docs/workspace-ssh.md.
+#
+# sshd runs as the workspace user (uid 1000, `warren`), started by warren-sshd after
+# the entrypoint has dropped privileges. It is reached only through an SSM port-forward
+# to the task's own loopback, so it listens on 127.0.0.1 and nowhere else.
+#
+# Drop-ins come first so that a derived image can override a setting: for most
+# keywords sshd uses the first value it reads. To allow agent forwarding, add
+# /etc/ssh/sshd_config.d/agent-forwarding.conf containing `AllowAgentForwarding yes`
+# in an image built FROM this one (and `ForwardAgent yes` on the client).
+Include /etc/ssh/sshd_config.d/*.conf
+
+Port 2222
+ListenAddress 127.0.0.1:2222
+AddressFamily inet
+
+# Generated on first start onto the workspace volume by warren-sshd, so the client's
+# known_hosts entry stays valid across task restarts. Never baked into the image.
+HostKey /var/lib/warren/.warren-ssh/ssh_host_ed25519_key
+PidFile none
+
+# Key-only: no passwords, no keyboard-interactive, no PAM, no host-based, no GSSAPI.
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+PasswordAuthentication no
+PermitEmptyPasswords no
+KbdInteractiveAuthentication no
+HostbasedAuthentication no
+GSSAPIAuthentication no
+KerberosAuthentication no
+UsePAM no
+AuthorizedKeysFile .ssh/authorized_keys
+StrictModes yes
+PermitUserEnvironment no
+MaxAuthTries 3
+LoginGraceTime 30
+
+# Only the workspace user. (sshd runs as that user, so it could not log anyone else in
+# anyway; these make the policy explicit and testable with `sshd -T`.)
+PermitRootLogin no
+AllowUsers warren
+
+# Editors (VS Code Remote-SSH, Cursor, JetBrains Gateway) need local (-L / direct-tcpip)
+# forwarding and a pty. Nothing else is forwarded: no remote listeners, no X11, no agent,
+# no Unix-socket forwarding, no tun devices.
+AllowTcpForwarding local
+GatewayPorts no
+PermitListen none
+AllowStreamLocalForwarding no
+X11Forwarding no
+AllowAgentForwarding no
+PermitTunnel no
+PermitTTY yes
+
+ClientAliveInterval 30
+ClientAliveCountMax 4
+PrintMotd no
+PrintLastLog no
+Banner none
+LogLevel INFO
+
+# JetBrains Gateway uploads its backend over SFTP; VS Code uses it for some file ops.
+Subsystem sftp internal-sftp

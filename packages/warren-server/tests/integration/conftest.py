@@ -139,6 +139,34 @@ def itest_workspace_docker_image() -> Iterator[str]:
         client.close()
 
 
+@pytest.fixture(scope="session")
+def itest_docker_ssh_base_image() -> Iterator[str]:
+    """The shipped warren-docker-ssh-base image (images/warren-docker-ssh-base/), for
+    test_ssh_access.py's production-image variant. Opt-in, because it builds FROM the
+    multi-GB warren-docker-dev-base: set WARREN_ITEST_DOCKER_SSH_BASE to an image
+    reference podman already has, or to "build" to build it here from this checkout."""
+    socket_path = os.environ.get("PODMAN_SOCKET")
+    if not socket_path:
+        pytest.skip("PODMAN_SOCKET not set")
+    wanted = os.environ.get("WARREN_ITEST_DOCKER_SSH_BASE", "")
+    if not wanted:
+        pytest.skip("WARREN_ITEST_DOCKER_SSH_BASE not set (an image ref, or 'build')")
+    if wanted != "build":
+        yield wanted
+        return
+
+    from podman import PodmanClient
+
+    build_dir = Path(__file__).resolve().parents[4] / "images" / "warren-docker-ssh-base"
+    tag = "localhost/warren-itest-docker-ssh-base:latest"
+    client = PodmanClient(base_url=f"unix://{socket_path}", timeout=60)
+    try:
+        client.images.build(path=str(build_dir), dockerfile="Dockerfile", tag=tag, rm=True, timeout=1800)
+        yield tag
+    finally:
+        client.close()
+
+
 @pytest.fixture
 def itest_env(
     monkeypatch: pytest.MonkeyPatch,
