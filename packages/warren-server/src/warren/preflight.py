@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket as _socket_mod
 from pathlib import Path
 from typing import Any
 
 import structlog
 
 from warren.errors import PreflightError
+from warren.podman_host import pasta_apparmor_warning, read_local_pasta_profile
 from warren.runtime import podman as _podman_module
 
 log = structlog.get_logger(__name__)
@@ -44,7 +46,30 @@ def _graph_driver(info: dict[str, Any]) -> str | None:
     return store.get("graphDriverName") or store.get("GraphDriverName")
 
 
-async def run_preflight(socket_path: str | Path) -> None:
+def _info_hostname(info: dict[str, Any]) -> str | None:
+    host = info.get("host") or info.get("Host") or {}
+    return host.get("hostname") or host.get("Hostname")
+
+
+def _warn_pasta_apparmor(info: dict[str, Any], socket: Path, same_host: bool) -> None:
+    # Read the local pasta profile only when podman is on this host: same filesystem
+    # (not containerized) and podman reports our hostname (not a socket forwarded over SSH).
+    profile = None
+    if same_host and _info_hostname(info) == _socket_mod.gethostname():
+        profile = read_local_pasta_profile()
+    warning = pasta_apparmor_warning(info, profile)
+    if warning is None:
+        return
+    log.warning("podman_pasta_apparmor", socket=str(socket), **warning)
+    _stdlib_log.warning(
+        "Podman %s uses pasta under AppArmor: container removal may fail on Ubuntu 26.04. Set %s (%s)",
+        warning["podman_version"],
+        warning["fix"],
+        warning["docs"],
+    )
+
+
+async def run_preflight(socket_path: str | Path, *, same_host: bool = False) -> None:
     """Raise PreflightError on fatal misconfiguration; log warning for `vfs`.
 
     Fatal:
@@ -54,6 +79,10 @@ async def run_preflight(socket_path: str | Path) -> None:
 
     Warning (non-fatal):
       * graphDriverName == "vfs" (Pitfall #5)
+      * rootless pasta under AppArmor on podman 5.x (warren.podman_host)
+
+    `same_host` says the server shares podman's filesystem, so the pasta AppArmor
+    profile can be read locally to rule the pasta warning out.
     """
     socket = Path(str(socket_path))
     if not socket.exists():
@@ -88,6 +117,8 @@ async def run_preflight(socket_path: str | Path) -> None:
             "Podman using vfs storage driver at %s — install fuse-overlayfs for 10-100x speedup",
             socket,
         )
+
+    _warn_pasta_apparmor(info, socket, same_host)
 
 
 async def check_podman_health(socket_path: str | Path) -> dict:

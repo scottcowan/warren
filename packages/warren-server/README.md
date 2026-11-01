@@ -37,14 +37,8 @@ agent-controlled and the workspace task role is the control; see
 
 Requires Python 3.11+, [uv](https://docs.astral.sh/uv/), and a rootless Podman socket.
 
-On Ubuntu 26.04, rootless Podman can't remove containers with its default `pasta` network
-helper: the shipped AppArmor `pasta` profile refuses SIGTERM from the `podman` profile
-("rootless netns: kill network process: permission denied"). Use slirp4netns instead:
-
-```bash
-mkdir -p ~/.config/containers
-printf '[network]\ndefault_rootless_network_cmd = "slirp4netns"\n' >> ~/.config/containers/containers.conf
-```
+On Ubuntu 26.04, switch rootless Podman to slirp4netns first; see
+[below](#ubuntu-2604-rootless-podman-and-pasta).
 
 ```bash
 git clone https://github.com/scottcowan/warren.git
@@ -91,6 +85,47 @@ server exits with an error. Typical setups:
   `-p 127.0.0.1:8420:8420 -e WARREN_HOST=0.0.0.0 -e WARREN_ALLOW_INSECURE_HTTP=1`.
 - **Clients connecting over the network** (`url = "https://node2:8420"`): set `WARREN_HOST`
   and TLS.
+
+Running the server image on a podman host, reached over SSH (`ssh -L 8420:127.0.0.1:8420 node2`):
+
+```bash
+podman run -d --name warren-server \
+  -p 127.0.0.1:8420:8420 \
+  -e WARREN_HOST=0.0.0.0 \
+  -e WARREN_ALLOW_INSECURE_HTTP=1 \
+  -e WARREN_SECRET_KEY -e WARREN_BOOTSTRAP_TOKEN \
+  -v warren-data:/var/lib/warren \
+  ghcr.io/scottcowan/warren-server:latest
+```
+
+The server binds `0.0.0.0` inside the container so the published port reaches it, while
+`-p 127.0.0.1:...` keeps it loopback-only on the host, so plain HTTP never leaves the host
+and you reach it over SSH. For TLS instead, mount a cert and key and replace
+`WARREN_ALLOW_INSECURE_HTTP=1` with `-e WARREN_TLS_CERTFILE=... -e WARREN_TLS_KEYFILE=...`.
+The image sets no `WARREN_HOST` of its own (the Dockerfile only documents it), so the
+default stays `127.0.0.1` unless you pass it. A server driving the host's podman also
+needs the host's podman socket mounted and `WARREN_PODMAN_SOCKET`/`WARREN_HOST_DATA_DIR`
+set; see `config.py`.
+
+### Ubuntu 26.04: rootless podman and pasta
+
+On Ubuntu 26.04, rootless Podman can't remove containers with its default `pasta` network
+helper: the shipped AppArmor `pasta` profile refuses SIGTERM from the `podman` profile
+(`apparmor="DENIED" operation="signal" profile="pasta" signal=term peer="podman"`, then
+"rootless netns: kill network process: permission denied"). Use slirp4netns instead,
+which also keeps host loopback closed to containers by default, as the
+[threat model](../../docs/threat-model.md) assumes:
+
+```bash
+mkdir -p ~/.config/containers
+printf '[network]\ndefault_rootless_network_cmd = "slirp4netns"\n' >> ~/.config/containers/containers.conf
+```
+
+At startup the server logs `podman_pasta_apparmor` (a warning; startup continues) when
+`podman info` reports podman 5.x, `rootlessNetworkCmd: pasta` and AppArmor enabled. When
+the server runs directly on the podman host (not containerized, and podman reports the
+same hostname) it also reads the local pasta profile and stays quiet if that profile lets
+pasta receive signals from `podman`.
 
 ## API surface
 
