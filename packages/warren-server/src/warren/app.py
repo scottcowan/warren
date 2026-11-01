@@ -229,6 +229,15 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
     from warren.git.token_issuer import control_plane_issuer  # noqa: PLC0415
 
     app.state.github_token_issuer = control_plane_issuer(settings)
+    # git_write templates (git/write_tokens.py): same App issuer; refreshed while running.
+    app.state.git_write_refresh_task = None
+    if app.state.github_token_issuer is not None:
+        from warren.git.write_tokens import GitWriteTokens, run_refresh_loop  # noqa: PLC0415
+
+        registry.git_write_tokens = GitWriteTokens(app.state.github_token_issuer)
+        app.state.git_write_refresh_task = asyncio.create_task(
+            run_refresh_loop(registry, registry.git_write_tokens)
+        )
     app.state.reaper_task = None
 
     if os.environ.get("WARREN_REAPER_ENABLED", "1") != "0":
@@ -430,6 +439,15 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
                 pass
             except Exception:
                 log.exception("idle_reaper_shutdown_error")
+        git_write_task = getattr(app.state, "git_write_refresh_task", None)
+        if git_write_task is not None:
+            git_write_task.cancel()
+            try:
+                await git_write_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("git_write_refresh_shutdown_error")
         rate_limiter_pruner_task = getattr(app.state, "rate_limiter_pruner_task", None)
         if rate_limiter_pruner_task is not None:
             rate_limiter_pruner_task.cancel()

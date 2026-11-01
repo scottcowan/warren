@@ -57,6 +57,11 @@ class WorkspaceSpec:
     mode: str = "interactive"
     # AG2b/AM3: a `kind: agent` workspace's supervisor launch spec (warren_common.agent_launch); None for user workspaces.
     agent: dict | None = None
+    # git_write templates (warren-server git/write_tokens.py): persisted opt-in flag, and
+    # this launch's {github owner: installation token}, delivered with the launch-time
+    # secrets. git_tokens is transient: never in spec_json, repr or logs.
+    git_write: bool = False
+    git_tokens: dict[str, str] = field(default_factory=dict, repr=False)
 
 
 def harness_state(spec: WorkspaceSpec) -> dict:

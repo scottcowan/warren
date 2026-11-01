@@ -15,7 +15,7 @@ import stat
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from warren_common.errors import CapacityExhausted, ProvisionError
@@ -90,6 +90,7 @@ _SPEC_EXTRA_FIELDS = (
     "mode",
     "idle_destroy_seconds",
     "agent",
+    "git_write",
 )
 
 # Audit R11: "aws"/"scope" are pydantic models (warren_common.models.AwsConfig/
@@ -314,6 +315,9 @@ class WorkspaceRegistry:
         # (re)start of the same workspace can find and replace its
         # predecessor's task instead of leaking a second tailer alongside it.
         self._log_tasks: dict[str, asyncio.Task] = {}
+        # git_write templates (git/write_tokens.py): wired by app.py when a GitHub App
+        # issuer is configured; None = no workspace gets write tokens.
+        self.git_write_tokens: Any = None
 
     async def _lock_for(self, workspace_id: str) -> asyncio.Lock:
         """Return the asyncio.Lock serializing lifecycle transitions for workspace_id.
@@ -753,6 +757,57 @@ class WorkspaceRegistry:
 
             raise GitError(f"branch target repo {branch_from.repo!r} was not materialized")
 
+        minted = await self._mint_git_write(workspace_id, spec)
+        try:
+            handle = await self._provision_runtime(spec, ssh_port)
+        except BaseException:
+            if minted:
+                await self.git_write_tokens.discard(workspace_id, minted, owner_id=spec.owner_id or None)
+            raise
+        finally:
+            delivered = bool(spec.git_tokens)
+            spec.git_tokens = {}
+        if minted:
+            await self.git_write_tokens.launched(
+                workspace_id, minted, delivered=delivered, owner_id=spec.owner_id or None
+            )
+        return handle
+
+    async def _mint_git_write(self, workspace_id: str, spec: "WorkspaceSpec") -> dict:
+        """git_write: this launch's tokens, handed to the runtime on spec.git_tokens. A
+        mint failure doesn't fail the launch; the refresh loop keeps retrying."""
+        spec.git_tokens = {}
+        manager = self.git_write_tokens
+        if not getattr(spec, "git_write", False):
+            return {}
+        if manager is None or not hasattr(self.runtime, "install_git_tokens"):
+            log.warning("git_write_unavailable", workspace_id=workspace_id)
+            return {}
+        from warren.git.write_tokens import GitWriteError  # noqa: PLC0415
+
+        try:
+            minted = await manager.mint(workspace_id, spec.folders, owner_id=spec.owner_id or None)
+        except GitWriteError as exc:
+            log.warning("git_write_mint_failed", workspace_id=workspace_id, error=str(exc))
+            return {}
+        spec.git_tokens = {owner: tok.token for owner, tok in minted.items()}
+        return minted
+
+    async def _revoke_git_write(self, ws: "Workspace", handle: WorkspaceHandle, *, reason: str) -> None:
+        manager = self.git_write_tokens
+        if manager is None:
+            return
+        if not deserialize_spec_extra(ws.spec_json).get("git_write") and ws.workspace_id not in manager.held_ids():
+            return
+        try:
+            await manager.revoke(
+                ws.workspace_id, runtime=self.runtime, handle=handle, owner_id=ws.owner_id, reason=reason
+            )
+        except Exception:
+            log.exception("git_write_revoke_failed", workspace_id=ws.workspace_id)
+
+    async def _provision_runtime(self, spec: "WorkspaceSpec", ssh_port: int | None) -> "WorkspaceHandle":
+        workspace_id = spec.workspace_id
         if hasattr(self.runtime, "supports_ssh_access"):
             # D-05/D-06/D-07: allocate and publish the SSH host port at
             # provision time. Does NOT mint/inject a keypair here — D-01/
@@ -869,6 +924,7 @@ class WorkspaceRegistry:
             runtime_id=ws.container_id or "",
             root_path=ws.root_path,
         )
+        await self._revoke_git_write(ws, handle, reason="destroyed")
         try:
             await self.runtime.destroy(handle)
         except Exception:
@@ -959,6 +1015,7 @@ class WorkspaceRegistry:
                 runtime_id=ws.container_id or "",
                 root_path=ws.root_path,
             )
+            await self._revoke_git_write(ws, handle, reason="stopped")
             try:
                 if hasattr(self.runtime, "stop"):
                     await self.runtime.stop(handle)

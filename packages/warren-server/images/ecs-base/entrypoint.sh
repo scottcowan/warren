@@ -42,6 +42,23 @@ if [ -d /var/lib/warren/.warren ] && [ ! -L /var/lib/warren/.warren ]; then
 fi
 unset _ws_ebs
 
+# git_write templates (src/warren/git/write_tokens.py): the launch's GitHub tokens arrive
+# with the secrets as WARREN_GIT_TOKENS. As root they go to /run/warren-git (0600, the
+# workspace user) for git-credential-warren, and out of the root-only secrets copy that
+# warren-session loads; the variable never reaches a workspace process. Not root (task
+# user set): the control plane's next refresh installs them over ECS Exec instead.
+if [ -n "${WARREN_GIT_TOKENS:-}" ]; then
+    if [ "$(/usr/bin/id -u)" = 0 ]; then
+        printf '%s\n' "$WARREN_GIT_TOKENS" | /usr/local/bin/warren-git-token install >/dev/null \
+            || echo "entrypoint: cannot install git_write tokens" >&2
+        if [ -f /run/warren/secrets.env ]; then
+            (umask 077 && /bin/grep -v '^WARREN_GIT_TOKENS=' /run/warren/secrets.env \
+                > /run/warren/secrets.env.tmp; /bin/mv -f /run/warren/secrets.env.tmp /run/warren/secrets.env) || true
+        fi
+    fi
+    unset WARREN_GIT_TOKENS
+fi
+
 # AD3: started as root (unless the task definition sets `user`), take ownership of the
 # volume mount points, then re-exec as warren. Nothing workspace-controlled runs as root.
 if [ "$(/usr/bin/id -u)" = 0 ]; then
