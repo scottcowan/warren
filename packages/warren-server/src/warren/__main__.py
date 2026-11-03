@@ -57,12 +57,12 @@ async def _recover_admin(username: str | None, reenable: bool) -> int:
         TargetAdminDisabledError,
         recover_admin_token,
     )
-    from warren.auth.store import AuthStore
     from warren.config import WarrenSettings
-    from warren.paths import db_path
+    from warren.state import open_state
 
     settings = WarrenSettings()
-    store = await AuthStore.open(db_path(settings))
+    state = await open_state(settings)  # WARREN_STATE_BACKEND: SQLite or DynamoDB
+    store = state.auth
     try:
         try:
             user, token, raw_token = await recover_admin_token(
@@ -72,12 +72,28 @@ async def _recover_admin(username: str | None, reenable: bool) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
     finally:
-        await store.close()
+        await state.close()
 
     verb = "Re-enabled and recovered" if reenable else "Recovered"
     print(f"{verb} admin token for user {user.username!r} ({user.user_id}):")
     print(raw_token)
     print("This token is shown once and is not recoverable -- store it now.")
+    return 0
+
+
+async def _migrate_state(apply: bool, sqlite_path: str | None) -> int:
+    """Copy SQLite state into the configured DynamoDB table / Secrets Manager prefix
+    (warren/state/migrate.py). Dry run unless `apply`."""
+    from warren.config import WarrenSettings
+    from warren.registry.store import WriterLockHeld
+    from warren.state.migrate import migrate_state
+
+    settings = WarrenSettings()
+    try:
+        await migrate_state(settings, apply=apply, sqlite_path=sqlite_path)
+    except (ValueError, FileNotFoundError, WriterLockHeld) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -112,6 +128,21 @@ def main() -> None:
             "leave you just as locked out (audit R9/S9)."
         ),
     )
+    parser.add_argument(
+        "--migrate-state",
+        action="store_true",
+        help=(
+            "Copy this deployment's SQLite state into the backends selected by "
+            "WARREN_STATE_BACKEND=dynamodb / WARREN_SECRETS_BACKEND=secretsmanager and exit. "
+            "Dry run unless --apply; idempotent (never overwrites). Stop the server first."
+        ),
+    )
+    parser.add_argument("--apply", action="store_true", help="With --migrate-state: write.")
+    parser.add_argument(
+        "--sqlite-path",
+        default=None,
+        help="With --migrate-state: the SQLite file to copy (default <WARREN_DATA_DIR>/warren.db).",
+    )
     args = parser.parse_args()
 
     # `configure_logging()` installs `redact_secrets` as the first processor
@@ -133,6 +164,9 @@ def main() -> None:
     if args.recover_admin:
         exit_code = asyncio.run(_recover_admin(args.username, args.reenable))
         raise SystemExit(exit_code)
+
+    if args.migrate_state:
+        raise SystemExit(asyncio.run(_migrate_state(args.apply, args.sqlite_path)))
 
     uvicorn.run("warren.app:app", log_level="info", **_listen_kwargs())
 
