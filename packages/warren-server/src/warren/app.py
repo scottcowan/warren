@@ -3,9 +3,10 @@
 Startup order:
     1. WarrenSettings()
     2. run runtime.preflight() — ECS: await runtime.preflight(); else: run_preflight(podman_socket)
-    3. acquire_writer_lock + open_db(db_path(settings)) -- waits up to
+    3. acquire_writer_lock + open_state(settings) (warren/state/: SQLite by default, or
+       DynamoDB / Secrets Manager, preflighted) -- while SQLite is in use, waits up to
        writer_lock_wait_s, then fails, if another server process owns the database (audit #10)
-    4. Construct AuthStore(db) + ensure_bootstrap_admin(auth_store, settings) (D-03/D-04) —
+    4. state.auth + ensure_bootstrap_admin(auth_store, settings) (D-03/D-04) —
        before reconcile so a reconcile timeout can never leave the server admin-less
     5. Construct runtime (ECSRuntime | DockerRuntime | PodmanRuntime) + WorkspaceStore + WorkspaceRegistry
     6. asyncio.wait_for(registry.reconcile_from_disk(), timeout=30) — TimeoutError logged, non-fatal (D-14)
@@ -34,15 +35,9 @@ from warren.paths import db_path
 from warren.preflight import run_preflight
 from warren.registry.reaper import run_reaper
 from warren.registry.registry import WorkspaceRegistry
-from warren.registry.store import (
-    EbsSnapshotStore,
-    LaunchAttemptStore,
-    OperationStore,
-    WorkspaceStore,
-    acquire_writer_lock,
-    open_db,
-)
+from warren.registry.store import acquire_writer_lock
 from warren.runtime.podman import PodmanRuntime
+from warren.state import open_state, uses_sqlite
 
 log = structlog.get_logger(__name__)
 
@@ -52,14 +47,19 @@ _RECONCILE_TIMEOUT_S: float = 30.0
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = WarrenSettings()
-    writer_lock = await asyncio.to_thread(
-        acquire_writer_lock, db_path(settings), settings.writer_lock_wait_s
-    )
+    # Only SQLite needs a single writer: with WARREN_STATE_BACKEND=dynamodb and
+    # WARREN_SECRETS_BACKEND=secretsmanager no database file is opened at all.
+    writer_lock = None
+    if uses_sqlite(settings):
+        writer_lock = await asyncio.to_thread(
+            acquire_writer_lock, db_path(settings), settings.writer_lock_wait_s
+        )
     try:
         async with _lifespan(app, settings):
             yield
     finally:
-        writer_lock.release()
+        if writer_lock is not None:
+            writer_lock.release()
 
 
 @asynccontextmanager
@@ -125,12 +125,22 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
             # host_data_dir unset means the server isn't containerized (config.py).
             await run_preflight(settings.podman_socket, same_host=settings.host_data_dir is None)
 
-    db = await open_db(db_path(settings), journal_mode=settings.sqlite_journal_mode)
-    auth_store = AuthStore(db)
+    # WARREN_STATE_BACKEND / WARREN_SECRETS_BACKEND (warren/state/): SQLite by default.
+    state = await open_state(settings)
+    if not os.environ.get("WARREN_DRY_RUN_SKIP_PREFLIGHT"):
+        from warren.state.preflight import check_state_backends  # noqa: PLC0415
+
+        try:
+            await check_state_backends(settings, state)
+        except Exception:
+            await state.close()
+            raise
+    db = state.db
+    auth_store: AuthStore = state.auth  # type: ignore[assignment]
     await ensure_bootstrap_admin(auth_store, settings)
-    store = WorkspaceStore(db)
+    store = state.workspaces
     if settings.runtime_type == "ecs":
-        runtime.launch_store = LaunchAttemptStore(db)
+        runtime.launch_store = state.launch_attempts
 
         async def _storage_key_of(workspace_id: str) -> str | None:
             from warren.registry.registry import deserialize_spec_extra  # noqa: PLC0415
@@ -150,24 +160,18 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
 
         runtime.storage_of = _storage_of
         if runtime.ebs is not None:
-            runtime.ebs.snapshot_store = EbsSnapshotStore(db)
+            runtime.ebs.snapshot_store = state.ebs_snapshots
             if getattr(settings, "ecs_ebs_bare_seeds", False):
-                from warren.registry.store import EbsSeedStore  # noqa: PLC0415
                 from warren.runtime.ebs_seeds import BareSeeds, live_union  # noqa: PLC0415
 
-                runtime.seeds = BareSeeds(runtime, runtime.ebs, settings, EbsSeedStore(db))
+                runtime.seeds = BareSeeds(runtime, runtime.ebs, settings, state.ebs_seeds)
 
                 async def _live_seed_repos():
                     return live_union(await store.list_all())
 
                 runtime.seeds.live_repos = _live_seed_repos
-        from warren.secrets import store as secret_store  # noqa: PLC0415
-        from warren.secrets.cipher import LocalCipher  # noqa: PLC0415
-
-        cipher = LocalCipher(settings.secret_key.get_secret_value())
-
         async def _secret_values(owner_id: str, names: list[str]) -> dict[str, str]:
-            return await secret_store.resolve_secrets_for_names(db, cipher, owner_id, names)
+            return await state.secrets.resolve(owner_id, names)
 
         runtime.secret_values = _secret_values
     from warren.registry.events import WorkspaceEventStore
@@ -212,6 +216,7 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
         event_store=event_store,
         settings=settings,
         git_manager=git_manager,
+        secret_store=state.secrets,
     )
 
     try:
@@ -225,7 +230,8 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
     app.state.registry = registry
     app.state.event_store = event_store
     app.state.auth_store = auth_store
-    app.state.operation_store = OperationStore(db)
+    app.state.operation_store = state.operations
+    app.state.secret_store = state.secrets
     from warren.git.token_issuer import control_plane_issuer  # noqa: PLC0415
 
     app.state.github_token_issuer = control_plane_issuer(settings)
@@ -439,7 +445,7 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
                 pass
             except Exception:
                 log.exception("rate_limiter_pruner_shutdown_error")
-        await db.close()
+        await state.close()
 
 
 app = FastAPI(lifespan=lifespan)

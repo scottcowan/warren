@@ -48,6 +48,16 @@ Context variables (pass via --context or cdk.json):
     secrets_kms_key_arn     str  (default: "")    KMS key ARN for EBS-mode secrets delivery;
                                                    empty creates one (with rotation)
     ebs_size_gib            int  (default: 20)    Size of a new workspace's EBS volume
+    enable_dynamodb_state   bool (default: false) DynamoDB state table + WARREN_STATE_BACKEND=dynamodb
+    dynamodb_table_name     str  (default: "")    Table name; empty uses warren-state-<env_suffix>
+    dynamodb_kms_key_arn    str  (default: "")    CMK for the table; empty uses aws/dynamodb
+    enable_secretsmanager_secrets
+                             bool (default: false) User secrets in Secrets Manager
+                                                   (WARREN_SECRETS_BACKEND=secretsmanager)
+    secretsmanager_prefix   str  (default: "")    Secret name prefix; empty uses
+                                                   <ecs_resource_prefix>/<env_suffix>
+    secretsmanager_kms_key_arn
+                             str  (default: "")    CMK for the secrets; empty uses aws/secretsmanager
 """
 import aws_cdk as cdk
 from warren_stack import WarrenECSStack
@@ -120,6 +130,15 @@ ebs_kms_key_arn = app.node.try_get_context("ebs_kms_key_arn") or ""
 secrets_kms_key_arn = app.node.try_get_context("secrets_kms_key_arn") or ""
 ebs_size_gib = int(app.node.try_get_context("ebs_size_gib") or 20)
 
+
+def _flag(name: str) -> bool:
+    raw = app.node.try_get_context(name)
+    return raw if isinstance(raw, bool) else str(raw or "").lower() in ("true", "1", "yes")
+
+
+enable_dynamodb_state = _flag("enable_dynamodb_state")
+enable_secretsmanager_secrets = _flag("enable_secretsmanager_secrets")
+
 WarrenECSStack(
     app,
     "WarrenECSStack",
@@ -144,6 +163,12 @@ WarrenECSStack(
     ebs_kms_key_arn=ebs_kms_key_arn,
     secrets_kms_key_arn=secrets_kms_key_arn,
     ebs_size_gib=ebs_size_gib,
+    enable_dynamodb_state=enable_dynamodb_state,
+    dynamodb_table_name=app.node.try_get_context("dynamodb_table_name") or "",
+    dynamodb_kms_key_arn=app.node.try_get_context("dynamodb_kms_key_arn") or "",
+    enable_secretsmanager_secrets=enable_secretsmanager_secrets,
+    secretsmanager_prefix=app.node.try_get_context("secretsmanager_prefix") or "",
+    secretsmanager_kms_key_arn=app.node.try_get_context("secretsmanager_kms_key_arn") or "",
 )
 
 app.synth()

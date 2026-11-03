@@ -1516,6 +1516,179 @@ resource "aws_iam_role_policy" "ebs_task_policy" {
 }
 
 # ---------------------------------------------------------------------------
+# Optional AWS state backends (warren-server warren/state/, README "State backends").
+# enable_dynamodb_state: registry/auth state in one DynamoDB table
+# (WARREN_STATE_BACKEND=dynamodb). enable_secretsmanager_secrets: user secrets in Secrets
+# Manager under <prefix>/ (WARREN_SECRETS_BACKEND=secretsmanager). Both off by default:
+# SQLite on EFS stays the default.
+# ---------------------------------------------------------------------------
+
+locals {
+  dynamodb_table_name   = var.dynamodb_table_name != "" ? var.dynamodb_table_name : "warren-state-${var.env_suffix}"
+  secretsmanager_prefix = var.secretsmanager_prefix != "" ? var.secretsmanager_prefix : "${var.ecs_resource_prefix}/${var.env_suffix}"
+  secretsmanager_arns   = "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:${local.secretsmanager_prefix}/*"
+}
+
+# Key layout: packages/warren-server/src/warren/state/dynamodb.py. PITR and SSE on;
+# TTL on `ttl` expires idle-stop markers and expired/revoked tokens.
+resource "aws_dynamodb_table" "warren_state" {
+  count                       = var.enable_dynamodb_state ? 1 : 0
+  name                        = local.dynamodb_table_name
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "pk"
+  range_key                   = "sk"
+  deletion_protection_enabled = true
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+  attribute {
+    name = "gsi1pk"
+    type = "S"
+  }
+  attribute {
+    name = "gsi1sk"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "gsi1"
+    hash_key        = "gsi1pk"
+    range_key       = "gsi1sk"
+    projection_type = "ALL"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+
+  server_side_encryption {
+    enabled     = true
+    kms_key_arn = var.dynamodb_kms_key_arn != "" ? var.dynamodb_kms_key_arn : null
+  }
+
+  tags = {
+    warren = "true"
+  }
+}
+
+data "aws_iam_policy_document" "state_backend_policy" {
+  dynamic "statement" {
+    for_each = var.enable_dynamodb_state ? [1] : []
+    content {
+      sid    = "StateTable"
+      effect = "Allow"
+      # TransactWriteItems authorizes as the Put/Update/Delete/ConditionCheck it contains.
+      # Scan is only used by `warren-server --migrate-state` (counter rebuild).
+      actions = [
+        "dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query", "dynamodb:Scan",
+        "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:ConditionCheckItem",
+        "dynamodb:DescribeTable", "dynamodb:DescribeTimeToLive",
+      ]
+      resources = [aws_dynamodb_table.warren_state[0].arn, "${aws_dynamodb_table.warren_state[0].arn}/index/gsi1"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_dynamodb_state && var.dynamodb_kms_key_arn != "" ? [1] : []
+    content {
+      sid       = "StateTableKMS"
+      effect    = "Allow"
+      actions   = ["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey", "kms:DescribeKey"]
+      resources = [var.dynamodb_kms_key_arn]
+      condition {
+        test     = "StringEquals"
+        variable = "kms:ViaService"
+        values   = ["dynamodb.${var.aws_region}.amazonaws.com"]
+      }
+    }
+  }
+
+  # CreateSecret (and tag-on-create) only under the prefix, only carrying warren=true and
+  # only warren's own tag keys.
+  dynamic "statement" {
+    for_each = var.enable_secretsmanager_secrets ? [1] : []
+    content {
+      sid       = "SecretsCreateTagged"
+      effect    = "Allow"
+      actions   = ["secretsmanager:CreateSecret", "secretsmanager:TagResource"]
+      resources = [local.secretsmanager_arns]
+      condition {
+        test     = "StringEquals"
+        variable = "aws:RequestTag/warren"
+        values   = ["true"]
+      }
+      condition {
+        test     = "ForAllValues:StringEquals"
+        variable = "aws:TagKeys"
+        values   = ["warren", "warren.owner_id", "warren.server_instance"]
+      }
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_secretsmanager_secrets ? [1] : []
+    content {
+      sid    = "SecretsManageTagged"
+      effect = "Allow"
+      actions = [
+        "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:UpdateSecret",
+        "secretsmanager:DescribeSecret", "secretsmanager:DeleteSecret", "secretsmanager:RestoreSecret",
+      ]
+      resources = [local.secretsmanager_arns]
+      condition {
+        test     = "StringEquals"
+        variable = "secretsmanager:ResourceTag/warren"
+        values   = ["true"]
+      }
+    }
+  }
+
+  # ListSecrets has no resource-level permissions; warren filters on name prefix and tag.
+  dynamic "statement" {
+    for_each = var.enable_secretsmanager_secrets ? [1] : []
+    content {
+      sid       = "SecretsList"
+      effect    = "Allow"
+      actions   = ["secretsmanager:ListSecrets"]
+      resources = ["*"]
+    }
+  }
+
+  dynamic "statement" {
+    for_each = var.enable_secretsmanager_secrets && var.secretsmanager_kms_key_arn != "" ? [1] : []
+    content {
+      sid       = "SecretsKMS"
+      effect    = "Allow"
+      actions   = ["kms:GenerateDataKey", "kms:Decrypt", "kms:DescribeKey"]
+      resources = [var.secretsmanager_kms_key_arn]
+      condition {
+        test     = "StringEquals"
+        variable = "kms:ViaService"
+        values   = ["secretsmanager.${var.aws_region}.amazonaws.com"]
+      }
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "state_backend_policy" {
+  count  = var.enable_dynamodb_state || var.enable_secretsmanager_secrets ? 1 : 0
+  name   = "WarrenStateBackendPolicy"
+  role   = aws_iam_role.task_role.id
+  policy = data.aws_iam_policy_document.state_backend_policy.json
+}
+
+# ---------------------------------------------------------------------------
 # WARREN_SECRET_KEY — finding #19b / R20. Previously deferred to a runbook requiring a
 # plaintext env override on a one-off `run-task` call, which exposes the key in
 # plaintext to anyone who can see that invocation (T-07-01). Terraform now generates
@@ -1739,6 +1912,18 @@ resource "aws_ecs_task_definition" "warren_server" {
           { name = "WARREN_ECS_EBS_SIZE_GIB", value = tostring(var.ebs_size_gib) },
         ],
         var.ebs_kms_key_arn != "" ? [{ name = "WARREN_ECS_EBS_KMS_KEY_ID", value = var.ebs_kms_key_arn }] : [],
+        # Optional AWS state backends (README "State backends").
+        var.enable_dynamodb_state ? [
+          { name = "WARREN_STATE_BACKEND", value = "dynamodb" },
+          { name = "WARREN_DYNAMODB_TABLE", value = aws_dynamodb_table.warren_state[0].name },
+        ] : [],
+        var.enable_secretsmanager_secrets ? [
+          { name = "WARREN_SECRETS_BACKEND", value = "secretsmanager" },
+          { name = "WARREN_SECRETSMANAGER_PREFIX", value = local.secretsmanager_prefix },
+        ] : [],
+        var.enable_secretsmanager_secrets && var.secretsmanager_kms_key_arn != "" ? [
+          { name = "WARREN_SECRETSMANAGER_KMS_KEY_ID", value = var.secretsmanager_kms_key_arn },
+        ] : [],
       )
 
       logConfiguration = {

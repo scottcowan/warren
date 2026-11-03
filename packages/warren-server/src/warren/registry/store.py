@@ -527,6 +527,36 @@ class LaunchAttemptStore:
             ),
         )
 
+    async def claim(self, workspace_id: str, attempt: dict[str, str]) -> dict[str, str]:
+        """Store `attempt` unless a row with the same generation and fingerprint exists;
+        return the stored row either way (state/protocols.py). One statement, so two
+        racing claims can't both write."""
+        await self._db.execute(
+            """
+            INSERT INTO ecs_launch_attempts (
+                workspace_id, generation, fingerprint, task_definition_arn,
+                client_token, created_at, secrets_blobs
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(workspace_id) DO UPDATE SET
+                generation = excluded.generation, fingerprint = excluded.fingerprint,
+                task_definition_arn = excluded.task_definition_arn,
+                client_token = excluded.client_token, created_at = excluded.created_at,
+                secrets_blobs = excluded.secrets_blobs
+            WHERE ecs_launch_attempts.generation != excluded.generation
+               OR ecs_launch_attempts.fingerprint != excluded.fingerprint
+            """,
+            (
+                workspace_id,
+                attempt["generation"],
+                attempt["fingerprint"],
+                attempt["task_definition_arn"],
+                attempt["client_token"],
+                _utcnow_iso(),
+                attempt.get("secrets_blobs") or None,
+            ),
+        )
+        return await self.get(workspace_id) or dict(attempt)
+
     async def delete(self, workspace_id: str) -> None:
         await self._db.execute(
             "DELETE FROM ecs_launch_attempts WHERE workspace_id = ?", (workspace_id,)
