@@ -150,6 +150,40 @@ class WarrenSettings(BaseSettings):
     # Audit #10: how long startup waits for warren.db.lock (a stopped Fargate task's
     # NFSv4 lock can outlive it until the lease expires). 0 fails fast.
     writer_lock_wait_s: float = Field(default=120.0, ge=0)
+    # Optional AWS state backends (warren/state/, resources/ecs/README.md "State
+    # backends"). Independent switches; SQLite stays the default for both. The writer
+    # lock is only taken while either one is still sqlite.
+    # WARREN_STATE_BACKEND: registry, launch attempts, EBS snapshots/seeds, operations,
+    # idle stops, users and tokens. dynamodb needs WARREN_DYNAMODB_TABLE.
+    state_backend: Literal["sqlite", "dynamodb"] = "sqlite"
+    dynamodb_table: str = ""
+    # DynamoDB TTL backstops: how long an expired/revoked token's items, and an idle-stop
+    # marker, are kept before DynamoDB deletes them.
+    dynamodb_token_retention_days: float = Field(default=30.0, ge=0)
+    dynamodb_idle_stop_retention_days: float = Field(default=90.0, gt=0)
+    # WARREN_SECRETS_BACKEND: user secrets. secretsmanager stores one secret per
+    # (owner, name) at <prefix>/<owner>/<name> (default prefix warren/<server_id>),
+    # encrypted with WARREN_SECRETSMANAGER_KMS_KEY_ID when set (else aws/secretsmanager).
+    secrets_backend: Literal["sqlite", "secretsmanager"] = "sqlite"
+    secretsmanager_prefix: str = ""
+    secretsmanager_kms_key_id: str = ""
+    # Delete: a recovery window (7-30 days) by default; force-delete skips it.
+    secretsmanager_force_delete: bool = False
+    secretsmanager_recovery_window_days: int = Field(default=7, ge=7, le=30)
+    # In-memory cache of GetSecretValue at launch, per (owner, name, version stage).
+    secretsmanager_cache_ttl_s: float = Field(default=60.0, ge=0)
+
+    @model_validator(mode="after")
+    def _check_state_backends(self) -> "WarrenSettings":
+        if self.state_backend == "dynamodb" and not self.dynamodb_table:
+            raise ValueError("WARREN_STATE_BACKEND=dynamodb needs WARREN_DYNAMODB_TABLE")
+        prefix = self.secretsmanager_prefix
+        if prefix and not re.fullmatch(r"[A-Za-z0-9_+=.@-]+(/[A-Za-z0-9_+=.@-]+)*", prefix):
+            raise ValueError(
+                "WARREN_SECRETSMANAGER_PREFIX may only hold letters, digits and _+=.@- "
+                "in '/'-separated segments, with no leading or trailing '/'"
+            )
+        return self
     projects_dir: Path = Path.home() / ".warren" / "projects"
     server_id: str = Field(default_factory=socket.gethostname)
 

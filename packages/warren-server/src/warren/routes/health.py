@@ -81,7 +81,7 @@ async def _check_runtime_reachable(runtime, runtime_type: str) -> dict:
         return {"type": runtime_type, "reachable": False, "socket": ""}
 
 
-async def _check_secret_store(db) -> dict:
+async def _check_secret_store(db, secret_store=None) -> dict:
     """Return secret store reachability dict.
 
     Executes a COUNT(*) against the `secrets` table (warren.secrets.store) --
@@ -91,6 +91,8 @@ async def _check_secret_store(db) -> dict:
     e.g. a database opened before the `secrets` table existed in schema.sql.
     """
     try:
+        if secret_store is not None:  # WARREN_SECRETS_BACKEND (state/)
+            return {"reachable": True, "count": await secret_store.count()}
         async with db.execute("SELECT COUNT(*) FROM secrets") as cur:
             row = await cur.fetchone()
         return {"reachable": True, "count": row[0]}
@@ -132,7 +134,7 @@ async def healthz_detail(request: Request) -> HealthzDetailResponse:
             runtime_dict, all_ws, secret_dict = await asyncio.gather(
                 check_podman_health(settings.podman_socket),
                 store.list_all(),
-                _check_secret_store(db),
+                _check_secret_store(db, getattr(request.app.state, "secret_store", None)),
             )
         else:
             # R16: used to hardcode reachable=True here unconditionally for every
@@ -140,7 +142,7 @@ async def healthz_detail(request: Request) -> HealthzDetailResponse:
             runtime = getattr(request.app.state, "runtime", None)
             all_ws, secret_dict, runtime_dict = await asyncio.gather(
                 store.list_all(),
-                _check_secret_store(db),
+                _check_secret_store(db, getattr(request.app.state, "secret_store", None)),
                 _check_runtime_reachable(runtime, settings.runtime_type),
             )
 

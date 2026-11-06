@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from warren.registry.events import WorkspaceEventStore
     from warren.registry.models import Workspace
     from warren.registry.store import WorkspaceStore
+    from warren.state.protocols import SecretStoreProtocol
     from warren_common.agent_state import AgentState
     from warren_common.runtime.base import ContainerRuntime, WorkspaceSpec
     from warren_common.turn_refs import Snapshot
@@ -323,11 +324,14 @@ class WorkspaceRegistry:
         event_store: "WorkspaceEventStore | None" = None,
         settings: "WarrenSettings | None" = None,
         git_manager: "GitManager | None" = None,
+        secret_store: "SecretStoreProtocol | None" = None,
     ) -> None:
         self.runtime = runtime
         self.store = store
         self.server_id = server_id
         self.settings = settings
+        # WARREN_SECRETS_BACKEND (state/); None means the SQLite store on store's db.
+        self.secret_store = secret_store
         # LIFE-03/D-06/D-07: optional so every existing construction site (3-arg
         # and 5-arg) keeps working untouched, following the same precedent as
         # the optional event_store/settings parameters above.
@@ -1176,13 +1180,15 @@ class WorkspaceRegistry:
         )
 
         if self.settings is not None and getattr(self.settings, "runtime_type", "podman") != "ecs":
-            from warren.secrets import store as local_store
-            from warren.secrets.cipher import LocalCipher
+            secret_store = self.secret_store
+            if secret_store is None:
+                from warren.secrets.cipher import LocalCipher
+                from warren.secrets.store import SqliteSecretStore
 
-            cipher = LocalCipher(self.settings.secret_key.get_secret_value())
-            spec.env = await local_store.resolve_secrets_for_names(
-                self.store._db, cipher, owner_id, spec.secret_names
-            )
+                secret_store = SqliteSecretStore(
+                    self.store._db, LocalCipher(self.settings.secret_key.get_secret_value())
+                )
+            spec.env = await secret_store.resolve(owner_id, spec.secret_names)
 
         return spec
 

@@ -21,10 +21,14 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 import aiosqlite
 
 from warren.secrets.cipher import LocalCipher
+
+if TYPE_CHECKING:
+    from warren.state.protocols import SecretStoreProtocol
 
 
 def _utcnow_iso() -> str:
@@ -115,3 +119,48 @@ async def resolve_secrets_for_names(
     ) as cur:
         rows = await cur.fetchall()
     return {name: cipher.decrypt(ciphertext) for name, ciphertext in rows}
+
+
+class SqliteSecretStore:
+    """`SecretStoreProtocol` (state/protocols.py) over the functions above: the default
+    WARREN_SECRETS_BACKEND=sqlite, Fernet-encrypted rows in the shared database."""
+
+    def __init__(self, db: aiosqlite.Connection, cipher: LocalCipher) -> None:
+        self._db = db
+        self._cipher = cipher
+
+    async def set(self, owner_id: str, name: str, value: str) -> None:
+        await set_secret(self._db, self._cipher, owner_id, name, value)
+
+    async def exists(self, owner_id: str, name: str) -> bool:
+        return await secret_exists(self._db, owner_id, name)
+
+    async def delete(self, owner_id: str, name: str) -> bool:
+        return await delete_secret(self._db, owner_id, name)
+
+    async def list(self, owner_id: str) -> list[dict[str, str]]:
+        return await list_secrets(self._db, owner_id)
+
+    async def resolve(self, owner_id: str, names: list[str]) -> dict[str, str]:
+        return await resolve_secrets_for_names(self._db, self._cipher, owner_id, names)
+
+    async def reencrypt(self, owner_id: str, name: str) -> bool:
+        return await reencrypt_secret(self._db, self._cipher, owner_id, name)
+
+    async def count(self) -> int:
+        async with self._db.execute("SELECT COUNT(*) FROM secrets") as cur:
+            row = await cur.fetchone()
+        return int(row[0])
+
+
+def secret_store_from_state(state: object) -> "SecretStoreProtocol":
+    """The app's secret store: `app.state.secret_store` when lifespan wired one, else
+    (tests that only set `db`/`settings`) the SQLite store over `app.state.db`."""
+    store = getattr(state, "secret_store", None)
+    # A SQLite store always follows app.state.db (tests swap the connection).
+    if store is not None and not (
+        isinstance(store, SqliteSecretStore) and store._db is not getattr(state, "db", None)
+    ):
+        return store
+    settings = getattr(state, "settings")
+    return SqliteSecretStore(getattr(state, "db"), LocalCipher(settings.secret_key.get_secret_value()))

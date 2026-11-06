@@ -448,12 +448,9 @@ async def _provision_workspace(
     # writes them onto the task's own EFS volume (runtime/ecs_secrets.py).
     secret_env: dict[str, str] = {}
     if settings is not None and getattr(settings, "runtime_type", "podman") != "ecs":
-        from warren.secrets import store as local_store
-        from warren.secrets.cipher import LocalCipher
+        from warren.secrets.store import secret_store_from_state
 
-        db = request.app.state.db
-        cipher = LocalCipher(settings.secret_key.get_secret_value())
-        secret_env = await local_store.resolve_secrets_for_names(db, cipher, secret_owner_id, secret_names)
+        secret_env = await secret_store_from_state(request.app.state).resolve(secret_owner_id, secret_names)
 
     spec = WorkspaceSpec(
         workspace_id=workspace_id,

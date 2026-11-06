@@ -30,8 +30,7 @@ from pydantic import BaseModel
 
 from warren.audit import audit_event
 from warren.auth.deps import resolve_owner_id
-from warren.secrets import store as local_store
-from warren.secrets.cipher import LocalCipher
+from warren.secrets.store import secret_store_from_state
 
 log = structlog.get_logger(__name__)
 
@@ -89,11 +88,9 @@ async def put_secret(body: SecretWriteRequest, request: Request) -> Response:
     _validate_secret_write(body.name, body.value)
 
     owner_id = await resolve_owner_id(request)
-    settings = request.app.state.settings
-    db = request.app.state.db
-    cipher = LocalCipher(settings.secret_key.get_secret_value())
+    store = secret_store_from_state(request.app.state)
 
-    await local_store.set_secret(db, cipher, owner_id, body.name, body.value)
+    await store.set(owner_id, body.name, body.value)
     # Audit #46: secret writes weren't logged at all -- name/owner/action only, never
     # the value, same discipline as every other secret-touching log line in this module.
     log.info("secret_written", owner_id=owner_id, name=body.name)
@@ -104,20 +101,19 @@ async def put_secret(body: SecretWriteRequest, request: Request) -> Response:
 @router.get("/secrets", response_model=list[SecretMeta])
 async def list_secrets(request: Request) -> list[SecretMeta]:
     owner_id = await resolve_owner_id(request)
-    db = request.app.state.db
-    rows = await local_store.list_secrets(db, owner_id)
+    rows = await secret_store_from_state(request.app.state).list(owner_id)
     return [SecretMeta(name=r["name"]) for r in rows]
 
 
 @router.delete("/secrets/{name}", status_code=204)
 async def delete_secret(name: str, request: Request) -> Response:
     owner_id = await resolve_owner_id(request)
-    db = request.app.state.db
+    store = secret_store_from_state(request.app.state)
 
-    if not await local_store.secret_exists(db, owner_id, name):
+    if not await store.exists(owner_id, name):
         raise HTTPException(status_code=404, detail={"error": "secret_not_found"})
 
-    await local_store.delete_secret(db, owner_id, name)
+    await store.delete(owner_id, name)
     log.info("secret_deleted", owner_id=owner_id, name=name)
     audit_event("secret.delete", request=request, owner_id=owner_id, secret_names=[name])
     return Response(status_code=204)
@@ -130,20 +126,18 @@ async def rotate_secret(name: str, request: Request, body: SecretRotateRequest |
     support yet, so that is a fresh-IV re-encryption under the same WARREN_SECRET_KEY.
     A running workspace keeps the value it started with until it is relaunched."""
     owner_id = await resolve_owner_id(request)
-    settings = request.app.state.settings
-    db = request.app.state.db
-    cipher = LocalCipher(settings.secret_key.get_secret_value())
+    store = secret_store_from_state(request.app.state)
 
-    if not await local_store.secret_exists(db, owner_id, name):
+    if not await store.exists(owner_id, name):
         raise HTTPException(status_code=404, detail={"error": "secret_not_found"})
 
     value = body.value if body is not None else None
     if value is not None:
         _validate_secret_write(name, value)
-        await local_store.set_secret(db, cipher, owner_id, name, value)
+        await store.set(owner_id, name, value)
         log.info("secret_rotated", owner_id=owner_id, name=name, mode="new_value")
     else:
-        await local_store.reencrypt_secret(db, cipher, owner_id, name)
+        await store.reencrypt(owner_id, name)
         log.info("secret_rotated", owner_id=owner_id, name=name, mode="reencrypt")
     audit_event(
         "secret.rotate", request=request, owner_id=owner_id, secret_names=[name],

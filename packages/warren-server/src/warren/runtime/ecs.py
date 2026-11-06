@@ -122,6 +122,13 @@ class _MemoryLaunchStore:
     async def put(self, workspace_id: str, attempt: dict[str, str]) -> None:
         self._rows[workspace_id] = dict(attempt)
 
+    async def claim(self, workspace_id: str, attempt: dict[str, str]) -> dict[str, str]:
+        row = self._rows.get(workspace_id)
+        if row and (row["generation"], row["fingerprint"]) == (attempt["generation"], attempt["fingerprint"]):
+            return dict(row)
+        self._rows[workspace_id] = dict(attempt)
+        return dict(attempt)
+
     async def delete(self, workspace_id: str) -> None:
         self._rows.pop(workspace_id, None)
 
@@ -839,7 +846,12 @@ class ECSRuntime:
             }
             if blobs:
                 attempt["secrets_blobs"] = json.dumps(blobs, sort_keys=True)
-            await self.launch_store.put(spec.workspace_id, attempt)
+            # A concurrent launch of the same generation may have stored its attempt
+            # first: adopt it, so both send ECS the same clientToken and request.
+            attempt = await self.launch_store.claim(spec.workspace_id, attempt)
+            task_def_arn = attempt["task_definition_arn"]
+            if blobs:
+                blobs = _load_blobs(attempt.get("secrets_blobs")) or blobs
 
         if blobs:
             for override in container_overrides:

@@ -20,6 +20,7 @@ from warren.auth.deps import current_token_id, require_admin
 from warren.auth.models import Token, User
 from warren.auth.store import LastAdminError, TokenLimitReached
 from warren.auth.tokens import derive_token_pepper, generate_token, hash_token
+from warren.state.errors import StateConflict
 
 log = structlog.get_logger(__name__)
 
@@ -73,7 +74,7 @@ async def create_user(
 
     try:
         user = await store.create_user(username=body.username, is_admin=body.is_admin)
-    except aiosqlite.IntegrityError as exc:
+    except (aiosqlite.IntegrityError, StateConflict) as exc:
         raise HTTPException(status_code=409, detail="username already exists") from exc
 
     raw_token = generate_token()
