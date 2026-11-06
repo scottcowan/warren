@@ -77,7 +77,7 @@ def test_settings_empty_url_is_unset(monkeypatch):
 
 def test_build_notifier_server_target(monkeypatch):
     s = _settings(monkeypatch, WARREN_NOTIFY_WEBHOOK_URL=SECRET, WARREN_NOTIFY_EVENTS="agent.failed,agent.waiting")
-    n = build_notifier(s, db=None)
+    n = build_notifier(s, secrets=None)
     assert n.server_target is not None and n.server_target.kind == "server"
     assert n.server_target.events == {"agent.failed", "agent.waiting"}
     assert not n.server_target.require_public

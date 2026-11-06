@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from warren.config import WarrenSettings
-    from warren.registry.runs import RunStore
+    from warren.state.protocols import RunStoreProtocol
     from warren.git.manager import GitManager
     from warren.registry.events import WorkspaceEventStore
     from warren.registry.models import Workspace
@@ -352,7 +352,7 @@ class WorkspaceRegistry:
         self._locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
         # Headless runs (registry/runs.py): set by app.py; None keeps runs unrecorded.
-        self.run_store: "RunStore | None" = None
+        self.run_store: "RunStoreProtocol | None" = None
         self._run_probe_at: dict[str, float] = {}
         # Audit 2026-10-16 P1 #33: a bare `asyncio.create_task(...)` with no
         # reference kept anywhere can be garbage-collected mid-run on some

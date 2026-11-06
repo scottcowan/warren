@@ -1,7 +1,8 @@
 """Backend-parametrised store fixtures (warren/state/).
 
-`workspace_store`, `auth_store`, `launch_store`, `snapshot_store`, `seed_store` and
-`operation_store` run each test against SQLite and against DynamoDB under moto;
+`workspace_store`, `auth_store`, `launch_store`, `snapshot_store`, `seed_store`,
+`operation_store` and `run_store` run each test against SQLite and against DynamoDB
+under moto;
 `secret_store` against SQLite + Fernet and against Secrets Manager under moto. moto
 intercepts every AWS call in-process: nothing here reaches AWS.
 """
@@ -92,6 +93,7 @@ async def _stores(state_backend, request, sqlite_path):
         yield dynamo_stores(table, settings)
         return
     from warren.auth.store import AuthStore
+    from warren.registry.runs import RunStore
     from warren.registry.store import (
         EbsSeedStore,
         EbsSnapshotStore,
@@ -109,6 +111,7 @@ async def _stores(state_backend, request, sqlite_path):
         "ebs_seeds": EbsSeedStore(db),
         "operations": OperationStore(db),
         "auth": AuthStore(db),
+        "runs": RunStore(db),
     }
     await db.close()
 
@@ -141,6 +144,11 @@ def seed_store(_stores):
 @pytest.fixture
 def operation_store(_stores):
     return _stores["operations"]
+
+
+@pytest.fixture
+def run_store(_stores):
+    return _stores["runs"]
 
 
 @pytest.fixture(params=["sqlite", "secretsmanager"])

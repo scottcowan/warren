@@ -151,14 +151,37 @@ async def test_store_roundtrip_and_tampered_record_fails_closed(tmp_path):
     db = await open_db(tmp_path / "w.db")
     try:
         cipher = LocalCipher("k" * 32)
-        await store.put(db, cipher, "u1", URL, "slack", frozenset({"agent.waiting"}))
-        t = await store.get(db, cipher, "u1")
+        secrets = secret_store.SqliteSecretStore(db, cipher)
+        await store.put(secrets, "u1", URL, "slack", frozenset({"agent.waiting"}))
+        t = await store.get(secrets, "u1")
         assert t is not None and t.kind == "owner" and t.require_public and t.format == "slack"
         assert t.url.get_secret_value() == URL and "ownerSECRETpart" not in repr(t)
-        assert await store.subscribed_owners(db) == {"u1"}
+        assert await store.subscribed_owners(secrets) == {"u1"}
         await secret_store.set_secret(db, cipher, "u2", store.SECRET_NAME, '{"url": "http://internal/x"}')
-        assert await store.get(db, cipher, "u2") is None
-        assert await store.delete(db, "u1") is True
-        assert await store.get(db, cipher, "u1") is None
+        assert await store.get(secrets, "u2") is None
+        assert await store.delete(secrets, "u1") is True
+        assert await store.get(secrets, "u1") is None
     finally:
         await db.close()
+
+
+
+async def test_store_on_every_secrets_backend(secret_store):
+    """The webhook record goes through SecretStoreProtocol: SQLite + Fernet and Secrets
+    Manager (moto) behave the same (fixture in tests/unit/conftest.py)."""
+    from warren.notify import store
+
+    await store.put(secret_store, "u1", URL, "json", frozenset({"agent.failed"}))
+    await store.put(secret_store, "arn:aws:iam::1:user/u2", URL, "slack", frozenset())
+    await secret_store.set("u3", "NOT_A_WEBHOOK", "x")
+    assert await store.subscribed_owners(secret_store) == {"u1", "arn:aws:iam::1:user/u2"}
+    t = await store.get(secret_store, "u1")
+    assert t is not None and t.events == {"agent.failed"} and t.url.get_secret_value() == URL
+    assert (await store.get(secret_store, "arn:aws:iam::1:user/u2")).format == "slack"
+    assert await store.get(secret_store, "u3") is None
+    await store.put(secret_store, "u1", URL, "slack", frozenset({"agent.waiting"}))
+    assert (await store.get(secret_store, "u1")).events == {"agent.waiting"}  # write invalidates any cache
+    assert await store.delete(secret_store, "u1") is True
+    assert await store.delete(secret_store, "u1") is False
+    assert await store.get(secret_store, "u1") is None
+    assert await store.subscribed_owners(secret_store) == {"arn:aws:iam::1:user/u2"}

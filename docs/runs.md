@@ -137,8 +137,9 @@ Git state is read through a read-only shadow git dir (no repo config, hooks or f
 
 ## Retention
 
-Runs live in the registry's `runs` table, so the result is there after the workspace is
-destroyed and after a server restart. Finished runs are pruned when another run finishes:
+Runs live in the registry's `runs` table (or, with `WARREN_STATE_BACKEND=dynamodb`, as
+`RUN#<run_id>` items in the workspace's partition; `--migrate-state` copies them), so the
+result is there after the workspace is destroyed and after a server restart. Finished runs are pruned when another run finishes:
 those older than `WARREN_RUN_RETENTION_SECONDS` (default 30 days), then each owner's oldest
 beyond `WARREN_RUN_MAX_PER_OWNER` (default 500). Running runs are never pruned.
 

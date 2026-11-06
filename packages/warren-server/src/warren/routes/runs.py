@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, model_validator
 from warren.audit import audit_event
 from warren.auth.deps import current_user, current_workspace_scope
 from warren.registry import runs
+from warren.state.protocols import RunStoreProtocol
 from warren.routes.workspaces import (
     _MAX_PROMPT_CHARS,
     _OPERATION_ID_PATTERN,
@@ -48,7 +49,7 @@ class RunRequest(BaseModel):
         return data
 
 
-def _store(request: Request) -> runs.RunStore:
+def _store(request: Request) -> RunStoreProtocol:
     store = getattr(request.app.state, "run_store", None)
     if store is None:
         raise HTTPException(status_code=503, detail="run store unavailable")
@@ -79,7 +80,7 @@ async def _visible_run(request: Request, run_id: str) -> dict[str, Any]:
     return run
 
 
-async def _settle(request: Request, store: runs.RunStore, run: dict[str, Any]) -> dict[str, Any]:
+async def _settle(request: Request, store: RunStoreProtocol, run: dict[str, Any]) -> dict[str, Any]:
     registry = getattr(request.app.state, "registry", None)
     if registry is None:
         return run

@@ -292,3 +292,19 @@ async def test_reservation_token_provision_grant(auth_store):
     assert results.count(True) == 1
     assert await auth_store.get_active_workspace_token("res") is None  # unprovisioned, grant spent
     assert await auth_store.consume_provision_grant("unknown") is False
+
+
+# -- host ports (#73) ---------------------------------------------------------
+
+
+async def test_host_ports_roundtrip(workspace_store):
+    await workspace_store.insert(**_ws("ws-hp"))
+    assert (await workspace_store.get("ws-hp")).host_ports_json is None
+    ports = {"t3": {"host": "127.0.0.1", "port": 41234}}
+    await workspace_store.update_host_ports("ws-hp", ports)
+    assert json.loads((await workspace_store.get("ws-hp")).host_ports_json) == ports
+    assert [json.loads(w.host_ports_json) for w in await workspace_store.list_all()] == [ports]
+    await workspace_store.update_host_ports("ws-hp", {})
+    assert (await workspace_store.get("ws-hp")).host_ports_json is None
+    await workspace_store.update_host_ports("missing", ports)  # no-op, as the SQLite UPDATE
+    assert await workspace_store.get("missing") is None

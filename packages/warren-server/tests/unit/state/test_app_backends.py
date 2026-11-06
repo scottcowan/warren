@@ -4,6 +4,7 @@ created, and a missing table fails startup."""
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -72,6 +73,47 @@ def test_routes_run_on_dynamodb_and_secretsmanager(aws_env, sm_client, dynamo_ta
     assert len(names) == 1 and names[0].startswith("warren/test/")
     # Nothing SQLite: no database file and no writer lock.
     assert not (aws_env / "warren.db").exists() and not (aws_env / "warren.db.lock").exists()
+
+
+def test_notifications_and_runs_on_dynamodb_and_secretsmanager(aws_env, sm_client):
+    """#68's webhook record goes through the Secrets Manager store (reserved name kept
+    out of PUT /secrets, subscribers found by owners_with); #72's runs land in DynamoDB."""
+    import asyncio
+
+    from warren.app import app
+
+    url = "https://hooks.slack.com/services/T000/B000/ownerSECRETpart"
+    headers = {"Authorization": f"Bearer {TEST_BOOTSTRAP_TOKEN}"}
+    with (
+        patch("warren.app.run_preflight", AsyncMock()),
+        patch("warren.app.WorkspaceRegistry", return_value=_fake_registry()),
+        patch("warren.app.PodmanRuntime"),
+        TestClient(app, headers=headers) as client,
+    ):
+        assert type(app.state.run_store).__name__ == "DynamoRunStore"
+        resp = client.post("/admin/users", json={"username": "bob", "is_admin": False})
+        bob_id = resp.json()["user"]["user_id"]
+        bob = {"Authorization": f"Bearer {resp.json()['token']['token']}"}
+
+        refused = client.put("/secrets", json={"name": "warren.notify.webhook", "value": "{}"}, headers=bob)
+        assert refused.status_code == 400 and refused.json()["detail"]["error"] == "reserved_secret_name"
+        assert client.put("/notifications/webhook", json={"url": url, "format": "slack"}, headers=bob).status_code == 204
+        view = client.get("/notifications/webhook", headers=bob).json()
+        assert view["configured"] is True and view["format"] == "slack" and url not in str(view)
+        assert client.get("/notifications/webhook").json()["configured"] is False  # the admin's: none
+
+        notifier = app.state.notifier
+        assert asyncio.run(notifier.watched_owners()) == {bob_id}
+        target = asyncio.run(notifier.targets_for(SimpleNamespace(owner=bob_id, event="agent.waiting")))
+        assert [t.url.get_secret_value() for t in target] == [url]
+
+        assert client.delete("/notifications/webhook", headers=bob).status_code == 204
+        assert client.delete("/notifications/webhook", headers=bob).status_code == 404
+        assert asyncio.run(notifier.watched_owners()) == set()
+
+    names = [s["Name"] for s in sm_client.list_secrets(IncludePlannedDeletion=True)["SecretList"]]
+    assert len(names) == 1 and names[0].startswith("warren/test/") and names[0].endswith("/warren.notify.webhook")
+    assert not (aws_env / "warren.db").exists()
 
 
 def test_missing_table_fails_startup(aws_env, monkeypatch):

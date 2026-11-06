@@ -52,6 +52,17 @@ async def populated(tmp_path):
     await ws.insert(workspace_id="ws-2", project="p", intent="i", image="img", root_path="", server_instance="s1",
                     status="destroyed", owner_id=admin.user_id)
     await ws.mark_idle_stopped("ws-2")
+    await ws.update_host_ports("ws-1", {"t3": {"host": "127.0.0.1", "port": 41234}})
+    from warren.registry.runs import RunStore
+
+    run_store = RunStore(db)
+    started = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
+    await run_store.create(run_id="ws-2", owner_id=admin.user_id, project="p", template="t",
+                           timeout_seconds=90.0, started_at=started)
+    await run_store.finish("ws-2", status="succeeded", result={"schema": "warren.run.result/v1", "exit_code": 0},
+                           ended_at=started + timedelta(seconds=30))
+    await run_store.create(run_id="ws-1", owner_id=admin.user_id, project="p", template="t",
+                           timeout_seconds=None, started_at=started + timedelta(minutes=1))
     await auth.create_workspace_token(workspace_id="ws-1", user_id=admin.user_id, hashed_token="wh", expires_at=expires)
     await LaunchAttemptStore(db).put("ws-1", {"generation": "g", "fingerprint": "f", "task_definition_arn": "arn", "client_token": "ct"})
     await EbsSnapshotStore(db).put("ws-1", "snap-1")
@@ -75,6 +86,7 @@ async def test_dry_run_writes_nothing(populated, dynamo_table, sm_client):
     )
     assert summary["workspaces"] == {"copied": 2, "present": 0}
     assert summary["users"]["copied"] == 2 and summary["tokens"]["copied"] == 1
+    assert summary["runs"] == {"copied": 2, "present": 0}
     assert summary["secrets"] == {"copied": 2, "present": 0}
     assert await dynamo_table.scan() == []
     assert sm_client.list_secrets()["SecretList"] == []
@@ -107,6 +119,14 @@ async def test_apply_copies_everything_and_is_idempotent(populated, dynamo_table
     assert (await stores["ebs_seeds"].get_seed(populated.admin.user_id))["size_gib"] == 10
     assert (await stores["ebs_seeds"].repos(populated.admin.user_id))[0]["branches"] == ["main"]
     assert (await stores["operations"].get("p", "op"))["workspace_id"] == "ws-1"
+    assert ws1.host_ports_json is not None and "41234" in ws1.host_ports_json
+
+    # Headless runs (#72): finished and running, newest first, result intact.
+    runs = await stores["runs"].list(populated.admin.user_id)
+    assert [(r["run_id"], r["status"]) for r in runs] == [("ws-1", "running"), ("ws-2", "succeeded")]
+    assert runs[1]["result"] == {"schema": "warren.run.result/v1", "exit_code": 0}
+    assert runs[1]["timeout_seconds"] == 90.0 and runs[1]["ended_at"] == "2026-11-01T12:00:30Z"
+    assert runs[0]["timeout_seconds"] is None and runs[0]["result"] is None
 
     # Counters were rebuilt: the cap sees the migrated live workspace.
     from warren.registry.store import CapacityExhausted

@@ -1,4 +1,5 @@
-"""Headless runs: the runs store, result assembly and parsing (registry/runs.py)."""
+"""Headless runs: the runs store (against every WARREN_STATE_BACKEND, fixtures in
+tests/unit/conftest.py), result assembly and parsing (registry/runs.py)."""
 
 from __future__ import annotations
 
@@ -8,16 +9,13 @@ from types import SimpleNamespace
 
 import pytest
 from warren.registry import runs
-from warren.registry.store import open_db
 
 T0 = datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
 
 
 @pytest.fixture
-async def store(sqlite_path):
-    db = await open_db(sqlite_path)
-    yield runs.RunStore(db)
-    await db.close()
+def store(run_store):
+    return run_store
 
 
 async def _create(store, run_id, owner="alice", started=T0, timeout=None):
@@ -185,3 +183,21 @@ def test_build_result_shape():
     assert result["pull_requests"] == ["https://github.com/o/r/pull/9"]
     assert result["capture_errors"] == ["a", "b"]
     assert result["git"][0]["branch"] == "main"
+
+
+async def test_prune_skips_a_run_that_is_still_running_however_old(store):
+    await _create(store, "live", started=T0 - timedelta(days=400))
+    assert await store.prune(retention_seconds=1, max_per_owner=0, now=T0) == 0
+    assert (await store.get("live"))["status"] == "running"
+
+
+async def test_list_limit_and_result_fidelity(store):
+    for i in range(3):
+        await _create(store, f"r{i}", started=T0 + timedelta(minutes=i), timeout=1.5)
+    result = {"schema": runs.SCHEMA, "nested": {"a": [1, 2.5, None]}, "final_message": "done"}
+    await store.finish("r2", status="timed_out", result=result, ended_at=T0 + timedelta(minutes=9))
+    listed = await store.list("alice", limit=2)
+    assert [r["run_id"] for r in listed] == ["r2", "r1"]
+    assert listed[0]["result"] == result and listed[0]["timeout_seconds"] == 1.5
+    assert listed[0]["status"] == "timed_out" and listed[1]["result"] is None
+    assert await store.get("missing") is None

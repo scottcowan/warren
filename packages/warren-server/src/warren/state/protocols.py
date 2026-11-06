@@ -13,7 +13,7 @@ every backend, so a backend missing the method fails there.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from warren.auth.models import Token, User, WorkspaceToken
 from warren.registry.models import Workspace, WorkspaceStatus
@@ -52,6 +52,7 @@ class WorkspaceStoreProtocol(Protocol):
     async def update_container_id(self, workspace_id: str, container_id: str | None) -> None: ...
     async def update_image(self, workspace_id: str, image: str) -> None: ...
     async def update_ssh_port(self, workspace_id: str, port: int) -> None: ...
+    async def update_host_ports(self, workspace_id: str, host_ports: dict | None) -> None: ...
     async def list_non_terminal(self) -> list[Workspace]: ...
     async def list_all(self) -> list[Workspace]: ...
 
@@ -173,3 +174,36 @@ class SecretStoreProtocol(Protocol):
         ...
 
     async def count(self) -> int: ...
+
+    async def owners_with(self, name: str) -> set[str]:
+        """Every owner that has a secret called `name` (warren.notify: who has a webhook).
+        Names only, never values."""
+        ...
+
+
+@runtime_checkable
+class RunStoreProtocol(Protocol):
+    """Headless runs (registry/runs.py), keyed by run id (= workspace id). Rows outlive
+    their workspace; `prune` drops finished ones by age and per-owner count."""
+
+    async def create(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        project: str,
+        template: str,
+        timeout_seconds: float | None,
+        started_at: datetime | None = None,
+    ) -> None: ...
+
+    async def get(self, run_id: str) -> dict[str, Any] | None: ...
+    async def list(self, owner_id: str | None, limit: int = 50) -> list[dict[str, Any]]: ...
+
+    async def finish(
+        self, run_id: str, *, status: str, result: dict[str, Any], ended_at: datetime | None = None
+    ) -> bool: ...
+
+    async def prune(
+        self, *, retention_seconds: float, max_per_owner: int, now: datetime | None = None
+    ) -> int: ...

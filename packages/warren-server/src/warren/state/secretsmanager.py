@@ -240,6 +240,17 @@ class SecretsManagerSecretStore:
     async def count(self) -> int:
         return len(await self._list(f"{self.prefix}/"))
 
+    async def owners_with(self, name: str) -> set[str]:
+        """Owners with a secret called `name`: one paginated ListSecrets over the prefix
+        (ListSecrets can't filter on a name suffix), decoding `<prefix>/<owner>/<name>`."""
+        root = f"{self.prefix}/"
+        owners = set()
+        for entry in await self._list(root):
+            owner, sep, rest = entry["Name"][len(root) :].partition("/")
+            if sep and "/" not in rest and decode_component(rest) == name:
+                owners.add(decode_component(owner))
+        return owners
+
     async def resolve(self, owner_id: str, names: list[str]) -> dict[str, str]:
         """Exactly the named secrets of `owner_id`, through the cache."""
         if not names:

@@ -19,10 +19,10 @@ log = structlog.get_logger(__name__)
 __all__ = ["EVENTS", "Notifier", "build_notifier", "notify_workspace", "notify_workspace_id"]
 
 
-def build_notifier(settings: Any, db: Any) -> Notifier:
-    """The server's Notifier from WARREN_NOTIFY_* settings and the secrets store."""
+def build_notifier(settings: Any, secrets: Any) -> Notifier:
+    """The server's Notifier from WARREN_NOTIFY_* settings and the server's secret store
+    (a `SecretStoreProtocol`; None: server-wide webhook only)."""
     from warren.notify import store  # noqa: PLC0415
-    from warren.secrets.cipher import LocalCipher  # noqa: PLC0415
 
     server_target = None
     if settings.notify_webhook_url is not None:
@@ -32,18 +32,17 @@ def build_notifier(settings: Any, db: Any) -> Notifier:
             events=parse_events(settings.notify_events),
             kind="server",
         )
-    cipher = LocalCipher(settings.secret_key.get_secret_value())
 
     async def owner_lookup(owner_id: str) -> Target | None:
-        return await store.get(db, cipher, owner_id)
+        return await store.get(secrets, owner_id)
 
     async def watched_owners() -> set[str]:
-        return await store.subscribed_owners(db)
+        return await store.subscribed_owners(secrets)
 
     return Notifier(
         server_target=server_target,
-        owner_lookup=owner_lookup,
-        watched_owners=watched_owners,
+        owner_lookup=owner_lookup if secrets is not None else None,
+        watched_owners=watched_owners if secrets is not None else None,
         queue_size=settings.notify_queue_size,
         max_retries=settings.notify_max_retries,
         timeout_seconds=settings.notify_timeout_seconds,

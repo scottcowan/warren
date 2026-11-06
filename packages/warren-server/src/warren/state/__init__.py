@@ -4,7 +4,7 @@
 `state/protocols.py`. Two independent switches:
 
 - WARREN_STATE_BACKEND=sqlite (default) | dynamodb: registry, launch attempts, EBS
-  snapshots and seeds, operations, idle stops, users and tokens.
+  snapshots and seeds, operations, idle stops, users and tokens, headless runs.
 - WARREN_SECRETS_BACKEND=sqlite (default) | secretsmanager: user secrets.
 
 The SQLite file (and its writer lock) is only opened while either switch is sqlite.
@@ -25,6 +25,7 @@ if TYPE_CHECKING:
         EbsSnapshotStoreProtocol,
         LaunchAttemptStoreProtocol,
         OperationStoreProtocol,
+        RunStoreProtocol,
         SecretStoreProtocol,
         WorkspaceStoreProtocol,
     )
@@ -39,6 +40,7 @@ class StateBackend:
     operations: "OperationStoreProtocol"
     auth: "AuthStoreProtocol"
     secrets: "SecretStoreProtocol"
+    runs: "RunStoreProtocol"
     # The SQLite connection, while either backend is sqlite; else None.
     db: "aiosqlite.Connection | None" = None
 
@@ -79,6 +81,7 @@ def dynamo_stores(table: Any, settings: Any) -> dict[str, Any]:
         "ebs_seeds": d.DynamoEbsSeedStore(table),
         "operations": d.DynamoOperationStore(table),
         "auth": d.DynamoAuthStore(table, token_retention_days=settings.dynamodb_token_retention_days),
+        "runs": d.DynamoRunStore(table),
     }
 
 
@@ -108,6 +111,7 @@ async def open_state(
     clients are injectable for tests (moto) and default to boto3 in WARREN_AWS_REGION."""
     from warren.auth.store import AuthStore
     from warren.paths import db_path
+    from warren.registry.runs import RunStore
     from warren.registry.store import (
         EbsSeedStore,
         EbsSnapshotStore,
@@ -134,6 +138,7 @@ async def open_state(
             "ebs_seeds": EbsSeedStore(db),
             "operations": OperationStore(db),
             "auth": AuthStore(db),
+            "runs": RunStore(db),
         }
     if settings.secrets_backend == "secretsmanager":
         secrets = secretsmanager_store(settings, secretsmanager_client)

@@ -100,3 +100,18 @@ async def test_count_counts_every_owner(secret_store):
     await secret_store.set("user-1", "A", "va")
     await secret_store.set("user-2", "A", "vb")
     assert await secret_store.count() == 2
+
+
+async def test_owners_with_names_every_owner_of_one_secret_name(secret_store):
+    # warren.notify finds its subscribers this way; the reserved, non-env name must
+    # survive each backend's name encoding.
+    await secret_store.set("alice", "warren.notify.webhook", "{}")
+    await secret_store.set("arn:aws:iam::1:user/bob", "warren.notify.webhook", "{}")
+    await secret_store.set("carol", "OTHER", "x")
+    await secret_store.set("carol", "warren.notify.webhook.old", "x")
+    assert await secret_store.owners_with("warren.notify.webhook") == {"alice", "arn:aws:iam::1:user/bob"}
+    assert [r["name"] for r in await secret_store.list("alice")] == ["warren.notify.webhook"]
+    assert await secret_store.count() == 4
+    assert await secret_store.delete("alice", "warren.notify.webhook")
+    assert await secret_store.owners_with("warren.notify.webhook") == {"arn:aws:iam::1:user/bob"}
+    assert await secret_store.owners_with("nope") == set()

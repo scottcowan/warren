@@ -63,8 +63,9 @@ DELETE /notifications/webhook
 
 - `events` left out or empty means every event.
 - The URL is validated like the server-wide one. `GET` never returns it.
-- The record (URL, format, events) is encrypted with `WARREN_SECRET_KEY` and kept in
-  the secrets store under the reserved name `warren.notify.webhook`, keyed by your
+- The record (URL, format, events) is kept in the server's secret store like any other
+  secret (encrypted with `WARREN_SECRET_KEY` in SQLite, or a Secrets Manager secret with
+  `WARREN_SECRETS_BACKEND=secretsmanager`) under the reserved name `warren.notify.webhook`, keyed by your
   warren user id (the id that owns your workspaces). `PUT /secrets` rejects names
   starting `warren.notify.`. That name isn't an environment variable name, so it can
   never be delivered into a workspace.

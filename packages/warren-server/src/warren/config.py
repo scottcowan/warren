@@ -154,7 +154,7 @@ class WarrenSettings(BaseSettings):
     # backends"). Independent switches; SQLite stays the default for both. The writer
     # lock is only taken while either one is still sqlite.
     # WARREN_STATE_BACKEND: registry, launch attempts, EBS snapshots/seeds, operations,
-    # idle stops, users and tokens. dynamodb needs WARREN_DYNAMODB_TABLE.
+    # idle stops, users and tokens, headless runs. dynamodb needs WARREN_DYNAMODB_TABLE.
     state_backend: Literal["sqlite", "dynamodb"] = "sqlite"
     dynamodb_table: str = ""
     # DynamoDB TTL backstops: how long an expired/revoked token's items, and an idle-stop

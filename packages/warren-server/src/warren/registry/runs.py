@@ -148,7 +148,13 @@ class RunStore:
 
 
 def _row(row: Any) -> dict[str, Any]:
-    data = dict(zip(_COLUMNS, row))
+    return run_view(dict(zip(_COLUMNS, row)))
+
+
+def run_view(data: dict[str, Any]) -> dict[str, Any]:
+    """A stored run (its `_COLUMNS`) as the store returns it: `result_json` decoded
+    into `result`. Shared by the SQLite and DynamoDB (state/dynamodb.py) stores."""
+    data = {c: data.get(c) for c in _COLUMNS}
     raw = data.pop("result_json")
     try:
         data["result"] = json.loads(raw) if raw else None

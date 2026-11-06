@@ -22,14 +22,16 @@ from warren.state.dynamodb import (
     DynamoAuthStore,
     DynamoTable,
     _epoch_after,
+    _RUN_FIELDS,
     recount,
+    run_item,
     user_item,
     workspace_item,
 )
 
 _ENTITIES = (
     "workspaces", "launch_attempts", "ebs_snapshots", "idle_stops", "ebs_seeds",
-    "ebs_seed_repos", "operations", "users", "tokens", "workspace_tokens",
+    "ebs_seed_repos", "operations", "users", "tokens", "workspace_tokens", "runs",
 )
 
 
@@ -85,6 +87,9 @@ async def _dynamo_items(db: Any, settings: Any) -> dict[str, list[list[dict]]]:
     out["tokens"] = [auth.token_items(r) for r in await _rows(db, "SELECT * FROM tokens")]
     out["workspace_tokens"] = [
         auth.workspace_token_items(r) for r in await _rows(db, "SELECT * FROM workspace_tokens")
+    ]
+    out["runs"] = [
+        [run_item(r)] for r in await _rows(db, f"SELECT {', '.join(_RUN_FIELDS)} FROM runs")
     ]
     return out
 

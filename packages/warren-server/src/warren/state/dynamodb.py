@@ -23,6 +23,8 @@ boto3 call runs in `asyncio.to_thread`. Key layout (also in resources/ecs/README
     EBS seed repo       SEED#<owner>          REPO#<repo_key>    SEEDREPOS /              -
                                                                  <owner>#<repo_key>
     operation           OP#<principal>        OP#<operation_id>  -                        -
+    headless run        WS#<id>               RUN#<run_id>       RUNS /                   -
+                                                                 <created_at>#<run_id>
     workspace counters  COUNTER#workspaces    ALL | OWNER#<owner> | OWNERLESS             -
     admin counters      COUNTER#admins        META               -                        -
 
@@ -357,7 +359,13 @@ async def _backoff(attempt: int) -> None:
 _WS_FIELDS = (
     "workspace_id", "project", "intent", "image", "root_path", "container_id", "status",
     "server_instance", "labels_json", "created_at", "updated_at", "ssh_port", "owner_id",
-    "idle_ttl_seconds", "spec_json",
+    "idle_ttl_seconds", "spec_json", "host_ports_json",
+)
+
+
+_RUN_FIELDS = (
+    "run_id", "owner_id", "project", "template", "status", "created_at", "started_at",
+    "ended_at", "timeout_seconds", "result_json",
 )
 
 
@@ -396,6 +404,7 @@ def _item_to_workspace(item: dict[str, Any]) -> Workspace:
         owner_id=item.get("owner_id"),
         idle_ttl_seconds=float(ttl) if ttl is not None else None,
         spec_json=item.get("spec_json"),
+        host_ports_json=item.get("host_ports_json"),
     )
 
 
@@ -548,6 +557,12 @@ class DynamoWorkspaceStore:
     async def update_ssh_port(self, workspace_id: str, port: int) -> None:
         await self._update_existing(workspace_id, ssh_port=port)
 
+    async def update_host_ports(self, workspace_id: str, host_ports: dict | None) -> None:
+        # Same encoding as the SQLite column: empty or None clears it.
+        await self._update_existing(
+            workspace_id, host_ports_json=json.dumps(host_ports) if host_ports else None
+        )
+
     async def _by_status(self, statuses: tuple[str, ...]) -> list[dict]:
         results = await asyncio.gather(*(self._t.query(f"WSSTATUS#{s}", index=GSI1) for s in statuses))
         return [it for items in results for it in items]
@@ -622,6 +637,127 @@ class DynamoEbsSnapshotStore:
 
     async def delete(self, workspace_id: str) -> None:
         await self._t.delete(f"WS#{workspace_id}", "EBSSNAP")
+
+
+# ----------------------------------------------------------------------------
+# Headless runs (registry/runs.py)
+# ----------------------------------------------------------------------------
+
+_RUNS_GSI_PK = "RUNS"
+
+
+def run_item(fields: dict[str, Any]) -> dict[str, Any]:
+    """The run item for a row of `runs` column values: in its workspace's partition
+    (a run id is its workspace id), listed through `gsi1` under one `RUNS` key."""
+    rid = fields["run_id"]
+    return {
+        "pk": f"WS#{rid}", "sk": f"RUN#{rid}", "gsi1pk": _RUNS_GSI_PK,
+        "gsi1sk": f"{fields['created_at']}#{rid}",
+        **{k: fields.get(k) for k in _RUN_FIELDS},
+    }
+
+
+class DynamoRunStore:
+    """`RunStoreProtocol` at WS#<id>/RUN#<run_id>. Point reads and `finish` are
+    consistent and conditional; listings and pruning read the `RUNS` GSI partition,
+    which retention and the per-owner cap keep small. A run left in the GSI by lag is
+    re-checked by the conditional delete, which never removes a running run."""
+
+    def __init__(self, table: DynamoTable) -> None:
+        self._t = table
+
+    @staticmethod
+    def _view(item: dict[str, Any]) -> dict[str, Any]:
+        from warren.registry.runs import run_view
+
+        return run_view({k: _from_dynamo(item.get(k)) for k in _RUN_FIELDS})
+
+    async def create(
+        self,
+        *,
+        run_id: str,
+        owner_id: str,
+        project: str,
+        template: str,
+        timeout_seconds: float | None,
+        started_at: datetime | None = None,
+    ) -> None:
+        from warren.registry.runs import RUNNING, iso, utcnow
+
+        now = iso(started_at or utcnow())
+        await self._t.put(
+            run_item({
+                "run_id": run_id, "owner_id": owner_id, "project": project, "template": template,
+                "status": RUNNING, "created_at": now, "started_at": now, "timeout_seconds": timeout_seconds,
+            }),
+            condition=_NOT_EXISTS,  # INSERT OR IGNORE
+        )
+
+    async def get(self, run_id: str) -> dict[str, Any] | None:
+        item = await self._t.get(f"WS#{run_id}", f"RUN#{run_id}")
+        return self._view(item) if item else None
+
+    async def _all(self) -> list[dict[str, Any]]:
+        items = await self._t.query(_RUNS_GSI_PK, index=GSI1)
+        return sorted(items, key=lambda it: (it["created_at"], it["run_id"]), reverse=True)
+
+    async def list(self, owner_id: str | None, limit: int = 50) -> list[dict[str, Any]]:
+        """Newest first; every owner's when `owner_id` is None (admin)."""
+        items = [it for it in await self._all() if owner_id is None or it.get("owner_id") == owner_id]
+        return [self._view(it) for it in items[: max(limit, 0)]]
+
+    async def finish(
+        self, run_id: str, *, status: str, result: dict[str, Any], ended_at: datetime | None = None
+    ) -> bool:
+        """Record the result of a still-running run. False if it had already finished."""
+        from warren.registry.runs import RUNNING, STATUSES, iso, utcnow
+
+        if status not in STATUSES or status == RUNNING:
+            raise ValueError(f"not a final run status: {status!r}")
+        return await self._t.update(
+            f"WS#{run_id}", f"RUN#{run_id}",
+            sets={
+                "status": status, "ended_at": iso(ended_at or utcnow()),
+                "result_json": json.dumps(result, separators=(",", ":")),
+            },
+            condition="#st = :running", names={"#st": "status"}, values={":running": RUNNING},
+        )
+
+    async def _delete_finished(self, run_id: str) -> bool:
+        from warren.registry.runs import RUNNING
+
+        try:
+            await self._t._call(
+                "delete_item", TableName=self._t.name, Key=_key(f"WS#{run_id}", f"RUN#{run_id}"),
+                ConditionExpression="attribute_exists(pk) AND #st <> :running",
+                ExpressionAttributeNames={"#st": "status"}, ExpressionAttributeValues={":running": RUNNING},
+            )
+        except Exception as exc:
+            if _error_code(exc) == "ConditionalCheckFailedException":
+                return False
+            raise
+        return True
+
+    async def prune(self, *, retention_seconds: float, max_per_owner: int, now: datetime | None = None) -> int:
+        """Drop finished runs older than the retention, then each owner's oldest finished
+        runs beyond `max_per_owner` (running ones count toward it but are never pruned),
+        as the SQLite store does."""
+        from warren.registry.runs import RUNNING, iso, utcnow
+
+        cutoff = iso((now or utcnow()) - timedelta(seconds=retention_seconds))
+        removed = 0
+        kept: dict[str, list[dict[str, Any]]] = {}
+        for it in await self._all():
+            finished = it.get("status") != RUNNING
+            if finished and (it.get("ended_at") or it["created_at"]) < cutoff:
+                removed += await self._delete_finished(it["run_id"])
+                continue
+            kept.setdefault(it.get("owner_id", ""), []).append(it)
+        for rows in kept.values():  # already newest first
+            for it in rows[max(max_per_owner, 0):]:
+                if it.get("status") != RUNNING:
+                    removed += await self._delete_finished(it["run_id"])
+        return removed
 
 
 # ----------------------------------------------------------------------------
@@ -1187,6 +1323,7 @@ __all__ = [
     "DynamoEbsSnapshotStore",
     "DynamoLaunchAttemptStore",
     "DynamoOperationStore",
+    "DynamoRunStore",
     "DynamoTable",
     "DynamoWorkspaceStore",
     "create_table_kwargs",

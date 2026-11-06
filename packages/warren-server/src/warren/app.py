@@ -237,9 +237,7 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
     app.state.auth_store = auth_store
     app.state.operation_store = state.operations
     app.state.secret_store = state.secrets
-    from warren.registry.runs import RunStore  # noqa: PLC0415
-
-    app.state.run_store = RunStore(db)
+    app.state.run_store = state.runs
     registry.run_store = app.state.run_store
     from warren.git.token_issuer import control_plane_issuer  # noqa: PLC0415
 
@@ -262,7 +260,7 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
             from warren.notify import build_notifier  # noqa: PLC0415
             from warren.notify.watcher import run_agent_state_watcher  # noqa: PLC0415
 
-            notifier = build_notifier(settings, db)
+            notifier = build_notifier(settings, state.secrets)
             notifier.start()
             app.state.notifier = notifier
             registry.notifier = notifier

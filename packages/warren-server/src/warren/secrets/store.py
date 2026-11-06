@@ -152,6 +152,11 @@ class SqliteSecretStore:
             row = await cur.fetchone()
         return int(row[0])
 
+    async def owners_with(self, name: str) -> set[str]:
+        async with self._db.execute("SELECT owner_id FROM secrets WHERE name = ?", (name,)) as cur:
+            rows = await cur.fetchall()
+        return {row[0] for row in rows}
+
 
 def secret_store_from_state(state: object) -> "SecretStoreProtocol":
     """The app's secret store: `app.state.secret_store` when lifespan wired one, else

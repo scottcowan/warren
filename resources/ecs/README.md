@@ -188,7 +188,7 @@ deployment can opt into either of two independent backends:
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `WARREN_STATE_BACKEND` | `sqlite` | `dynamodb`: registry, launch attempts, EBS snapshots and seeds, operations, idle stops, users, tokens, workspace tokens |
+| `WARREN_STATE_BACKEND` | `sqlite` | `dynamodb`: registry, launch attempts, EBS snapshots and seeds, operations, idle stops, users, tokens, workspace tokens, headless runs |
 | `WARREN_DYNAMODB_TABLE` | | The table (required with `dynamodb`) |
 | `WARREN_DYNAMODB_TOKEN_RETENTION_DAYS` | `30` | How long an expired or revoked token's items stay before TTL deletes them |
 | `WARREN_DYNAMODB_IDLE_STOP_RETENTION_DAYS` | `90` | TTL on idle-stop markers (an `idle_destroy_seconds` longer than this loses its marker) |
@@ -223,13 +223,14 @@ One table, string partition key `pk` and sort key `sk`, one global secondary ind
 | EBS seed | `SEED#<owner>` | `META` | `SEEDS` / `<owner>` | |
 | EBS seed repo | `SEED#<owner>` | `REPO#<repo_key>` | `SEEDREPOS` / `<owner>#<repo_key>` | |
 | operation | `OP#<principal>` | `OP#<operation_id>` | | |
+| headless run | `WS#<id>` | `RUN#<run_id>` (run id = workspace id) | `RUNS` / `<created_at>#<run_id>` | |
 | live-workspace counters | `COUNTER#workspaces` | `ALL`, `OWNER#<owner>`, `OWNERLESS` | | |
 | admin counters | `COUNTER#admins` | `META` | | |
 
 Every check that decides access or a limit reads the base table with strongly
 consistent reads: token lookups go hash item -> token item -> user item, a user's tokens
 share the user's partition and a workspace's tokens share the workspace's. The index
-only serves listings (workspaces by status, users, seeds, idle stops), which are
+only serves listings (workspaces by status, users, seeds, idle stops, runs), which are
 eventually consistent. `list_non_terminal` re-reads its rows consistently. The listing
 partitions (`USERS`, `SEEDS`, ...) are single partitions, fine at warren's scale.
 
@@ -266,9 +267,11 @@ from several tasks. **warren-server still assumes one control-plane task**, so k
 - per-workspace lifecycle locks (`WorkspaceRegistry._lock_for`) and the per-operation
   locks in `routes/workspaces.py` are `asyncio.Lock`s in one process;
 - the background loops all run in every task: the reaper, idle reaper, EFS reaper, ECS
-  orphan sweep, EBS sweep, EBS seed refresh, and the startup reconcile;
-- the workspace event store (SSE), the rate limiter, the exec relay and the task
-  definition cache are in memory;
+  orphan sweep, EBS sweep, EBS seed refresh, the notification watcher, the `git_write`
+  token refresh, and the startup reconcile;
+- the workspace event store (SSE), the rate limiter, the exec relay, the task
+  definition cache, the notification queue and dedupe window, and the held `git_write`
+  installation tokens (re-minted on launch; never persisted) are in memory;
 - the Secrets Manager value cache is per process: another task's write is seen when the
   entry expires (`WARREN_SECRETSMANAGER_CACHE_TTL_S`).
 
