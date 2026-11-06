@@ -116,6 +116,7 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
             server_id=settings.server_id,
             egress_bridge_name=settings.egress_bridge_name,
             ssh_publish_host=settings.ssh_publish_host,
+            userns=settings.podman_userns,
         )
 
     if not os.environ.get("WARREN_DRY_RUN_SKIP_PREFLIGHT"):
@@ -123,7 +124,11 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
             await runtime.preflight()
         else:
             # host_data_dir unset means the server isn't containerized (config.py).
-            await run_preflight(settings.podman_socket, same_host=settings.host_data_dir is None)
+            await run_preflight(
+                settings.podman_socket,
+                same_host=settings.host_data_dir is None,
+                userns=settings.podman_userns,
+            )
 
     db = await open_db(db_path(settings), journal_mode=settings.sqlite_journal_mode)
     auth_store = AuthStore(db)

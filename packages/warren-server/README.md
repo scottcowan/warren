@@ -127,6 +127,42 @@ the server runs directly on the podman host (not containerized, and podman repor
 same hostname) it also reads the local pasta profile and stays quiet if that profile lets
 pasta receive signals from `podman`.
 
+### Rootless podman user namespace (`WARREN_PODMAN_USERNS`)
+
+Podman workspaces run with `--userns=keep-id:uid=1000,gid=1000` by default, which needs
+podman 4.3 or later (the server refuses to start on older podman while this is set). The
+server's host user is mapped to container uid/gid 1000, which is `warren` in warren's
+images. As a result:
+
+- the git checkout, harness dir and other bind mounts the server writes are owned by
+  uid 1000 inside the container, so `warren` (SSH logins, or an agent running as
+  `warren`) can edit and commit in `/workspace`;
+- what uid 1000 writes there is owned by the server user on the host;
+- container root, and every other container uid, maps to the server user's subuid
+  range, as under podman's default mapping. keep-id gives the container no host
+  privileges: container root is still an unprivileged subuid on the host, and it can't
+  act as the server user.
+
+The container still starts as the image's `USER` (root for warren's images). The server
+passes it to podman explicitly, because with keep-id and no explicit user podman would
+start the entrypoint as uid 1000. Processes running as root inside the workspace (the
+default tmux session and harnesses in `warren-docker-base`) can still write the checkout,
+but what they create there is owned by a subuid on the host. The server handles that
+itself: destroy removes such files with `podman unshare rm -rf` when a plain delete is
+refused, and harness state files it can't read on the host are read through the podman
+API instead. The entrypoint gives what its harness init writes to the harness dir's
+owner. Host-side git operations on files root created in the checkout (for example
+`POST /workspaces/{id}/git/pull` into a directory root made) can fail with
+`Permission denied`. Run the processes that write the checkout as `warren` to avoid this.
+
+The first start of an image under a new mapping can take longer, because podman may
+have to re-own the image's layers for the new user namespace.
+
+To opt out and keep podman's default mapping (host user = container root, as before),
+set `WARREN_PODMAN_USERNS=host` (or an empty string). `keep-id`, `auto` and `nomap`,
+with or without `:options`, are passed through to podman as given. The setting only
+applies to the podman runtime. The docker runtime is rootful and ignores it.
+
 ## API surface
 
 | Method | Path | Notes |
@@ -185,6 +221,9 @@ All settings are `WARREN_*` environment variables, loaded by `src/warren/config.
 - `WARREN_BOOTSTRAP_TOKEN` — mints the first admin on an empty database
 - `WARREN_RUNTIME_TYPE` — `podman` (default) / `docker` / `ecs`
 - `WARREN_PODMAN_SOCKET` — path to the rootless Podman socket
+- `WARREN_PODMAN_USERNS` — podman workspaces' user namespace, default
+  `keep-id:uid=1000,gid=1000`; `host` turns it off (see
+  [above](#rootless-podman-user-namespace-warren_podman_userns))
 - `WARREN_DATA_DIR` — SQLite registry + auth DB location
 - `WARREN_MAX_WORKSPACES` — concurrency cap
 - `WARREN_IDLE_TTL_SECONDS` / `WARREN_IDLE_REAPER_ENABLED` — idle-workspace reaping
