@@ -69,6 +69,14 @@ jobs:
           docker run --rm --entrypoint uv "$IMG" --version
           docker run --rm --entrypoint aws "$IMG" --version | grep -q '^aws-cli/2\.'
           docker run --rm --entrypoint claude "$IMG" --version
+          docker run --rm --entrypoint codex "$IMG" --version | grep -q '^codex-cli '
+          docker run --rm --entrypoint pi "$IMG" --version
+          # The harnesses run as the workspace user too, and pi's WebAssembly deps load.
+          docker run --rm --user 1000:1000 --entrypoint sh "$IMG" -c 'claude --version && codex --version && pi --version'
+          docker run --rm --user 1000:1000 -w /opt/pi --entrypoint node "$IMG" -e 'require("@silvia-odwyer/photon-node")'
+          # opencode is the Docker-env dev-base's only (docs/harnesses.md); self-updates are off.
+          docker run --rm --entrypoint sh "$IMG" -c '! command -v opencode'
+          docker run --rm --entrypoint sh "$IMG" -c 'test "$DISABLE_AUTOUPDATER$PI_SKIP_VERSION_CHECK" = 11 && grep -qx "check_for_update_on_startup = false" /etc/codex/config.toml'
           # glibc: nodejs.org's node and the glibc Claude Code build.
           docker run --rm --entrypoint sh "$IMG" -c 'ldd "$(command -v node)" | grep -q libc.so.6'
           # ecs-base's contract is unchanged underneath.

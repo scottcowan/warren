@@ -65,13 +65,57 @@ that isn't a shell or a harness (ECS), as before; an agent workspace never sets 
 | Agent auto-start (`kind: agent`) | `entrypoint.sh` execs the supervisor as PID 1 after dropping to `warren` (uid 1000); the shell attaches over ECS Exec | `entrypoint.py` starts the supervisor next to tmux session `main`; it runs as the container user (root in these images, which rootless podman maps to the operator's uid) | not run locally (no supervisor) |
 | Env the harness sees | task env (template env, secrets, bedrock/gateway env) | container env (template env, secrets) | the template's `env_snapshot` |
 | Model config from env | at container start | at container start | on create/connect |
-| opencode installed | no image | `warren-docker-dev-base` (1.19.5, glibc, sha256-pinned) | whatever is on the host |
-| codex installed | no image | no image | whatever is on the host |
+| Harnesses installed | `warren-ecs-dev-base`: claude, codex, pi | `warren-docker-dev-base`: claude, opencode, codex, pi | whatever is on the host |
 
 The image's `harness.sh`, `warren-harness-init`, `warren-state-hook` and
 `warren-agent-supervisor` come from `warren-docker-base` / `warren-ecs-base`. A dev-base
 pins its base by digest, so these changes reach `warren-docker-dev-base` only after
 `warren-docker-base` is republished and the digest is bumped.
+
+## Which image ships which harness
+
+The base images (`warren-ecs-base`, `warren-docker-base`) carry the workspace contract
+and no harnesses. The dev-bases carry them:
+
+| Harness | `warren-ecs-dev-base` (1.3.0) | `warren-docker-dev-base` (1.1.0) | Installed from | Verified by | Self-update off by |
+|---|---|---|---|---|---|
+| claude | 2.1.309 | 2.1.309 | Anthropic's `claude.ai/install.sh`, pinned version | ECS: the binary's sha256 against Anthropic's GPG-signed release manifest; docker: none beyond the installer's own | `DISABLE_AUTOUPDATER=1` |
+| opencode | no | 1.19.5 | GitHub release `opencode-linux-{x64,arm64}.tar.gz` (glibc) | sha256 pinned per arch (GitHub asset digest) | `OPENCODE_DISABLE_AUTOUPDATE=1` (the harness profile also sets `autoupdate: false`) |
+| codex | 0.166.0 | 0.166.0 | GitHub release `codex-{x86_64,aarch64}-unknown-linux-musl.tar.gz` (static, runs on glibc) | sha256 pinned per arch (GitHub asset digest) | `check_for_update_on_startup = false` in `/etc/codex/config.toml` (codex has no env var) |
+| pi | 1.5.0 | 1.5.0 | npm `@earendil-works/pi-coding-agent`, `npm ci --ignore-scripts` from `pi/package-lock.json` into `/opt/pi` | the lockfile's sha512 integrity for every package | `PI_SKIP_VERSION_CHECK=1` (pi only notifies; `pi update` is manual) |
+
+Every harness is a root-owned file (or, for pi, a symlink into `/opt/pi`) in
+`/usr/local/bin`, runnable by root and by the workspace user (uid 1000). Both images are
+multi-arch through `TARGETARCH` (linux/amd64, linux/arm64). pi was published as
+`@mariozechner/pi-coding-agent` up to 0.73.1; npm deprecated that name in favour of
+`@earendil-works/pi-coding-agent` (1.x needs Node >= 22.19; both dev-bases have Node 24
+or newer). pi 1.5.0 has no install-time native build: its image codec and code-mode
+sandbox are WebAssembly, and pi-tui's prebuilt X11 clipboard addon is only loaded when
+`DISPLAY` is set. Its `--help` still lists every flag and env var warren's pi profile uses
+(`--mode rpc`, `--no-approve`, `--continue`, `--session`, `PI_CODING_AGENT_DIR`,
+`PI_CODING_AGENT_SESSION_DIR`, `PI_OFFLINE`, `PI_TELEMETRY`); the profile wasn't otherwise
+re-run against 1.5.0. codex reads `/etc/codex/config.toml`: a wrong-typed
+`check_for_update_on_startup` there makes it fail to load its config.
+
+`warren-ecs-ssh-base` (FROM `warren-ecs-dev-base:1.3.0`) gets the same harnesses as
+the ECS dev-base. `warren-docker-ssh-base` pins `warren-docker-dev-base` by digest, so it
+gets them once dev-base 1.1.0 is published and that digest is bumped.
+
+`scripts/bump_pins.py` checks every pin weekly (Claude Code's npm `stable` tag,
+opencode's and codex's latest GitHub release with their asset digests, pi's npm `latest`
+tag). A pi bump rewrites `pi/package.json` and regenerates `pi/package-lock.json` in a
+`node:<NODE_VERSION>-bookworm-slim` container. To do it by hand, from the repo root, for
+each `pi/` dir:
+
+```bash
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/packages/warren-server/images/warren-ecs-dev-base/pi:/w" -w /w \
+  -e HOME=/tmp node:24.22.2-bookworm-slim \
+  npm install --package-lock-only --ignore-scripts --omit=dev --no-audit --no-fund
+cp packages/warren-server/images/warren-ecs-dev-base/pi/package*.json images/warren-docker-dev-base/pi/
+```
+
+A codex bump also needs the codex checks below redone, since warren trusts its own codex
+hooks by hash.
 
 ## State hooks
 
@@ -178,5 +222,5 @@ Not checked: opencode's musl build (Alpine) and linux/amd64; a real Bedrock gate
 `opencode attach` and the T3 desktop app against `serve`, and `codex --remote` against
 `app-server` (both interactive); opencode's `permission.asked` and `tool.execute.before`
 events and codex's PermissionRequest/Subagent/Compact/SessionEnd events (no tool calls or
-approvals in the fake runs); any codex ACP adapter. Codex isn't installed in any warren
-image; the profile works in an image that installs it.
+approvals in the fake runs); any codex ACP adapter. The checks above used codex from npm;
+the dev-bases install the same version's standalone release binary.

@@ -584,7 +584,8 @@ terraform apply -var="image_uri=..." -var="env_suffix=staging"
 | Image | Base | What it is |
 | --- | --- | --- |
 | `ghcr.io/scottcowan/warren-ecs-base` | Debian bookworm-slim (glibc) since 1.5.0; 1.4 and earlier were Alpine | The default `ecs_image`: entrypoint, `warren-session`, git-init, secrets handling, the uid 1000 `warren` user. No harnesses. |
-| `ghcr.io/scottcowan/warren-ecs-dev-base` | `warren-ecs-base` (Debian since 1.5.0) | + Claude Code, Node.js LTS, pyenv Python 3.12, uv, AWS CLI v2, ripgrep. |
+| `ghcr.io/scottcowan/warren-ecs-dev-base` | `warren-ecs-base` (Debian since 1.5.0) | + the harnesses Claude Code, codex and pi (opencode is in `warren-docker-dev-base` only; see [docs/harnesses.md](../../docs/harnesses.md#which-image-ships-which-harness)), Node.js LTS, pyenv Python 3.12, uv, AWS CLI v2, ripgrep. |
+| `ghcr.io/scottcowan/warren-ecs-ssh-base` | `warren-ecs-dev-base` | + an sshd on loopback for editor remoting; the same harnesses as dev-base. |
 
 Built from [`packages/warren-server/images/ecs-base`](../../packages/warren-server/images/ecs-base/Dockerfile)
 and [`warren-ecs-dev-base`](../../packages/warren-server/images/warren-ecs-dev-base/Dockerfile).

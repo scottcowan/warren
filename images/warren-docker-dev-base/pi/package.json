@@ -1,0 +1,8 @@
+{
+  "name": "warren-pi",
+  "private": true,
+  "description": "pi (@earendil-works/pi-coding-agent), installed into /opt/pi by this image's Dockerfile with npm ci. Regenerate package-lock.json after a version bump; see the Dockerfile's pi step.",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.0"
+  }
+}
