@@ -53,6 +53,11 @@ starting the SSM tunnel when something first connects and restarting it when the
 workspace's task changes (for desktop apps such as T3 Code that remember a server
 address). See [docs/proxy.md](docs/proxy.md).
 
+`warren run <project>/<template> --prompt TEXT [--wait] [--json]` runs a template headless on a
+prompt and keeps the result (status, exit code, final message, changed files, PR links) on the
+server after the workspace is destroyed; `warren run status|result <id>` reads it. See
+[docs/runs.md](docs/runs.md).
+
 Or run entirely local (no server) against a `config.toml` project definition — see `warren
 init` to scaffold one:
 
@@ -133,8 +138,9 @@ local runtimes (warren-common, used by the warren CLI directly, no server involv
 
 container images
 ├── warren-base / warren-ecs-base           minimal — git, ssh-client/jq/curl, uv; no sshd
-├── warren-dev-base / warren-ecs-dev-base   + Claude Code CLI, nvm/pyenv, common dev tools
-└── warren-agent-base / warren-ecs-agent-base   stubs for purpose-built agent tooling (deferred)
+├── warren-dev-base / warren-ecs-dev-base   + harnesses (Claude Code, codex, pi), Node/Python, dev tools
+├── warren-agent-base / warren-ecs-agent-base   stubs for purpose-built agent tooling (deferred)
+└── warren-docker-ssh-base / warren-ecs-ssh-base   opt-in: + hardened sshd for editors (docs/workspace-ssh.md)
 
 warren-sidecar (in-workspace)
 └── agent-state recorder: tails the tmux pane for OSC 7501 state and writes
@@ -210,6 +216,8 @@ templates:
     # harness still running; a harness cut off by a task relaunch (or, locally, a
     # closed terminal: local sandboxes have no tmux) restarts on the same
     # conversation by session id; `--new` ignores that and opens the shell.
+    # docs/harnesses.md: per-harness modes (opencode serve, codex app-server), ACP,
+    # state hooks, persisted paths and Bedrock config.
     harnesses: [claude, codex]
     # false rejects harnesses that can hand a session to the vendor's cloud.
     allow_vendor_cloud: true

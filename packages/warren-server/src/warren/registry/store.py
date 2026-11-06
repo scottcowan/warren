@@ -39,6 +39,10 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         # snapshotted at provision time so ensure_running can reprovision a
         # lost/reaped container faithfully instead of as a bare shell.
         "spec_json": "TEXT",
+        # Template-declared ports' host-side bindings on podman/docker,
+        # {name: {"host": "127.0.0.1", "port": <host port>}} (JSON), refreshed each
+        # time the container is created or started; read by `warren proxy`.
+        "host_ports_json": "TEXT",
     },
     "users": {
         # Issue #11: nullable-timestamp "disabled" flag, matching the existing
@@ -282,6 +286,7 @@ def _row_to_workspace(row: aiosqlite.Row | tuple) -> Workspace:
         owner_id,
         idle_ttl_seconds,
         spec_json,
+        host_ports_json,
     ) = row
     return Workspace(
         workspace_id=workspace_id,
@@ -299,6 +304,7 @@ def _row_to_workspace(row: aiosqlite.Row | tuple) -> Workspace:
         owner_id=owner_id,
         idle_ttl_seconds=idle_ttl_seconds,
         spec_json=spec_json,
+        host_ports_json=host_ports_json,
     )
 
 
@@ -390,7 +396,7 @@ class WorkspaceStore:
             SELECT workspace_id, project, intent, image, root_path,
                    container_id, status, server_instance, labels_json,
                    created_at, updated_at, ssh_port, owner_id, idle_ttl_seconds,
-                   spec_json
+                   spec_json, host_ports_json
             FROM workspaces WHERE workspace_id = ?
             """,
             (workspace_id,),
@@ -451,6 +457,12 @@ class WorkspaceStore:
             (port, _utcnow_iso(), workspace_id),
         )
 
+    async def update_host_ports(self, workspace_id: str, host_ports: dict | None) -> None:
+        await self._db.execute(
+            "UPDATE workspaces SET host_ports_json = ?, updated_at = ? WHERE workspace_id = ?",
+            (json.dumps(host_ports) if host_ports else None, _utcnow_iso(), workspace_id),
+        )
+
     async def list_non_terminal(self) -> list[Workspace]:
         placeholders = ",".join("?" * len(_NON_TERMINAL))
         async with self._db.execute(
@@ -458,7 +470,7 @@ class WorkspaceStore:
             SELECT workspace_id, project, intent, image, root_path,
                    container_id, status, server_instance, labels_json,
                    created_at, updated_at, ssh_port, owner_id, idle_ttl_seconds,
-                   spec_json
+                   spec_json, host_ports_json
             FROM workspaces WHERE status IN ({placeholders})
             """,
             _NON_TERMINAL,
@@ -472,7 +484,7 @@ class WorkspaceStore:
             SELECT workspace_id, project, intent, image, root_path,
                    container_id, status, server_instance, labels_json,
                    created_at, updated_at, ssh_port, owner_id, idle_ttl_seconds,
-                   spec_json
+                   spec_json, host_ports_json
             FROM workspaces ORDER BY created_at DESC
             """
         ) as cur:
@@ -526,6 +538,36 @@ class LaunchAttemptStore:
                 attempt.get("secrets_blobs") or None,
             ),
         )
+
+    async def claim(self, workspace_id: str, attempt: dict[str, str]) -> dict[str, str]:
+        """Store `attempt` unless a row with the same generation and fingerprint exists;
+        return the stored row either way (state/protocols.py). One statement, so two
+        racing claims can't both write."""
+        await self._db.execute(
+            """
+            INSERT INTO ecs_launch_attempts (
+                workspace_id, generation, fingerprint, task_definition_arn,
+                client_token, created_at, secrets_blobs
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(workspace_id) DO UPDATE SET
+                generation = excluded.generation, fingerprint = excluded.fingerprint,
+                task_definition_arn = excluded.task_definition_arn,
+                client_token = excluded.client_token, created_at = excluded.created_at,
+                secrets_blobs = excluded.secrets_blobs
+            WHERE ecs_launch_attempts.generation != excluded.generation
+               OR ecs_launch_attempts.fingerprint != excluded.fingerprint
+            """,
+            (
+                workspace_id,
+                attempt["generation"],
+                attempt["fingerprint"],
+                attempt["task_definition_arn"],
+                attempt["client_token"],
+                _utcnow_iso(),
+                attempt.get("secrets_blobs") or None,
+            ),
+        )
+        return await self.get(workspace_id) or dict(attempt)
 
     async def delete(self, workspace_id: str) -> None:
         await self._db.execute(

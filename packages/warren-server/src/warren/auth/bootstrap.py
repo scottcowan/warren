@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import aiosqlite
 import structlog
 from warren.auth.tokens import derive_token_pepper, hash_token
+from warren.state.errors import StateConflict
 
 if TYPE_CHECKING:
     from warren.auth.store import AuthStore
@@ -45,7 +46,7 @@ async def ensure_bootstrap_admin(store: "AuthStore", settings: "WarrenSettings")
 
     try:
         user = await store.create_user(username=_BOOTSTRAP_ADMIN_USERNAME, is_admin=True)
-    except aiosqlite.IntegrityError:
+    except (aiosqlite.IntegrityError, StateConflict):
         # A concurrent/racing second bootstrap call lost the race on the unique username —
         # degrade to a logged no-op rather than crashing startup (T-02-22). No user was
         # created by this call, so there is nothing to clean up.
@@ -57,7 +58,7 @@ async def ensure_bootstrap_admin(store: "AuthStore", settings: "WarrenSettings")
     expires_at = datetime.now(timezone.utc) + timedelta(days=settings.token_ttl_days)
     try:
         await store.create_token(user_id=user.user_id, hashed_token=hashed, expires_at=expires_at)
-    except aiosqlite.IntegrityError:
+    except (aiosqlite.IntegrityError, StateConflict):
         # The admin user now exists but has no working token, and count_admins() > 0 will
         # block every future bootstrap attempt from retrying — this is a stuck deployment,
         # not a benign race, so it must be loud rather than logged identically to the

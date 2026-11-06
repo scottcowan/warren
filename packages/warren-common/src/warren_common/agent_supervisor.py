@@ -17,6 +17,11 @@ Standard library only: the images copy this file to
   still connected across a restart gets its session reloaded (`session/load`);
 - reports working/blocked/idle/exited to `<state_dir>/supervisor.json` for
   the control plane's state-aware reaping (AM1).
+
+Transport "self" is a harness serving its own endpoint on `port` (opencode
+serve's HTTP API, codex app-server's websocket): the supervisor runs, restarts
+and listener-checks it, serves nothing itself, and the harness's state hook is
+the only source of working/blocked.
 """
 from __future__ import annotations
 
@@ -68,7 +73,7 @@ def load_spec(raw: str) -> dict:
         raise SpecError(f"{SPEC_ENV} needs harness and argv")
     if not is_loopback(str(spec.get("host", ""))):
         raise SpecError(f"ACP endpoint host {spec.get('host')!r} is not loopback")
-    if spec.get("transport", "stdio") not in ("stdio", "tcp"):
+    if spec.get("transport", "stdio") not in ("stdio", "tcp", "self"):
         raise SpecError(f"unknown transport {spec.get('transport')!r}")
     for key in ("port", "inner_port"):
         if not isinstance(spec.get(key), int) or not 1 <= spec[key] <= 65535:
@@ -77,7 +82,7 @@ def load_spec(raw: str) -> dict:
     spec.setdefault("resume_args", [])
     spec.setdefault("env", {})
     spec.setdefault("max_line_bytes", 4 * 1024 * 1024)
-    spec["max_peers"] = 1 if spec.get("transport", "stdio") == "stdio" else max(1, int(spec.get("max_peers", 1)))
+    spec["max_peers"] = 1 if spec.get("transport", "stdio") != "tcp" else max(1, int(spec.get("max_peers", 1)))
     return spec
 
 
@@ -618,7 +623,10 @@ class Supervisor:
     async def run(self) -> int:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.session_id = self.recorded_session()
-        await self._serve()
+        if self.spec["transport"] == "self":
+            self.record("agent.self_serving", host=self.spec["host"], port=self.spec["port"])
+        else:
+            await self._serve()
         restarts, rc = 0, 0
         try:
             while not self.stopping:
@@ -649,7 +657,8 @@ class Supervisor:
             self.set_state(EXITED, "supervisor/stopped")
             return 0
         finally:
-            self.server.close()
+            if self.server is not None:
+                self.server.close()
             for peer in list(self.peers.values()):
                 with contextlib.suppress(Exception):
                     peer.writer.close()

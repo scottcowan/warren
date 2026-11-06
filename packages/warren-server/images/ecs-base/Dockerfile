@@ -3,12 +3,12 @@
 # ../workspace-base, which targets Docker instead — see that Containerfile's own header).
 # Published as ghcr.io/scottcowan/warren-ecs-base.
 #
-# Debian bookworm-slim (glibc) since 2.0.0; 1.x was Alpine (musl). Prebuilt PyPI
+# Debian bookworm-slim (glibc) since 1.5.0; 1.4 and earlier were Alpine (musl). Prebuilt PyPI
 # manylinux wheels, prebuilt npm native addons and glibc-only tools (T3 Code,
 # Playwright/Chrome) run here as published; on musl they don't, or need compiling.
-# Images built FROM this one install packages with apt, not apk. The 1.x Alpine
+# Images built FROM this one install packages with apt, not apk. The 1.4 Alpine
 # Dockerfile is in git history and its images stay on GHCR. The paths, modes, user and
-# USER/WORKDIR/ENTRYPOINT are the same as 1.x.
+# USER/WORKDIR/ENTRYPOINT are the same as 1.4.
 #
 # No sshd, no SSH host keys, no authorized_keys injection: ECS Exec
 # (enableExecuteCommand=True, src/warren/runtime/ecs.py) gives interactive access over SSM
@@ -73,16 +73,16 @@ RUN apt-get update \
         ca-certificates git openssh-client bash zsh tmux \
     && rm -rf /var/lib/apt/lists/* \
     # Debian's zsh runs zsh-newuser-install (an interactive menu) for a user with no
-    # ~/.zshrc (1.x's Alpine zsh didn't), and the workspace's home has none, so remove it.
+    # ~/.zshrc (1.4's Alpine zsh didn't), and the workspace's home has none, so remove it.
     && rm -f /usr/share/zsh/*/scripts/newuser
 
-# su-exec at the 1.x (Alpine) path. Debian's /sbin is a symlink to /usr/sbin (merged /usr), so
+# su-exec at the 1.4 (Alpine) path. Debian's /sbin is a symlink to /usr/sbin (merged /usr), so
 # /sbin/su-exec, which entrypoint.sh, warren-session and git-init call, resolves here.
 COPY --from=su-exec --chown=0:0 --chmod=0755 /out-su-exec /usr/sbin/su-exec
 
 # AD3: non-root workspace user. uid/gid 1000 matches the EFS access point's PosixUser
 # (src/warren/runtime/efs.py), so files under /var/lib/warren are owned by it. Home 2755
-# with no skel files, /bin/bash, locked password (as 1.x's busybox `adduser -D` made it).
+# with no skel files, /bin/bash, locked password (as 1.4's busybox `adduser -D` made it).
 # /workspace is a real (empty) directory in the image. When the task has git folders
 # (AH1), entrypoint.sh replaces it, as root and before dropping privileges, with a
 # symlink to the checkout on the volume ($WARREN_WORKSPACE_DIR).
@@ -103,7 +103,7 @@ RUN groupadd -g 1000 warren \
 COPY packages/warren-common/src/warren_common/assets/warren_banner.zsh /etc/zsh/zshrc
 # AG2a: the template's harnesses as warren shell commands, plus `warren resume`, for zsh
 # and bash. Generated from the harness profiles. Debian's bash reads /etc/bash.bashrc,
-# so the hooks go there; /etc/bash/bashrc (1.x's Alpine path) links to it for images
+# so the hooks go there; /etc/bash/bashrc (1.4's Alpine path) links to it for images
 # that append to that path.
 COPY --chown=0:0 --chmod=0644 packages/warren-common/src/warren_common/assets/warren_harness.sh /etc/warren/harness.sh
 COPY --chown=0:0 --chmod=0644 packages/warren-common/src/warren_common/assets/warren_banner.bash /etc/warren/banner.bash
@@ -125,6 +125,8 @@ COPY --chown=0:0 --chmod=0755 packages/warren-common/src/warren_common/assets/wa
 COPY --chown=0:0 --chmod=0755 packages/warren-common/src/warren_common/agent_supervisor.py /usr/local/bin/warren-agent-supervisor
 # AH1: run as the task's `git-init` container (runtime/ecs_git.py), never by the workspace.
 COPY --chown=0:0 --chmod=0755 packages/warren-server/images/ecs-base/git-materialize.sh /usr/local/bin/warren-git-materialize
+# Single-turn runs on EBS volumes: the run's result, recorded in the task for the control plane.
+COPY --chown=0:0 --chmod=0755 packages/warren-server/images/ecs-base/warren-run-result.sh /usr/local/bin/warren-run-result
 # Reader for the secrets file the control plane drops on the EFS volume (runtime/ecs_secrets.py),
 # and for warren-secrets-decrypt's output in EBS mode, sourced by entrypoint.sh, warren-session and warren-git-materialize.
 COPY --chown=0:0 --chmod=0644 packages/warren-server/images/ecs-base/warren-secrets.sh /usr/local/lib/warren/secrets.sh
@@ -133,6 +135,13 @@ COPY --from=secrets-decrypt --chown=0:0 --chmod=0755 /out/warren-secrets-decrypt
 # GitHub's published SSH host keys (api.github.com/meta "ssh_keys"), pinned for git-init's
 # ssh clones. Refresh the checked-in file when GitHub rotates a key.
 COPY --chown=0:0 --chmod=0444 packages/warren-server/images/ecs-base/ssh_known_hosts /etc/warren/ssh_known_hosts
+# git_write templates (src/warren/git/write_tokens.py): warren-git-token installs the
+# control plane's repo-scoped GitHub tokens in /run/warren-git (as root: entrypoint, ECS
+# Exec); git-credential-warren hands them to git for https://github.com only.
+COPY --chown=0:0 --chmod=0755 packages/warren-server/images/ecs-base/warren-git-token.sh /usr/local/bin/warren-git-token
+COPY --chown=0:0 --chmod=0755 packages/warren-common/src/warren_common/assets/warren_git_credential.sh /usr/local/bin/git-credential-warren
+RUN git config --system credential.https://github.com.helper /usr/local/bin/git-credential-warren \
+    && git config --system credential.https://github.com.useHttpPath true
 RUN chown 0:0 /usr /usr/local /usr/local/bin /usr/local/lib /usr/local/lib/warren /etc/warren \
     && chmod 0755 /usr /usr/local /usr/local/bin /usr/local/lib /usr/local/lib/warren /etc/warren
 

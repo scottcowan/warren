@@ -57,6 +57,7 @@ alongside the existing warren.* namespaced tags.
 from __future__ import annotations
 
 import aws_cdk as cdk
+import aws_cdk.aws_dynamodb as dynamodb
 import aws_cdk.aws_ec2 as ec2
 import aws_cdk.aws_ecs as ecs
 import aws_cdk.aws_efs as efs
@@ -128,6 +129,16 @@ class WarrenECSStack(cdk.Stack):
             (runtime/ecs_kms_secrets.py). Empty with EBS enabled creates a dedicated key
             with rotation.
         ebs_size_gib: Size of a new workspace's EBS volume (WARREN_ECS_EBS_SIZE_GIB).
+        enable_dynamodb_state: Create the DynamoDB state table (PITR, SSE, TTL) and run
+            the control plane with WARREN_STATE_BACKEND=dynamodb. Default False (SQLite).
+        dynamodb_table_name: WARREN_DYNAMODB_TABLE; empty means warren-state-<env_suffix>.
+        dynamodb_kms_key_arn: Customer managed key for the table; empty means aws/dynamodb.
+        enable_secretsmanager_secrets: Store user secrets in Secrets Manager
+            (WARREN_SECRETS_BACKEND=secretsmanager) under <secretsmanager_prefix>/*.
+        secretsmanager_prefix: WARREN_SECRETSMANAGER_PREFIX; empty means
+            <ecs_resource_prefix>/<env_suffix>.
+        secretsmanager_kms_key_arn: WARREN_SECRETSMANAGER_KMS_KEY_ID; empty means
+            aws/secretsmanager.
         **kwargs: Passed to cdk.Stack (env, termination_protection, etc.).
     """
 
@@ -179,6 +190,15 @@ class WarrenECSStack(cdk.Stack):
         ebs_kms_key_arn: str = "",
         secrets_kms_key_arn: str = "",
         ebs_size_gib: int = 20,
+        # Optional AWS state backends; mirror terraform/variables.tf's
+        # enable_dynamodb_state / dynamodb_table_name / dynamodb_kms_key_arn /
+        # enable_secretsmanager_secrets / secretsmanager_prefix / secretsmanager_kms_key_arn.
+        enable_dynamodb_state: bool = False,
+        dynamodb_table_name: str = "",
+        dynamodb_kms_key_arn: str = "",
+        enable_secretsmanager_secrets: bool = False,
+        secretsmanager_prefix: str = "",
+        secretsmanager_kms_key_arn: str = "",
         **kwargs,
     ) -> None:
         super().__init__(scope, id, **kwargs)
@@ -1401,6 +1421,137 @@ class WarrenECSStack(cdk.Stack):
         )
 
         # ---------------------------------------------------------------
+        # Optional AWS state backends (warren-server warren/state/; mirrors
+        # terraform/main.tf's warren_state table and state_backend_policy). Both off
+        # by default: SQLite on EFS stays the default.
+        # ---------------------------------------------------------------
+        state_table = None
+        sm_prefix = secretsmanager_prefix or f"{ecs_resource_prefix}/{env_suffix}"
+        state_statements: list[iam.PolicyStatement] = []
+        if enable_dynamodb_state:
+            # Key layout: packages/warren-server/src/warren/state/dynamodb.py.
+            state_table = dynamodb.Table(
+                self,
+                "WarrenStateTable",
+                table_name=dynamodb_table_name or f"warren-state-{env_suffix}",
+                partition_key=dynamodb.Attribute(name="pk", type=dynamodb.AttributeType.STRING),
+                sort_key=dynamodb.Attribute(name="sk", type=dynamodb.AttributeType.STRING),
+                billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+                time_to_live_attribute="ttl",
+                point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
+                    point_in_time_recovery_enabled=True
+                ),
+                encryption=(
+                    dynamodb.TableEncryption.CUSTOMER_MANAGED
+                    if dynamodb_kms_key_arn
+                    else dynamodb.TableEncryption.AWS_MANAGED
+                ),
+                encryption_key=(
+                    kms.Key.from_key_arn(self, "WarrenStateTableKey", dynamodb_kms_key_arn)
+                    if dynamodb_kms_key_arn
+                    else None
+                ),
+                deletion_protection=True,
+                removal_policy=cdk.RemovalPolicy.RETAIN,
+            )
+            state_table.add_global_secondary_index(
+                index_name="gsi1",
+                partition_key=dynamodb.Attribute(name="gsi1pk", type=dynamodb.AttributeType.STRING),
+                sort_key=dynamodb.Attribute(name="gsi1sk", type=dynamodb.AttributeType.STRING),
+                projection_type=dynamodb.ProjectionType.ALL,
+            )
+            cdk.Tags.of(state_table).add("warren", "true")
+            # TransactWriteItems authorizes as the Put/Update/Delete/ConditionCheck it
+            # contains. Scan is only used by `warren-server --migrate-state`.
+            state_statements.append(
+                iam.PolicyStatement(
+                    sid="StateTable",
+                    effect=iam.Effect.ALLOW,
+                    actions=[
+                        "dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query", "dynamodb:Scan",
+                        "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem",
+                        "dynamodb:ConditionCheckItem", "dynamodb:DescribeTable", "dynamodb:DescribeTimeToLive",
+                    ],
+                    resources=[state_table.table_arn, f"{state_table.table_arn}/index/gsi1"],
+                )
+            )
+            if dynamodb_kms_key_arn:
+                state_statements.append(
+                    iam.PolicyStatement(
+                        sid="StateTableKMS",
+                        effect=iam.Effect.ALLOW,
+                        actions=["kms:Decrypt", "kms:Encrypt", "kms:GenerateDataKey", "kms:DescribeKey"],
+                        resources=[dynamodb_kms_key_arn],
+                        conditions={"StringEquals": {"kms:ViaService": f"dynamodb.{self.region}.amazonaws.com"}},
+                    )
+                )
+        if enable_secretsmanager_secrets:
+            sm_arns = f"arn:aws:secretsmanager:{self.region}:{self.account}:secret:{sm_prefix}/*"
+            state_statements += [
+                # Create (and tag on create) only under the prefix, only with warren=true
+                # and warren's own tag keys.
+                iam.PolicyStatement(
+                    sid="SecretsCreateTagged",
+                    effect=iam.Effect.ALLOW,
+                    actions=["secretsmanager:CreateSecret", "secretsmanager:TagResource"],
+                    resources=[sm_arns],
+                    conditions={
+                        "StringEquals": {"aws:RequestTag/warren": "true"},
+                        "ForAllValues:StringEquals": {
+                            "aws:TagKeys": ["warren", "warren.owner_id", "warren.server_instance"]
+                        },
+                    },
+                ),
+                iam.PolicyStatement(
+                    sid="SecretsManageTagged",
+                    effect=iam.Effect.ALLOW,
+                    actions=[
+                        "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue",
+                        "secretsmanager:UpdateSecret", "secretsmanager:DescribeSecret",
+                        "secretsmanager:DeleteSecret", "secretsmanager:RestoreSecret",
+                    ],
+                    resources=[sm_arns],
+                    conditions={"StringEquals": {"secretsmanager:ResourceTag/warren": "true"}},
+                ),
+                # ListSecrets has no resource-level permissions; warren filters on name
+                # prefix and tag.
+                iam.PolicyStatement(
+                    sid="SecretsList",
+                    effect=iam.Effect.ALLOW,
+                    actions=["secretsmanager:ListSecrets"],
+                    resources=["*"],
+                ),
+            ]
+            if secretsmanager_kms_key_arn:
+                state_statements.append(
+                    iam.PolicyStatement(
+                        sid="SecretsKMS",
+                        effect=iam.Effect.ALLOW,
+                        actions=["kms:GenerateDataKey", "kms:Decrypt", "kms:DescribeKey"],
+                        resources=[secretsmanager_kms_key_arn],
+                        conditions={
+                            "StringEquals": {"kms:ViaService": f"secretsmanager.{self.region}.amazonaws.com"}
+                        },
+                    )
+                )
+        if state_statements:
+            task_role.attach_inline_policy(
+                iam.Policy(
+                    self,
+                    "WarrenStateBackendPolicy",
+                    policy_name=f"warren-state-backend-policy-{env_suffix}",
+                    statements=state_statements,
+                )
+            )
+        state_env: list[tuple[str, str]] = []
+        if state_table is not None:
+            state_env += [("WARREN_STATE_BACKEND", "dynamodb"), ("WARREN_DYNAMODB_TABLE", state_table.table_name)]
+        if enable_secretsmanager_secrets:
+            state_env += [("WARREN_SECRETS_BACKEND", "secretsmanager"), ("WARREN_SECRETSMANAGER_PREFIX", sm_prefix)]
+            if secretsmanager_kms_key_arn:
+                state_env.append(("WARREN_SECRETSMANAGER_KMS_KEY_ID", secretsmanager_kms_key_arn))
+
+        # ---------------------------------------------------------------
         # Control-plane task definition — warren-server running as its own
         # Fargate task, distinct from the per-workspace tasks ECSRuntime
         # launches at runtime. Launched as a long-lived ecs.CfnService below
@@ -1617,6 +1768,11 @@ class WarrenECSStack(cdk.Stack):
                             ]
                             if ebs_kms_key_arn
                             else []
+                        ),
+                        # Optional AWS state backends (above).
+                        *(
+                            ecs.CfnTaskDefinition.KeyValuePairProperty(name=name, value=value)
+                            for name, value in state_env
                         ),
                     ],
                     log_configuration=ecs.CfnTaskDefinition.LogConfigurationProperty(

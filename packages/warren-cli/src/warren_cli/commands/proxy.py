@@ -1,4 +1,4 @@
-"""warren proxy — stable loopback addresses for ports inside ECS workspaces (see warren_cli.proxy)."""
+"""warren proxy — stable loopback addresses for ports inside workspaces (see warren_cli.proxy)."""
 
 from __future__ import annotations
 
@@ -19,8 +19,9 @@ from ..config import WarrenCLIConfig
 proxy_app = typer.Typer(
     no_args_is_help=True,
     help=(
-        "Stable 127.0.0.1 addresses for ports inside ECS workspaces, started on demand "
-        "over SSM (e.g. a `t3 serve` for the T3 Code app). See docs/proxy.md."
+        "Stable 127.0.0.1 addresses for ports inside workspaces, started on demand: over SSM "
+        "for ECS, over SSH (or directly, for a local server) for podman/docker "
+        "(e.g. a `t3 serve` for the T3 Code app). See docs/proxy.md."
     ),
 )
 
@@ -34,46 +35,121 @@ def _load_cfg(config: Optional[Path]) -> WarrenCLIConfig:
 
 
 def _pick_server(cfg: WarrenCLIConfig, server: Optional[str]) -> str:
+    """--server, else [defaults] server if the proxy can reach it, else the only remote
+    it can reach (ecs, ssh, or an http remote on this machine's loopback)."""
+    if server:
+        return server
+    capable = sorted(name for name, r in cfg.remotes.items() if core.proxy_capable(r))
+    default = cfg.defaults.server
+    if default and default in capable:
+        return default
+    if len(capable) == 1:
+        return capable[0]
+    if not capable:
+        ui.error(
+            "no remotes warren proxy can reach: it needs an ecs or ssh remote, or an http remote on "
+            "this machine's loopback (add one with `warren remote add`)"
+        )
+    else:
+        ui.error(f"more than one remote warren proxy can reach ({', '.join(capable)}): pass --server")
+    raise typer.Exit(1)
+
+
+def _pick_ecs_server(cfg: WarrenCLIConfig, server: Optional[str]) -> str:
+    """`proxy stdio`'s server: --server, else [defaults] server if it's an ecs remote,
+    else the only ecs remote. Its relay is an SSM port-forward, so podman/docker remotes
+    (which the rest of `warren proxy` reaches) don't count towards the default."""
     if server:
         return server
     ecs = sorted(name for name, r in cfg.remotes.items() if r.runtime_type == "ecs")
+    default = cfg.defaults.server
+    if default and default in ecs:
+        return default
     if len(ecs) == 1:
         return ecs[0]
     if not ecs:
-        ui.error("no ECS remotes configured — warren proxy only reaches ECS workspaces (add one with `warren remote add`)")
+        ui.error("no ecs remotes: `warren proxy stdio` reaches ECS workspaces only (add one with `warren remote add`)")
     else:
-        ui.error(f"more than one ECS remote ({', '.join(ecs)}): pass --server")
+        ui.error(f"more than one ecs remote ({', '.join(ecs)}): pass --server")
     raise typer.Exit(1)
+
+
+def _declared_ports(cfg: WarrenCLIConfig, server: str, workspace: str) -> dict[str, int]:
+    """The workspace's template `ports` ({name: port}), read from the control plane."""
+    ws = core.match_workspace(asyncio.run(core.fetch_workspaces(cfg, server)), workspace)
+    return core.declared_ports(ws)
 
 
 @proxy_app.command("add")
 def proxy_add(
     workspace: str = typer.Argument(help="Workspace ID (or a prefix unique on that server)"),
-    remote_port: int = typer.Argument(help="Port inside the workspace"),
+    remote_port: Optional[str] = typer.Argument(
+        None, help="Port inside the workspace: a number, or a port name the workspace's template declares"
+    ),
+    from_template: bool = typer.Option(
+        False, "--from-template", help="Map every port the workspace's template declares under `ports:`"
+    ),
     local_port: Optional[int] = typer.Option(
         None, "--local-port", help="Local port to use (default: the first free one from [proxy] port_base)"
     ),
-    server: Optional[str] = typer.Option(None, "--server", help="ECS remote profile (default: the only one)"),
+    server: Optional[str] = typer.Option(
+        None, "--server", help="Remote profile (default: [defaults] server, else the only ecs/ssh/local one)"
+    ),
     config: Optional[Path] = typer.Option(None, "--config"),
 ) -> None:
     """Record a mapping and print its stable local address.
 
-    Nothing connects to AWS here; `warren proxy run` starts the SSM session the
-    first time something connects to the address.
+    With a port number nothing connects to the server here; a port name or
+    --from-template reads the workspace's declared ports from the control plane.
+    `warren proxy run` starts the forward (SSM for ECS, SSH for an ssh remote,
+    none for a local server) the first time something connects to the address.
+    On podman/docker only template-declared ports are published. Re-running is
+    safe: existing mappings keep their address.
     """
+    if from_template and remote_port is not None:
+        ui.error("pass a port or --from-template, not both")
+        raise typer.Exit(2)
+    if not from_template and remote_port is None:
+        ui.error("pass a port (number or declared name), or --from-template")
+        raise typer.Exit(2)
+    if from_template and local_port is not None:
+        ui.error("--local-port maps one port; it can't be combined with --from-template")
+        raise typer.Exit(2)
     cfg = _load_cfg(config)
     server = _pick_server(cfg, server)
+    store = core.MappingStore()
+    wanted: list[tuple[int, Optional[str]]]
     try:
         core.remote_for(cfg, server)
-        mapping, created = core.MappingStore().add(
-            server, workspace, remote_port, local_port=local_port, port_base=cfg.proxy.port_base
-        )
+        if remote_port is not None and remote_port.isdigit():
+            wanted = [(int(remote_port), None)]
+        else:
+            declared = _declared_ports(cfg, server, workspace)
+            if from_template:
+                if not declared:
+                    raise core.ProxyError(
+                        f"workspace {workspace!r} declares no ports (add `ports:` to its template, "
+                        "or map a port number)"
+                    )
+                wanted = [(port, name) for name, port in sorted(declared.items())]
+            elif remote_port in declared:
+                wanted = [(declared[remote_port], remote_port)]
+            else:
+                known = ", ".join(sorted(declared)) or "none"
+                raise core.ProxyError(
+                    f"workspace {workspace!r} declares no port named {remote_port!r} (declared: {known})"
+                )
+        results = [
+            store.add(server, workspace, port, local_port=local_port, name=name, port_base=cfg.proxy.port_base)
+            for port, name in wanted
+        ]
     except core.ProxyError as exc:
         ui.error(str(exc))
         raise typer.Exit(1) from exc
-    verb = "added" if created else "already mapped"
-    typer.echo(f"{mapping.label} {verb}: {mapping.address}")
-    if created:
+    for mapping, created in results:
+        verb = "added" if created else "already mapped"
+        typer.echo(f"{mapping.label} {verb}: {mapping.address}")
+    if any(created for _, created in results):
         typer.echo("Serve it with `warren proxy run` (picks up new mappings while running).", err=True)
 
 
@@ -92,12 +168,15 @@ def proxy_list(output_json: bool = typer.Option(False, "--json", help="Print JSO
         typer.echo("no mappings — add one with `warren proxy add <workspace> <port>`")
         return
     for m in sorted(mappings, key=lambda m: m.local_port):
-        typer.echo(f"{m.address:<24} -> {m.label}")
+        suffix = f" (port {m.remote_port})" if m.name else ""
+        typer.echo(f"{m.address:<24} -> {m.label}{suffix}")
 
 
 @proxy_app.command("rm")
 def proxy_rm(
-    selector: str = typer.Argument(help="Local port, <workspace>, or <workspace>:<remote-port>"),
+    selector: str = typer.Argument(
+        help="Local port, <workspace>, <workspace>:<remote-port> or <workspace>/<port-name>"
+    ),
     server: Optional[str] = typer.Option(None, "--server", help="Only mappings on this remote"),
 ) -> None:
     """Remove mappings (a running proxy stops serving them within a few seconds)."""
@@ -148,7 +227,7 @@ def proxy_run(
     except core.ProxyError as exc:
         ui.error(str(exc))
         raise typer.Exit(1) from exc
-    daemon = core.ProxyDaemon(store, core.ControlPlaneResolver(cfg), core.SsmForwarder(), settings)
+    daemon = core.ProxyDaemon(store, core.ControlPlaneResolver(cfg), core.RuntimeForwarder(), settings)
 
     async def _main() -> None:
         stop = asyncio.Event()
@@ -170,3 +249,38 @@ def proxy_run(
         asyncio.run(_main())
     except KeyboardInterrupt:
         pass
+
+
+@proxy_app.command("stdio")
+def proxy_stdio(
+    workspace: str = typer.Argument(help="Workspace ID (or a prefix unique on that server)"),
+    remote_port: int = typer.Argument(help="Port inside the workspace (2222: warren-ecs-ssh-base's sshd)"),
+    server: Optional[str] = typer.Option(None, "--server", help="ECS remote profile (default: the only one)"),
+    config: Optional[Path] = typer.Option(None, "--config"),
+) -> None:
+    """Pipe stdin/stdout through an SSM port-forward to a workspace port: an ssh
+    ProxyCommand (see `warren ssh-config` and docs/workspace-ssh.md)."""
+    import os  # noqa: PLC0415
+
+    from .. import ssh_access  # noqa: PLC0415
+
+    cfg = _load_cfg(config)
+    server = _pick_ecs_server(cfg, server)
+    # stdin/stdout carry the SSH stream: keep private copies for the relay, and point
+    # fds 0/1 at /dev/null and stderr so no child (aws, session-manager-plugin) or stray
+    # print can read from or write into it.
+    in_fd, out_fd = os.dup(0), os.dup(1)
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull, 0)
+    os.close(devnull)
+    os.dup2(2, 1)
+    try:
+        ssh_access.run_stdio(cfg, server, workspace, remote_port, in_fd=in_fd, out_fd=out_fd)
+    except core.ProxyError as exc:
+        ui.error(f"warren proxy stdio: {exc}")
+        raise typer.Exit(1) from exc
+    finally:
+        os.dup2(in_fd, 0)
+        os.dup2(out_fd, 1)
+        os.close(in_fd)
+        os.close(out_fd)

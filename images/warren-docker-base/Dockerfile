@@ -41,6 +41,11 @@ COPY --chmod=0755 packages/warren-common/src/warren_common/assets/warren_harness
 COPY --chmod=0755 packages/warren-common/src/warren_common/assets/warren_state_hook.sh /usr/local/bin/warren-state-hook
 # AG2b: supervises a `kind: agent` workspace's harness next to the shell.
 COPY --chmod=0755 packages/warren-common/src/warren_common/agent_supervisor.py /usr/local/bin/warren-agent-supervisor
+# git_write templates: the podman runtime writes repo-scoped GitHub tokens to
+# /run/warren-git/<owner>; this helper hands them to git for https://github.com only.
+COPY --chmod=0755 packages/warren-common/src/warren_common/assets/warren_git_credential.sh /usr/local/bin/git-credential-warren
+RUN git config --system credential.https://github.com.helper /usr/local/bin/git-credential-warren \
+    && git config --system credential.https://github.com.useHttpPath true
 RUN printf '\n[ -r /etc/warren/harness.sh ] && . /etc/warren/harness.sh\n' >> /etc/zsh/zshrc \
     && printf '\n[ -r /etc/warren/banner.bash ] && . /etc/warren/banner.bash\n[ -r /etc/warren/harness.sh ] && . /etc/warren/harness.sh\n' >> /etc/bash.bashrc
 

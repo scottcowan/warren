@@ -168,6 +168,29 @@ async def test_provision_harness_app_starts_at_the_warren_shell():
 
 
 @pytest.mark.asyncio
+async def test_provision_server_mode_agent_runs_under_the_supervisor():
+    """`agent.mode: serve`: entrypoint.py starts the supervisor, which runs
+    `opencode serve` on agent.port; WARREN_APP_PORT names the port."""
+    import json
+
+    from warren_common.agent_launch import launch_spec
+    from warren_common.models import AgentConfig
+
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.create.return_value = MagicMock(id="ctr-abc")
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        spec = _spec()
+        spec.harnesses = ["opencode"]
+        spec.agent = launch_spec("opencode", AgentConfig(mode="serve", port=4096))
+        await runtime.provision(spec)
+        env = client.containers.create.call_args.kwargs["environment"]
+        assert json.loads(env["WARREN_AGENT_SPEC"])["argv"][:2] == ["opencode", "serve"]
+        assert env["WARREN_APP_PORT"] == "4096"
+        assert env["WARREN_SHELL_FIRST"] == "1"
+
+
+@pytest.mark.asyncio
 async def test_provision_defaults_warren_app_to_bash():
     with patch("warren.runtime.podman.PodmanClient") as ClientCls:
         client = ClientCls.return_value
@@ -1089,3 +1112,100 @@ async def test_provision_points_harness_config_at_workspace_dir():
         assert env["OPENCODE_CONFIG_DIR"] == "/var/lib/warren/harness/opencode/config"
         assert env["OPENCODE_DB"] == "/var/lib/warren/harness/opencode/data/opencode.db"
         assert "CLAUDE_CONFIG_DIR" not in env
+
+
+# --- template-declared ports: published on host loopback, ephemeral host port ---
+
+_APP_PORTS = {"t3": {"port": 3773, "description": ""}, "code": {"port": 8080, "description": "code-server"}}
+
+
+def _ported_spec() -> WorkspaceSpec:
+    spec = _spec()
+    spec.ports = dict(_APP_PORTS)
+    return spec
+
+
+@pytest.mark.asyncio
+async def test_provision_publishes_declared_ports_on_loopback_with_ephemeral_host_ports():
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.create.return_value = MagicMock(id="ctr-abc")
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        await runtime.provision(_ported_spec())
+        _, kwargs = client.containers.create.call_args
+        # Host port 0: podman picks a free one. Never a fixed or wildcard address.
+        assert kwargs["ports"] == {"3773/tcp": ("127.0.0.1", 0), "8080/tcp": ("127.0.0.1", 0)}
+
+
+@pytest.mark.asyncio
+async def test_provision_publishes_declared_ports_next_to_the_ssh_port():
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.create.return_value = MagicMock(id="ctr-abc")
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        spec = _ported_spec()
+        spec.ports["ssh"] = {"port": 22}  # already published as the SSH port: left as is
+        await runtime.provision(spec, ssh_port=30017)
+        _, kwargs = client.containers.create.call_args
+        assert kwargs["ports"] == {
+            "22/tcp": ("127.0.0.1", 30017),
+            "3773/tcp": ("127.0.0.1", 0),
+            "8080/tcp": ("127.0.0.1", 0),
+        }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("publish_host", ["", "0.0.0.0", "192.168.1.10", "::"])
+async def test_declared_ports_stay_on_loopback_when_the_ssh_port_is_exposed_wider(publish_host):
+    """WARREN_SSH_PUBLISH_HOST may expose the SSH port to the LAN (or every interface);
+    template ports never follow it there."""
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.create.return_value = MagicMock(id="ctr-abc")
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1", ssh_publish_host=publish_host)
+        await runtime.provision(_ported_spec())
+        _, kwargs = client.containers.create.call_args
+        assert {host for host, _ in kwargs["ports"].values()} == {"127.0.0.1"}
+
+
+@pytest.mark.asyncio
+async def test_declared_ports_follow_a_loopback_publish_host():
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.create.return_value = MagicMock(id="ctr-abc")
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1", ssh_publish_host="127.0.0.2")
+        await runtime.provision(_ported_spec())
+        _, kwargs = client.containers.create.call_args
+        assert kwargs["ports"]["3773/tcp"] == ("127.0.0.2", 0)
+
+
+@pytest.mark.asyncio
+async def test_published_ports_reads_loopback_bindings_from_inspect():
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.get.return_value = MagicMock(
+            attrs={
+                "NetworkSettings": {
+                    "Ports": {
+                        "3773/tcp": [{"HostIp": "127.0.0.1", "HostPort": "41001"}],
+                        "8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "41002"}],
+                        "53/udp": [{"HostIp": "127.0.0.1", "HostPort": "41003"}],
+                        "9000/tcp": None,
+                    }
+                }
+            }
+        )
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        got = await runtime.published_ports(WorkspaceHandle(workspace_id="ws", runtime_id="ctr", root_path=""))
+    assert got == {3773: ("127.0.0.1", 41001)}
+
+
+@pytest.mark.asyncio
+async def test_published_ports_of_a_missing_container_is_empty():
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.get.side_effect = NotFound("gone")
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        handle = WorkspaceHandle(workspace_id="ws", runtime_id="ctr", root_path="")
+        assert await runtime.published_ports(handle) == {}
+        assert await runtime.published_ports(WorkspaceHandle(workspace_id="ws", runtime_id="", root_path="")) == {}

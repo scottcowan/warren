@@ -49,6 +49,7 @@ import structlog
 from git import GitCommandError, Repo
 from git.exc import InvalidGitRepositoryError, NoSuchPathError
 
+from warren.runtime.userns import remove_tree
 from warren_common.errors import ProvisionError
 from warren_common.safe_git import (
     SafeGitError,
@@ -363,7 +364,9 @@ class GitManager:
         roots = (self.worktree_path(workspace_id), self.folders_root(workspace_id))
         await asyncio.to_thread(self._drop_object_caches, roots)
         for path in roots:
-            await asyncio.to_thread(shutil.rmtree, path, ignore_errors=True)
+            # remove_tree, not a bare rmtree: under a keep-id userns what the workspace
+            # wrote as container root is owned by a subuid the server user can't delete.
+            await asyncio.to_thread(remove_tree, path)
 
     def _drop_object_caches(self, roots: tuple[Path, Path]) -> None:
         root, folders = roots

@@ -4,8 +4,8 @@
 # builds it and it isn't a component in .github/releases.json. Build it yourself
 # (README.md).
 #
-# FROM warren-ecs-base 2.0.0 or later, the first Debian (glibc) release. T3 Code's
-# prebuilt server is glibc-only (on the 1.x Alpine images, even with gcompat, it dies
+# FROM warren-ecs-base 1.5.0 or later, the first Debian (glibc) release. T3 Code's
+# prebuilt server is glibc-only (on the 1.4 and earlier Alpine images, even with gcompat, it dies
 # with `fcntl64: symbol not found`). Everything warren needs (entrypoint, warren-session,
 # git-init, secrets handling, su-exec, the uid/gid 1000 user, USER root, WORKDIR,
 # ENTRYPOINT) comes from ecs-base unchanged; this image only adds packages, Claude Code
@@ -16,12 +16,12 @@
 
 ARG BASE_REGISTRY=public.ecr.aws/docker/library
 # debian:bookworm-slim, multi-arch index digest, as of 2026-10-31: the base
-# warren-ecs-base 2.0.0 uses. Only the download stage runs on it.
+# warren-ecs-base 1.5.0 uses. Only the download stage runs on it.
 ARG DEBIAN_IMAGE=${BASE_REGISTRY}/debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
-# warren-ecs-base 2.0.0, by tag until it's published; pin it by digest (tag@sha256:...)
+# warren-ecs-base 1.5.0, by tag until it's published; pin it by digest (tag@sha256:...)
 # for your own builds. To build against a locally built ecs-base, pass
 # --build-arg WARREN_ECS_BASE=<local tag> (README.md, "Build").
-ARG WARREN_ECS_BASE=ghcr.io/scottcowan/warren-ecs-base:2.0.0
+ARG WARREN_ECS_BASE=ghcr.io/scottcowan/warren-ecs-base:1.5.0
 
 # Downloads: Claude Code and t3, each checked against a published checksum, for the
 # target architecture. Nothing here reaches the final image except the two installs.

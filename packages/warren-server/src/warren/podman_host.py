@@ -117,3 +117,30 @@ def pasta_apparmor_warning(info: dict[str, Any], pasta_profile: str | None = Non
         "fix": FIX,
         "docs": README_URL,
     }
+
+
+
+def pasta_host_loopback_warning(info: dict[str, Any]) -> dict[str, Any] | None:
+    """Warning fields when rootless podman runs pasta, whose `169.254.1.2` mapping
+    (`host.containers.internal`) reaches the host's loopback: workspaces can then reach
+    services bound to host loopback, including other workspaces' published SSH and
+    template ports. Seen with podman 6.0.1's default pasta options; slirp4netns
+    (`allow_host_loopback=false`, its default) keeps host loopback closed, which is what
+    CI's isolation tests run with. Advice, not a gate: missing fields mean no warning."""
+    host = _get(info, "host", "Host") or {}
+    security = _get(host, "security", "Security") or {}
+    if _get(security, "rootless", "Rootless") is False:
+        return None
+    net_cmd = _get(host, "rootlessNetworkCmd", "RootlessNetworkCmd")
+    if not isinstance(net_cmd, str) or net_cmd.strip().lower() != "pasta":
+        return None
+    version = _get(_get(info, "version", "Version") or {}, "Version", "version")
+    return {
+        "podman_version": str(version),
+        "rootless_network_cmd": net_cmd,
+        "detail": (
+            "pasta maps 169.254.1.2 to the host, so containers can reach services on host "
+            "loopback, including other workspaces' loopback-published ports"
+        ),
+        "fix": FIX,
+    }

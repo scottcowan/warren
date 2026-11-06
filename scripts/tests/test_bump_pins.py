@@ -15,6 +15,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -387,6 +388,249 @@ class TestAwsCliKeyGpg(AwsKeyFixture):
         self.assertIn("ROTATED", body)
 
 
+SHA = {c: c * 64 for c in "abcdef"}
+CODEX = bump_pins.RELEASE_BINARIES[0]
+# A second release-tarball harness with no bump warning, to test the generic path.
+OTHER = bump_pins.ReleaseBinary("other", "example/other", "v", "OTHER",
+                                (("AMD64", "other-linux-x64.tar.gz"), ("ARM64", "other-linux-arm64.tar.gz")))
+
+
+def release_fetch(releases, base=None):
+    """fetch() serving {repo: release JSON} at the latest-release URL; else ``base`` or 404."""
+    def fetch(url):
+        for repo, body in releases.items():
+            if url == bump_pins.GITHUB_LATEST_RELEASE_URL.format(repo=repo):
+                return (200, json.dumps(body).encode()) if body is not None else (503, b"")
+        return base(url) if base else (404, b"")
+    return fetch
+
+
+def release(tag, digests, prerelease=False):
+    return {"tag_name": tag, "draft": False, "prerelease": prerelease,
+            "assets": [{"name": n, "digest": d} for n, d in digests.items()]}
+
+
+def codex_release(tag="rust-v0.170.0", amd=SHA["c"], arm=SHA["d"]):
+    return release(tag, {"codex-x86_64-unknown-linux-musl.tar.gz": f"sha256:{amd}",
+                         "codex-aarch64-unknown-linux-musl.tar.gz": f"sha256:{arm}",
+                         "codex-x86_64-unknown-linux-musl.zst": f"sha256:{SHA['f']}"})
+
+
+def codex_args(version="0.166.0", amd=SHA["a"], arm=SHA["b"]):
+    return (f"ARG CODEX_VERSION={version}\nARG CODEX_SHA256_AMD64={amd}\nARG CODEX_SHA256_ARM64={arm}\n"
+            'RUN curl ".../rust-v${CODEX_VERSION}/codex.tar.gz"\n')
+
+
+class ReleaseFixture(RepoFixture):
+    DOCKER = "images/warren-docker-dev-base/Dockerfile"
+    ECS = "packages/warren-server/images/warren-ecs-dev-base/Dockerfile"
+
+    def setUp(self):
+        super().setUp()
+        self.write(self.DOCKER, "FROM x\nARG OTHER_VERSION=1.19.5\n"
+                   f"ARG OTHER_SHA256_AMD64={SHA['a']}\nARG OTHER_SHA256_ARM64={SHA['b']}\n" + codex_args())
+        self.write(self.ECS, "FROM x\nARG CLAUDE_CODE_VERSION=2.1.301\nARG NODE_VERSION=24.22.2\n" + codex_args())
+
+
+class TestReleaseBinary(ReleaseFixture):
+    def test_finds_pins_per_harness(self):
+        self.assertEqual([p.path.as_posix() for p in bump_pins.find_release_pins(self.root, OTHER)], [self.DOCKER])
+        self.assertEqual(sorted(p.path.as_posix() for p in bump_pins.find_release_pins(self.root, CODEX)),
+                         sorted([self.DOCKER, self.ECS]))
+
+    def test_bump_rewrites_version_and_both_checksums(self):
+        fetch = release_fetch({"openai/codex": codex_release()})
+        changes, _, warnings = bump_pins.bump_release_binary(self.root, fetch, CODEX, write=True)
+        self.assertEqual(sorted(c.path.as_posix() for c in changes), sorted([self.DOCKER, self.ECS]))
+        self.assertEqual({(c.old, c.new) for c in changes}, {("0.166.0", "0.170.0")})
+        for rel in (self.DOCKER, self.ECS):
+            text = self.read(rel)
+            self.assertIn("ARG CODEX_VERSION=0.170.0\n", text)
+            self.assertIn(f"ARG CODEX_SHA256_AMD64={SHA['c']}\n", text)
+            self.assertIn(f"ARG CODEX_SHA256_ARM64={SHA['d']}\n", text)
+            self.assertIn("rust-v${CODEX_VERSION}", text)  # the ARG reference is untouched
+        self.assertIn(f"ARG OTHER_SHA256_AMD64={SHA['a']}\n", self.read(self.DOCKER))  # other harness untouched
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("codex 0.166.0 -> 0.170.0", warnings[0])
+        self.assertIn("docs/harnesses.md", warnings[0])
+
+    def test_spec_without_bump_warning_adds_none(self):
+        fetch = release_fetch({"example/other": release("v1.20.0", {
+            "other-linux-x64.tar.gz": f"sha256:{SHA['e']}", "other-linux-arm64.tar.gz": f"sha256:{SHA['f']}"})})
+        changes, _, warnings = bump_pins.bump_release_binary(self.root, fetch, OTHER, write=True)
+        self.assertEqual([(c.kind, c.path.as_posix(), c.new) for c in changes], [("other", self.DOCKER, "1.20.0")])
+        self.assertEqual(warnings, [])
+        text = self.read(self.DOCKER)
+        self.assertIn("ARG OTHER_VERSION=1.20.0\n", text)
+        self.assertIn(f"ARG OTHER_SHA256_AMD64={SHA['e']}\nARG OTHER_SHA256_ARM64={SHA['f']}\n", text)
+        self.assertIn("ARG CODEX_VERSION=0.166.0\n", text)  # codex untouched
+
+    def test_report_only_does_not_write(self):
+        before = self.read(self.ECS)
+        changes, _, _ = bump_pins.bump_release_binary(self.root, release_fetch({"openai/codex": codex_release()}),
+                                                     CODEX, write=False)
+        self.assertEqual(len(changes), 2)
+        self.assertEqual(self.read(self.ECS), before)
+
+    def test_up_to_date_or_older_is_no_change(self):
+        for tag in ("rust-v0.166.0", "rust-v0.99.9"):
+            changes, notes, _ = bump_pins.bump_release_binary(
+                self.root, release_fetch({"openai/codex": codex_release(tag)}), CODEX, write=True)
+            self.assertEqual(changes, [], tag)
+            self.assertIn("at or above", notes[0])
+
+    def test_unusable_release_is_skipped_without_writing(self):
+        before = self.read(self.ECS)
+        cases = {
+            "http error": None,
+            "prerelease": {**codex_release(), "prerelease": True},
+            "odd tag": codex_release(tag="v0.170.0"),
+            "alpha tag": codex_release(tag="rust-v0.170.0-alpha.1"),
+            "missing digest": release("rust-v0.170.0", {"codex-x86_64-unknown-linux-musl.tar.gz": f"sha256:{SHA['c']}"}),
+            "bad digest": codex_release(amd="not-hex"),
+        }
+        for name, body in cases.items():
+            changes, notes, _ = bump_pins.bump_release_binary(
+                self.root, release_fetch({"openai/codex": body}), CODEX, write=True)
+            self.assertEqual(changes, [], name)
+            self.assertIn("skipped", notes[0], name)
+        self.assertEqual(self.read(self.ECS), before)
+
+    def test_file_without_checksum_args_is_not_bumped(self):
+        self.write(self.ECS, "FROM x\nARG CODEX_VERSION=0.166.0\n")
+        changes, _, warnings = bump_pins.bump_release_binary(
+            self.root, release_fetch({"openai/codex": codex_release()}), CODEX, write=True)
+        self.assertEqual([c.path.as_posix() for c in changes], [self.DOCKER])
+        self.assertIn("ARG CODEX_VERSION=0.166.0", self.read(self.ECS))
+        self.assertTrue(any("by hand" in w and self.ECS in w for w in warnings))
+
+
+PI_PKG = "images/warren-docker-dev-base/pi/package.json"
+PI_PKG_ECS = "packages/warren-server/images/warren-ecs-dev-base/pi/package.json"
+
+
+def pi_package(version):
+    return json.dumps({"name": "warren-pi", "private": True, "dependencies": {bump_pins.PI_PACKAGE: version}},
+                      indent=2) + "\n"
+
+
+def pi_lock(version):
+    return json.dumps({"lockfileVersion": 3, "packages": {
+        "": {"dependencies": {bump_pins.PI_PACKAGE: version}},
+        f"node_modules/{bump_pins.PI_PACKAGE}": {"version": version}}}, indent=2) + "\n"
+
+
+def pi_fetch(latest, status=200):
+    def fetch(url):
+        if url == bump_pins.PI_DIST_TAGS_URL:
+            return status, json.dumps({"latest": latest}).encode()
+        return 404, b""
+    return fetch
+
+
+class TestPi(ReleaseFixture):
+    def setUp(self):
+        super().setUp()
+        for pkg in (PI_PKG, PI_PKG_ECS):
+            self.write(pkg, pi_package("1.5.0"))
+            self.write(pkg.replace("package.json", "package-lock.json"), pi_lock("1.5.0"))
+        self.calls = []
+
+    def fake_lock(self, root, pi_dir):
+        """Stands in for the docker run: resolves whatever package.json now pins."""
+        self.calls.append(pi_dir.as_posix())
+        version = json.loads((root / pi_dir / "package.json").read_text())["dependencies"][bump_pins.PI_PACKAGE]
+        (root / pi_dir / "package-lock.json").write_text(pi_lock(version))
+
+    def test_bump_rewrites_package_json_and_regenerates_each_lockfile(self):
+        changes, _, warnings = bump_pins.bump_pi(self.root, pi_fetch("1.6.0"), write=True, lock=self.fake_lock)
+        self.assertEqual(warnings, [])
+        self.assertEqual(sorted(self.calls), sorted(str(Path(p).parent.as_posix()) for p in (PI_PKG, PI_PKG_ECS)))
+        for pkg in (PI_PKG, PI_PKG_ECS):
+            self.assertEqual(json.loads(self.read(pkg))["dependencies"][bump_pins.PI_PACKAGE], "1.6.0")
+            self.assertEqual(bump_pins.pi_lock_version(self.root / pkg.replace("package.json", "package-lock.json")),
+                             "1.6.0")
+        self.assertEqual({c.path.name for c in changes}, {"package.json", "package-lock.json"})
+        self.assertEqual(len(changes), 4)
+
+    def test_report_only_lists_the_bump_without_running_npm(self):
+        changes, _, _ = bump_pins.bump_pi(self.root, pi_fetch("1.6.0"), write=False, lock=self.fake_lock)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(sorted(c.path.as_posix() for c in changes), sorted([PI_PKG, PI_PKG_ECS]))
+        self.assertIn("1.5.0", self.read(PI_PKG))
+
+    def test_without_docker_reports_drift_and_the_manual_command(self):
+        changes, _, warnings = bump_pins.bump_pi(self.root, pi_fetch("1.6.0"), write=True, lock=None)
+        self.assertEqual(changes, [])
+        self.assertEqual(len(warnings), 2)
+        self.assertIn("docker run", warnings[0])
+        self.assertIn("npm install --package-lock-only --ignore-scripts", warnings[0])
+        self.assertIn("node:24.22.2-bookworm-slim", warnings[0])  # the ECS dev-base's Node
+        self.assertIn("1.5.0", self.read(PI_PKG))
+
+    def test_failed_regeneration_restores_both_files(self):
+        def broken(root, pi_dir):
+            (root / pi_dir / "package-lock.json").write_text("garbage")
+            raise subprocess.CalledProcessError(1, ["docker"])
+        before = {p: self.read(p) for p in (PI_PKG, PI_PKG.replace("package.json", "package-lock.json"))}
+        changes, _, warnings = bump_pins.bump_pi(self.root, pi_fetch("1.6.0"), write=True, lock=broken)
+        self.assertEqual(changes, [])
+        self.assertTrue(all("regeneration failed" in w for w in warnings))
+        self.assertEqual({p: self.read(p) for p in before}, before)
+
+    def test_lockfile_resolving_the_wrong_version_is_rejected(self):
+        def stale(root, pi_dir):
+            (root / pi_dir / "package-lock.json").write_text(pi_lock("1.5.0"))
+        changes, _, warnings = bump_pins.bump_pi(self.root, pi_fetch("1.6.0"), write=True, lock=stale)
+        self.assertEqual(changes, [])
+        self.assertIn("resolves 1.5.0", warnings[0])
+        self.assertIn("1.5.0", self.read(PI_PKG))
+
+    def test_up_to_date_and_registry_errors_are_no_change(self):
+        for fetch in (pi_fetch("1.5.0"), pi_fetch("1.4.9"), pi_fetch("1.6.0", status=500), pi_fetch("latest")):
+            changes, notes, _ = bump_pins.bump_pi(self.root, fetch, write=True, lock=self.fake_lock)
+            self.assertEqual(changes, [])
+            self.assertTrue(notes)
+        self.assertEqual(self.calls, [])
+
+    def test_out_of_sync_lockfile_warns(self):
+        self.write(PI_PKG.replace("package.json", "package-lock.json"), pi_lock("1.4.0"))
+        _, _, warnings = bump_pins.bump_pi(self.root, pi_fetch("1.5.0"), write=True, lock=self.fake_lock)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("resolves 1.4.0", warnings[0])
+
+    def test_range_pin_is_reported(self):
+        self.write(PI_PKG, pi_package("^1.5.0"))
+        pins, problems = bump_pins.find_pi_pins(self.root)
+        self.assertEqual([p.path.as_posix() for p in pins], [PI_PKG_ECS])
+        self.assertIn("exact X.Y.Z", problems[0])
+
+    def test_lock_command_runs_npm_only_in_a_container(self):
+        cmd = bump_pins.pi_lock_command(self.root, Path(PI_PKG).parent)
+        self.assertEqual(cmd[:3], ["docker", "run", "--rm"])
+        self.assertIn("node:24.22.2-bookworm-slim", cmd)
+        self.assertEqual(cmd[cmd.index("-e") + 1], "HOME=/tmp")
+        self.assertIn("--ignore-scripts", cmd)
+
+    def test_pi_bump_dispatches_the_dev_base_smoke(self):
+        self.write(".github/workflows/warren-ecs-dev-base-smoke.yml",
+                   "on:\n  pull_request:\n    paths:\n      - packages/warren-server/images/warren-ecs-dev-base/**\n")
+        changed = [Path(PI_PKG_ECS), Path(PI_PKG_ECS.replace("package.json", "package-lock.json"))]
+        self.assertEqual(bump_pins.smoke_workflows_for(self.root, changed), ["warren-ecs-dev-base-smoke.yml"])
+
+    def test_main_reports_every_harness(self):
+        fetch = release_fetch({"openai/codex": None},
+                              base=lambda url: pi_fetch("1.6.0")(url))
+        summary, smoke = self.root / "summary.md", self.root / "smoke.txt"
+        with contextlib.redirect_stdout(io.StringIO()):
+            bump_pins.main(["--write", "--summary", str(summary), "--smoke-workflows", str(smoke)],
+                           fetch=fetch, root=self.root, gpg=None, lock=self.fake_lock)
+        body = summary.read_text()
+        self.assertIn("codex: GET https://api.github.com/repos/openai/codex/releases/latest returned 503", body)
+        self.assertIn(f"| pi | `{PI_PKG}` | 1.5.0 | 1.6.0 |", body)
+        self.assertEqual(smoke.read_text().split(), ["warren-docker-dev-base-smoke.yml"])
+
+
 class TestMain(RepoFixture):
     def test_end_to_end_outputs(self):
         fetch = make_fetch({"stable": "2.2.0"}, manifests=["2.2.0"], meta_keys=[ED, EC, RSA_NEW])
@@ -426,9 +670,43 @@ class TestRealRepo(unittest.TestCase):
         self.assertEqual(dockerfile.count(bump_pins.spaced_fingerprint(info.fingerprint)), 1)
         self.assertNotIn(info.fingerprint, dockerfile)
 
+    def test_repo_harness_pins_match_the_images(self):
+        # Both dev-bases ship the same harnesses: codex and pi pinned here, Claude Code above.
+        def paths(spec):
+            return sorted(p.path.as_posix() for p in bump_pins.find_release_pins(bump_pins.REPO_ROOT, spec))
+        self.assertEqual([s.kind for s in bump_pins.RELEASE_BINARIES], ["codex"])
+        for rel in bump_pins.dockerfiles(bump_pins.REPO_ROOT):  # no warren image installs opencode
+            self.assertNotIn("OPENCODE_VERSION", (bump_pins.REPO_ROOT / rel).read_text(), rel)
+        self.assertEqual(paths(CODEX), ["images/warren-docker-dev-base/Dockerfile",
+                                        "packages/warren-server/images/warren-ecs-dev-base/Dockerfile"])
+        pins, problems = bump_pins.find_pi_pins(bump_pins.REPO_ROOT)
+        self.assertEqual(problems, [])
+        self.assertEqual(sorted(p.path.as_posix() for p in pins), [PI_PKG, PI_PKG_ECS])
+        for spec in bump_pins.RELEASE_BINARIES:
+            for rel in paths(spec):
+                text = (bump_pins.REPO_ROOT / rel).read_text()
+                for arch, _ in spec.assets:
+                    self.assertEqual(len(bump_pins._sha_arg(spec, arch).findall(text)), 1, (rel, arch))
+
+    def test_repo_pi_lockfiles_match_their_package_json_and_each_other(self):
+        pins, _ = bump_pins.find_pi_pins(bump_pins.REPO_ROOT)
+        locks = set()
+        for p in pins:
+            lock = bump_pins.REPO_ROOT / p.path.parent / "package-lock.json"
+            self.assertEqual(bump_pins.pi_lock_version(lock), p.version)
+            locks.add(lock.read_text())
+        self.assertEqual(len(locks), 1)
+
     def test_repo_known_hosts_parses(self):
         keys = bump_pins.parse_known_hosts((bump_pins.REPO_ROOT / bump_pins.KNOWN_HOSTS).read_text())
         self.assertEqual({k.split()[0] for k in keys}, {"ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa"})
+
+    def test_dev_base_bump_dispatches_the_ssh_base_smoke_too(self):
+        # warren-ecs-ssh-base builds FROM dev-base, so a dev-base pin bump is smoke-tested there too.
+        changed = [Path("packages/warren-server/images/warren-ecs-dev-base/Dockerfile")]
+        smoke = bump_pins.smoke_workflows_for(bump_pins.REPO_ROOT, changed)
+        self.assertIn("warren-ecs-dev-base-smoke.yml", smoke)
+        self.assertIn("warren-ecs-ssh-base-smoke.yml", smoke)
 
 
 if __name__ == "__main__":

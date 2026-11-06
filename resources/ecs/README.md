@@ -178,6 +178,226 @@ EFS, so exactly one control-plane process may have it open (audit #10):
 - `WARREN_SQLITE_JOURNAL_MODE=auto` (the default) uses `DELETE` journaling when the data
   dir is on NFS/EFS, because WAL's shared-memory index isn't safe on network
   filesystems. Use `wal`/`delete` to override.
+- With both [AWS state backends](#state-backends-dynamodb-and-secrets-manager) selected,
+  no SQLite file is opened and the writer lock isn't taken.
+
+## State backends: DynamoDB and Secrets Manager
+
+SQLite on EFS is the default and keeps working unchanged, on ECS and podman alike. An ECS
+deployment can opt into either of two independent backends:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `WARREN_STATE_BACKEND` | `sqlite` | `dynamodb`: registry, launch attempts, EBS snapshots and seeds, operations, idle stops, users, tokens, workspace tokens, headless runs |
+| `WARREN_DYNAMODB_TABLE` | | The table (required with `dynamodb`) |
+| `WARREN_DYNAMODB_TOKEN_RETENTION_DAYS` | `30` | How long an expired or revoked token's items stay before TTL deletes them |
+| `WARREN_DYNAMODB_IDLE_STOP_RETENTION_DAYS` | `90` | TTL on idle-stop markers (an `idle_destroy_seconds` longer than this loses its marker) |
+| `WARREN_SECRETS_BACKEND` | `sqlite` | `secretsmanager`: user secrets in AWS Secrets Manager |
+| `WARREN_SECRETSMANAGER_PREFIX` | `warren/<server_id>` | Secret name prefix |
+| `WARREN_SECRETSMANAGER_KMS_KEY_ID` | | Customer managed key for the secrets; empty uses `aws/secretsmanager` |
+| `WARREN_SECRETSMANAGER_FORCE_DELETE` | `false` | Delete immediately (`ForceDeleteWithoutRecovery`) instead of scheduling |
+| `WARREN_SECRETSMANAGER_RECOVERY_WINDOW_DAYS` | `7` | Recovery window for a deleted secret (7-30) |
+| `WARREN_SECRETSMANAGER_CACHE_TTL_S` | `60` | In-memory cache of secret values read at launch; `0` disables |
+
+The switches are independent: Secrets Manager with SQLite state works on podman too, and
+DynamoDB with SQLite secrets keeps the SQLite file (and its writer lock) for the secrets.
+`WARREN_SECRET_KEY` is required either way, because it derives the token-hashing pepper.
+
+### Table design
+
+One table, string partition key `pk` and sort key `sk`, one global secondary index
+`gsi1` (`gsi1pk`/`gsi1sk`, projection ALL), TTL on the `ttl` attribute.
+
+| Item | `pk` | `sk` | `gsi1pk` / `gsi1sk` | TTL |
+|---|---|---|---|---|
+| workspace | `WS#<id>` | `META` | `WSSTATUS#<status>` / `<created_at>#<id>` | |
+| launch attempt | `WS#<id>` | `LAUNCH` | | |
+| EBS snapshot | `WS#<id>` | `EBSSNAP` | | |
+| idle stop | `WS#<id>` | `IDLESTOP` | `IDLESTOPS` / `<id>` | yes |
+| workspace token | `WS#<id>` | `WSTOKEN#<token_id>` | | yes |
+| workspace token by hash / by id | `WSTOKENHASH#<hash>` / `WSTOKENID#<token_id>` | `META` | | yes |
+| user | `USER#<user_id>` | `META` | `USERS` / `<created_at>#<user_id>` | |
+| username (unique) | `USERNAME#<name>` | `META` | | |
+| token | `USER#<user_id>` | `TOKEN#<token_id>` | | yes |
+| token by hash / by id | `TOKENHASH#<hash>` / `TOKENID#<token_id>` | `META` | | yes |
+| EBS seed | `SEED#<owner>` | `META` | `SEEDS` / `<owner>` | |
+| EBS seed repo | `SEED#<owner>` | `REPO#<repo_key>` | `SEEDREPOS` / `<owner>#<repo_key>` | |
+| operation | `OP#<principal>` | `OP#<operation_id>` | | |
+| headless run | `WS#<id>` | `RUN#<run_id>` (run id = workspace id) | `RUNS` / `<created_at>#<run_id>` | |
+| live-workspace counters | `COUNTER#workspaces` | `ALL`, `OWNER#<owner>`, `OWNERLESS` | | |
+| admin counters | `COUNTER#admins` | `META` | | |
+
+Every check that decides access or a limit reads the base table with strongly
+consistent reads: token lookups go hash item -> token item -> user item, a user's tokens
+share the user's partition and a workspace's tokens share the workspace's. The index
+only serves listings (workspaces by status, users, seeds, idle stops, runs), which are
+eventually consistent. `list_non_terminal` re-reads its rows consistently. The listing
+partitions (`USERS`, `SEEDS`, ...) are single partitions, fine at warren's scale.
+
+### Atomicity
+
+What SQLite got from single statements and a single writer, DynamoDB gets from
+conditional writes and `TransactWriteItems`:
+
+- **Workspace caps** (`WARREN_MAX_WORKSPACES`, `..._PER_USER`, #28): counter items hold
+  the live (non-terminal) count, server-wide and per owner. A create is one transaction:
+  put the workspace (`attribute_not_exists`) and `ADD n 1` to both counters, each
+  conditioned on `n < cap`. A status change that enters or leaves a live state is a
+  transaction too: the workspace update conditioned on the status it read, plus the
+  counter deltas. A writer that lost a race re-reads and retries.
+- **Token cap** (`WARREN_MAX_TOKENS_PER_USER`): a mint counts the user's live tokens with
+  a consistent query and commits the token, its hash item and its id item together with
+  a `token_seq` bump on the user item, conditioned on the value it read. Two racing mints
+  can't both commit against the same count. Token hashes and usernames are unique
+  through `attribute_not_exists` puts.
+- **Last enabled admin:** `COUNTER#admins.enabled`, decremented only while `enabled > 1`.
+- **Launch attempts (AI3):** a conditional put. A launch racing another launch of the same
+  generation and fingerprint gets the stored attempt back, and with it the same RunTask
+  clientToken, task definition and secrets envelopes.
+- **Seed refresh single-flight:** `claim_refresh` is an `UpdateItem` conditioned on
+  `refreshing_since` being absent or older than the stale cutoff.
+- **Operations (AM2), reservation grants (AJ2):** conditional put / conditional update.
+
+### More than one control-plane task
+
+With both AWS backends there is no writer lock, and the state itself is safe to write
+from several tasks. **warren-server still assumes one control-plane task**, so keep
+`desired_count = 1` and stop-before-start deployments. Single-instance today:
+
+- per-workspace lifecycle locks (`WorkspaceRegistry._lock_for`) and the per-operation
+  locks in `routes/workspaces.py` are `asyncio.Lock`s in one process;
+- the background loops all run in every task: the reaper, idle reaper, EFS reaper, ECS
+  orphan sweep, EBS sweep, EBS seed refresh, the notification watcher, the `git_write`
+  token refresh, and the startup reconcile;
+- the workspace event store (SSE), the rate limiter, the exec relay, the task
+  definition cache, the notification queue and dedupe window, and the held `git_write`
+  installation tokens (re-minted on launch; never persisted) are in memory;
+- the Secrets Manager value cache is per process: another task's write is seen when the
+  entry expires (`WARREN_SECRETSMANAGER_CACHE_TTL_S`).
+
+What DynamoDB changes now: a deployment no longer waits on an NFS lock lease, and a
+brief overlap of two tasks can't corrupt state.
+
+### TTL
+
+DynamoDB TTL (attribute `ttl`, epoch seconds) removes idle-stop markers
+(`WARREN_DYNAMODB_IDLE_STOP_RETENTION_DAYS` after the stop) and token items (expiry or
+revocation plus `WARREN_DYNAMODB_TOKEN_RETENTION_DAYS`, for user and workspace tokens and
+their hash and id items). TTL deletion lags by up to a couple of days, so every read
+still checks `expires_at`/`revoked_at`. Once deleted, a token is gone from `GET /tokens`
+too. Workspaces, users and operations have no TTL: they don't expire in SQLite either.
+
+### Secrets Manager
+
+- **Naming:** one secret per (owner, name), `<prefix>/<owner>/<name>`. Both components are
+  encoded: letters, digits and `_.-@+` pass through, every other UTF-8 byte (including
+  `/`, `:` and `=`) becomes `=XX`. So `arn:aws:iam::1:role/x` + `API_KEY` is
+  `<prefix>/arn=3Aaws=3Aiam=3A=3A1=3Arole=2Fx/API_KEY`.
+- **Tags:** `warren=true`, `warren.owner_id=<owner>`, `warren.server_instance=<server id>`.
+- **Encryption:** Secrets Manager with KMS (the CMK when set) is the encryption at rest.
+  There is no Fernet layer in this backend.
+- **Delete:** schedules deletion with a 7-day recovery window by default
+  (`aws secretsmanager restore-secret` undoes it). Writing the same name again within the
+  window restores the secret and writes the new value. With
+  `WARREN_SECRETSMANAGER_FORCE_DELETE=true` a delete is immediate and unrecoverable.
+- **List:** `ListSecrets` filtered by name prefix and the `warren` tag key, then checked
+  exactly (the name filter is case-insensitive).
+- **Missing secrets:** under the tag-conditioned policy below, AWS answers AccessDenied
+  rather than ResourceNotFound for a secret that doesn't exist. warren tells the two
+  apart with `ListSecrets` on the exact name, so a real denial still fails loudly.
+- **Rotate without a value:** writes the current value back as a new version under the
+  configured key.
+- **Cost:** about $0.40 per secret per month plus $0.05 per 10,000 API calls (us-east-1
+  list prices); 100 users with 5 secrets each is about $200/month. Launches resolve
+  secrets through an in-memory TTL cache keyed by owner, name and version stage, which a
+  write through the same task invalidates.
+
+### IAM (control-plane task role)
+
+DynamoDB, on the table and its index:
+
+```json
+{"Sid": "StateTable", "Effect": "Allow",
+ "Action": ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:Query", "dynamodb:Scan",
+            "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem",
+            "dynamodb:ConditionCheckItem", "dynamodb:DescribeTable", "dynamodb:DescribeTimeToLive"],
+ "Resource": ["arn:aws:dynamodb:<region>:<account>:table/<table>",
+              "arn:aws:dynamodb:<region>:<account>:table/<table>/index/gsi1"]}
+```
+
+`TransactWriteItems` is authorized as the Put/Update/Delete/ConditionCheck actions it
+contains. `Scan` is only used by `--migrate-state`.
+
+Secrets Manager, limited to the prefix and the `warren` tag:
+
+```json
+{"Sid": "SecretsCreateTagged", "Effect": "Allow",
+ "Action": ["secretsmanager:CreateSecret", "secretsmanager:TagResource"],
+ "Resource": "arn:aws:secretsmanager:<region>:<account>:secret:<prefix>/*",
+ "Condition": {"StringEquals": {"aws:RequestTag/warren": "true"},
+               "ForAllValues:StringEquals": {"aws:TagKeys": ["warren", "warren.owner_id", "warren.server_instance"]}}},
+{"Sid": "SecretsManageTagged", "Effect": "Allow",
+ "Action": ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:UpdateSecret",
+            "secretsmanager:DescribeSecret", "secretsmanager:DeleteSecret", "secretsmanager:RestoreSecret"],
+ "Resource": "arn:aws:secretsmanager:<region>:<account>:secret:<prefix>/*",
+ "Condition": {"StringEquals": {"secretsmanager:ResourceTag/warren": "true"}}},
+{"Sid": "SecretsList", "Effect": "Allow", "Action": "secretsmanager:ListSecrets", "Resource": "*"}
+```
+
+`ListSecrets` has no resource-level permissions. With customer managed keys:
+
+- `kms:GenerateDataKey`, `kms:Decrypt`, `kms:DescribeKey` on the secrets key, with
+  `kms:ViaService = secretsmanager.<region>.amazonaws.com` (`SecretsKMS`);
+- `kms:Encrypt`, `kms:Decrypt`, `kms:GenerateDataKey`, `kms:DescribeKey` on the table key,
+  with `kms:ViaService = dynamodb.<region>.amazonaws.com` (`StateTableKMS`).
+
+The key policies must also allow the account (or the role) to use the keys.
+
+### Reference IaC
+
+Terraform and CDK create all of the above only when asked:
+
+| Terraform variable / CDK context | Default | |
+|---|---|---|
+| `enable_dynamodb_state` | `false` | Table (on demand, PITR, SSE, TTL, deletion protection) + `StateTable` grants + env |
+| `dynamodb_table_name` | `warren-state-<env_suffix>` | |
+| `dynamodb_kms_key_arn` | | CMK for the table, else `aws/dynamodb`; adds `StateTableKMS` |
+| `enable_secretsmanager_secrets` | `false` | Secrets Manager grants + env |
+| `secretsmanager_prefix` | `<ecs_resource_prefix>/<env_suffix>` | |
+| `secretsmanager_kms_key_arn` | | CMK for the secrets; adds `SecretsKMS` |
+
+```bash
+terraform apply -var="enable_dynamodb_state=true" -var="enable_secretsmanager_secrets=true"
+cdk deploy --context enable_dynamodb_state=true --context enable_secretsmanager_secrets=true
+```
+
+### Preflight
+
+With a non-default backend, startup fails before serving anything when the table is
+missing, isn't ACTIVE, lacks the `pk`/`sk` keys or the `gsi1` index, or the role can't
+call `DescribeTable`, and when `ListSecrets` on the prefix is denied. TTL not enabled on
+`ttl` is logged as a warning.
+
+### Moving an existing deployment
+
+Migrate before a server first starts on the new backend: a server starting on an empty
+table bootstraps a fresh admin from `WARREN_BOOTSTRAP_TOKEN`.
+
+1. Stop the control plane: `aws ecs update-service --desired-count 0`.
+2. Create only the table and the grants, e.g.
+   `terraform apply -var=enable_dynamodb_state=true -var=enable_secretsmanager_secrets=true
+   -target=aws_dynamodb_table.warren_state -target=aws_iam_role_policy.state_backend_policy`.
+3. Run a one-off task of the current control-plane task definition (it mounts the data
+   dir) with the new `WARREN_STATE_BACKEND`/`WARREN_DYNAMODB_TABLE`/
+   `WARREN_SECRETS_BACKEND`/`WARREN_SECRETSMANAGER_*` values as environment overrides and
+   the command `warren-server --migrate-state`. It prints what it would copy. Run it again
+   with `--apply` to copy. It takes the SQLite writer lock, so it refuses while a server
+   still has the database open. It only writes items and secrets that aren't there yet,
+   so a rerun copies nothing new and never overwrites, and then it rebuilds the counters.
+   Secrets are decrypted with `WARREN_SECRET_KEY` and stored as plain SecretStrings.
+   Tokens keep their hashes, so existing tokens keep working.
+4. Apply everything (`terraform apply` with the flags): the service starts on the new
+   backends. Keep `warren.db` until you're satisfied.
 
 **CDK parity:** `resources/ecs/cdk/warren_stack.py` accepts the same `create_efs` (default
 `True`) and `control_plane_image_uri` parameters as Terraform, producing the identical
@@ -363,22 +583,23 @@ terraform apply -var="image_uri=..." -var="env_suffix=staging"
 
 | Image | Base | What it is |
 | --- | --- | --- |
-| `ghcr.io/scottcowan/warren-ecs-base` | Debian bookworm-slim (glibc) since 2.0.0; 1.x was Alpine | The default `ecs_image`: entrypoint, `warren-session`, git-init, secrets handling, the uid 1000 `warren` user. No harnesses. |
-| `ghcr.io/scottcowan/warren-ecs-dev-base` | `warren-ecs-base` (Debian since 2.0.0) | + Claude Code, Node.js LTS, pyenv Python 3.12, uv, AWS CLI v2, ripgrep. |
+| `ghcr.io/scottcowan/warren-ecs-base` | Debian bookworm-slim (glibc) since 1.5.0; 1.4 and earlier were Alpine | The default `ecs_image`: entrypoint, `warren-session`, git-init, secrets handling, the uid 1000 `warren` user. No harnesses. |
+| `ghcr.io/scottcowan/warren-ecs-dev-base` | `warren-ecs-base` (Debian since 1.5.0) | + the harnesses Claude Code, codex and pi, as in `warren-docker-dev-base` (no warren image ships opencode; see [docs/harnesses.md](../../docs/harnesses.md#which-image-ships-which-harness)), Node.js LTS, pyenv Python 3.12, uv, AWS CLI v2, ripgrep. |
+| `ghcr.io/scottcowan/warren-ecs-ssh-base` | `warren-ecs-dev-base` | + an sshd on loopback for editor remoting; the same harnesses as dev-base. |
 
 Built from [`packages/warren-server/images/ecs-base`](../../packages/warren-server/images/ecs-base/Dockerfile)
 and [`warren-ecs-dev-base`](../../packages/warren-server/images/warren-ecs-dev-base/Dockerfile).
 
-**ecs-base 2.0.0 moved from Alpine to Debian.** glibc means prebuilt PyPI manylinux
+**ecs-base 1.5.0 moved from Alpine to Debian.** glibc means prebuilt PyPI manylinux
 wheels, prebuilt npm native addons and glibc-only tools (T3 Code, Playwright/Chrome)
 work without compiling. The workspace contract is unchanged: the same files at the same
 paths and modes, uid/gid 1000, `USER root`, `WORKDIR /home/warren` and the same
-`ENTRYPOINT`. The 1.x Alpine Dockerfile is in git history, and the 1.x images stay on
+`ENTRYPOINT`. The Alpine Dockerfile is in git history, and the 1.4 and earlier images stay on
 GHCR.
 
 If you build an image `FROM warren-ecs-base` and install packages with `apk`, switch
-to `apt-get` when you move to 2.0.0 (`apt-get update && apt-get install -y
---no-install-recommends ... && rm -rf /var/lib/apt/lists/*`), or stay on a pinned 1.x
+to `apt-get` when you move to 1.5.0 (`apt-get update && apt-get install -y
+--no-install-recommends ... && rm -rf /var/lib/apt/lists/*`), or stay on a pinned 1.4
 tag. Other differences for derived images:
 
 - su-exec is still `/sbin/su-exec`, built from the same upstream source Alpine
@@ -386,7 +607,7 @@ tag. Other differences for derived images:
 - bash reads `/etc/bash.bashrc`; `/etc/bash/bashrc` links to it.
 - git is 2.39 (bookworm), not 2.45.
 - `LANG=C.UTF-8` is set.
-- [`examples/ecs-t3code`](../../examples/ecs-t3code/) is an image built on 2.0.0.
+- [`examples/ecs-t3code`](../../examples/ecs-t3code/) is an image built on 1.5.0.
 
 ## Wiring Outputs into warren-server
 

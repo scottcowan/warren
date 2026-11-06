@@ -11,6 +11,7 @@ from typing import Annotated, Literal
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from warren.runtime.ecs_storage import OwnerStorage, parse_owner_storage
+from warren.runtime.userns import DEFAULT_PODMAN_USERNS, parse_podman_userns
 
 # Audit 2026-10-16 P2 #44: both secret_key and bootstrap_token are used as raw key
 # material (secret_key.encode() feeds auth/tokens.py's HMAC pepper derivation and
@@ -31,6 +32,9 @@ class WarrenSettings(BaseSettings):
         env_prefix="WARREN_",
         frozen=True,
         extra="ignore",
+        # A validation error must not echo a rejected value: several (secret key,
+        # bootstrap token, notify webhook URL) are credentials.
+        hide_input_in_errors=True,
     )
 
     secret_key: SecretStr
@@ -58,6 +62,12 @@ class WarrenSettings(BaseSettings):
             raise ValueError("WARREN_BEDROCK_GATEWAY_URL must be an https:// URL with no query or credentials")
         return v
 
+    @field_validator("podman_userns")
+    @classmethod
+    def _validate_podman_userns(cls, v: str) -> str:
+        parse_podman_userns(v)
+        return v.strip()
+
     @field_validator("bootstrap_token")
     @classmethod
     def _validate_bootstrap_token_entropy(cls, v: SecretStr | None) -> SecretStr | None:
@@ -72,6 +82,16 @@ class WarrenSettings(BaseSettings):
         return v
 
     podman_socket: Path = Path("/run/user/1000/podman/podman.sock")
+    # User namespace for rootless podman workspaces (podman only; the docker runtime is
+    # rootful and ignores it). The default `keep-id:uid=1000,gid=1000` (podman >= 4.3)
+    # maps the server's host user to container uid/gid 1000 -- `warren` in warren's
+    # images -- so the checkout and other bind mounts the server writes are owned by
+    # `warren` inside, and what `warren` writes is owned by the server user on the host.
+    # Container root is still an unprivileged subuid on the host. The entrypoint still
+    # starts as the image's USER (root for warren's images). "" or "host" turns it off:
+    # podman's default mapping, host user = container root (the behaviour before this
+    # setting existed). Other podman modes ("keep-id", "auto", "nomap") pass through.
+    podman_userns: str = DEFAULT_PODMAN_USERNS
     max_workspaces: int = 10
     # Issue #11: max_workspaces is a server-wide cap and doesn't stop one owner from
     # exhausting it for everyone. Checked against non-terminal workspaces with
@@ -130,6 +150,40 @@ class WarrenSettings(BaseSettings):
     # Audit #10: how long startup waits for warren.db.lock (a stopped Fargate task's
     # NFSv4 lock can outlive it until the lease expires). 0 fails fast.
     writer_lock_wait_s: float = Field(default=120.0, ge=0)
+    # Optional AWS state backends (warren/state/, resources/ecs/README.md "State
+    # backends"). Independent switches; SQLite stays the default for both. The writer
+    # lock is only taken while either one is still sqlite.
+    # WARREN_STATE_BACKEND: registry, launch attempts, EBS snapshots/seeds, operations,
+    # idle stops, users and tokens, headless runs. dynamodb needs WARREN_DYNAMODB_TABLE.
+    state_backend: Literal["sqlite", "dynamodb"] = "sqlite"
+    dynamodb_table: str = ""
+    # DynamoDB TTL backstops: how long an expired/revoked token's items, and an idle-stop
+    # marker, are kept before DynamoDB deletes them.
+    dynamodb_token_retention_days: float = Field(default=30.0, ge=0)
+    dynamodb_idle_stop_retention_days: float = Field(default=90.0, gt=0)
+    # WARREN_SECRETS_BACKEND: user secrets. secretsmanager stores one secret per
+    # (owner, name) at <prefix>/<owner>/<name> (default prefix warren/<server_id>),
+    # encrypted with WARREN_SECRETSMANAGER_KMS_KEY_ID when set (else aws/secretsmanager).
+    secrets_backend: Literal["sqlite", "secretsmanager"] = "sqlite"
+    secretsmanager_prefix: str = ""
+    secretsmanager_kms_key_id: str = ""
+    # Delete: a recovery window (7-30 days) by default; force-delete skips it.
+    secretsmanager_force_delete: bool = False
+    secretsmanager_recovery_window_days: int = Field(default=7, ge=7, le=30)
+    # In-memory cache of GetSecretValue at launch, per (owner, name, version stage).
+    secretsmanager_cache_ttl_s: float = Field(default=60.0, ge=0)
+
+    @model_validator(mode="after")
+    def _check_state_backends(self) -> "WarrenSettings":
+        if self.state_backend == "dynamodb" and not self.dynamodb_table:
+            raise ValueError("WARREN_STATE_BACKEND=dynamodb needs WARREN_DYNAMODB_TABLE")
+        prefix = self.secretsmanager_prefix
+        if prefix and not re.fullmatch(r"[A-Za-z0-9_+=.@-]+(/[A-Za-z0-9_+=.@-]+)*", prefix):
+            raise ValueError(
+                "WARREN_SECRETSMANAGER_PREFIX may only hold letters, digits and _+=.@- "
+                "in '/'-separated segments, with no leading or trailing '/'"
+            )
+        return self
     projects_dir: Path = Path.home() / ".warren" / "projects"
     server_id: str = Field(default_factory=socket.gethostname)
 
@@ -358,9 +412,52 @@ class WarrenSettings(BaseSettings):
     blocked_ttl_seconds: float = 4 * 3600.0
     hook_max_hold_seconds: float = 24 * 3600.0
 
+    # Agent notifications (warren.notify): a server-wide webhook every event goes to
+    # (operator-set, https only, never logged), plus per-owner webhooks registered
+    # through PUT /notifications/webhook. notify_enabled=False turns both off.
+    notify_enabled: bool = True
+    notify_webhook_url: SecretStr | None = None
+    notify_format: Literal["json", "slack"] = "json"
+    # Comma-separated event names for the server-wide webhook; empty means all.
+    notify_events: str = ""
+    notify_poll_interval: float = Field(default=30.0, gt=0)
+    notify_dedupe_seconds: float = Field(default=300.0, ge=0)
+    notify_timeout_seconds: float = Field(default=5.0, gt=0)
+    notify_max_retries: int = Field(default=3, ge=0, le=10)
+    notify_queue_size: int = Field(default=100, ge=1, le=10_000)
+
+    @field_validator("notify_webhook_url")
+    @classmethod
+    def _validate_notify_webhook_url(cls, v: SecretStr | None) -> SecretStr | None:
+        if v is None:
+            return None
+        from warren.notify.targets import validate_webhook_url  # noqa: PLC0415
+
+        raw = v.get_secret_value().strip()
+        if not raw:
+            return None
+        try:
+            return SecretStr(validate_webhook_url(raw))
+        except ValueError:
+            # Never echo the value: a webhook URL is a credential.
+            raise ValueError("WARREN_NOTIFY_WEBHOOK_URL must be an https:// URL with no credentials") from None
+
     # AH2: how long a destroyed single-turn workspace's events (ending in
     # workspace.completed) stay replayable via GET /workspaces/{id}/events?since=.
     single_turn_event_retention_seconds: float = 3600.0
+
+    # Headless runs (routes/runs.py, docs/runs.md): every single-turn workspace's result
+    # is kept in the registry after the workspace is destroyed, for this long and at most
+    # this many per owner (oldest finished runs go first).
+    run_retention_seconds: float = Field(default=30 * 86400.0, gt=0)
+    run_max_per_owner: int = Field(default=500, ge=1)
+    # A run still going after its timeout is destroyed and recorded as timed_out.
+    run_default_timeout_seconds: float = Field(default=3600.0, gt=0)
+    run_max_timeout_seconds: float = Field(default=86400.0, gt=0)
+    # EBS-backed ECS runs: how long the finished task waits for the control plane to read
+    # its result over ECS Exec, and how often the control plane looks (runtime/ecs_run_result.py).
+    run_result_hold_seconds: int = Field(default=300, ge=0, le=3600)
+    run_result_probe_seconds: float = Field(default=20.0, gt=0)
 
     # #59: bounds on POST /workspaces/{id}/exec (and the MCP exec_command tool).
     exec_max_output_bytes: int = Field(default=1_048_576, ge=1024)

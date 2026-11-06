@@ -20,13 +20,16 @@ from podman import PodmanClient
 from podman.errors import APIError, BuildError, ImageNotFound, NotFound
 from podman.errors.exceptions import PodmanError
 
+from warren.git.write_tokens import TOKEN_DIR, TOKEN_UID, encode_tokens
 from warren.images.build_spec import BuildSpec
+from warren.runtime.userns import DEFAULT_PODMAN_USERNS, parse_podman_userns
 from warren_common.errors import ImageUnavailable, RuntimeUnreachable
 from warren_common.agent_launch import SPEC_ENV as AGENT_SPEC_ENV
 from warren_common.harness_shell import seed_env, server_env, shell_first, workspace_shell
 from warren_common.models import template_env_for
 from warren_common.seed_prompt import app_command_with_seed
 from warren_common.runtime.base import ExecExit, WorkspaceHandle, WorkspaceSpec
+from warren_common.runtime.ports import app_port_bindings, loopback_publish_host, parse_published
 
 if TYPE_CHECKING:
     from warren.registry.events import WorkspaceEventBuffer
@@ -75,6 +78,26 @@ def _parse_memory_bytes(memory: str) -> int:
     if text and text[-1] in _MEMORY_SUFFIXES:
         return int(float(text[:-1]) * _MEMORY_SUFFIXES[text[-1]])
     return int(text)
+
+
+def _git_tokens_tar(tokens: dict[str, str]) -> bytes:
+    """git_write tokens as `warren-git/<owner>` (0600, TOKEN_UID) under a root-owned
+    0755 dir, for put_archive at /run. Validated by encode_tokens first."""
+    encode_tokens(tokens)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        top = tarfile.TarInfo(name=TOKEN_DIR.rsplit("/", 1)[1])
+        top.type = tarfile.DIRTYPE
+        top.mode = 0o755
+        tar.addfile(top)
+        for owner, token in sorted(tokens.items()):
+            payload = (token + "\n").encode()
+            info = tarfile.TarInfo(name=f"{top.name}/{owner}")
+            info.size = len(payload)
+            info.mode = 0o600
+            info.uid = info.gid = TOKEN_UID
+            tar.addfile(info, io.BytesIO(payload))
+    return buf.getvalue()
 
 
 def _authorized_keys_tar(pubkey_line: str) -> bytes:
@@ -135,8 +158,11 @@ class PodmanRuntime:
         client_timeout: float = _DEFAULT_CLIENT_TIMEOUT_SECONDS,
         egress_bridge_name: str = "warren-egress",
         ssh_publish_host: str = "127.0.0.1",
+        userns: str = DEFAULT_PODMAN_USERNS,
     ) -> None:
         self._socket_path = str(socket_path)
+        # WARREN_PODMAN_USERNS (warren.runtime.userns): None leaves podman's default.
+        self._userns = parse_podman_userns(userns)
         self._server_id = server_id
         self._client = PodmanClient(
             base_url=f"unix://{self._socket_path}", timeout=client_timeout
@@ -145,6 +171,9 @@ class PodmanRuntime:
         # app.py threads settings.egress_bridge_name through. "" = pasta default.
         self._egress_bridge_name = egress_bridge_name
         self._ssh_publish_host = ssh_publish_host
+        # Template-declared app ports always go on loopback, even if the SSH port
+        # was deliberately exposed wider (warren_common.runtime.ports).
+        self._app_publish_host = loopback_publish_host(ssh_publish_host)
 
     # --- ContainerRuntime Protocol surface ---
 
@@ -214,6 +243,8 @@ class PodmanRuntime:
         # AG2b: an agent workspace runs the supervisor next to that shell.
         if spec.agent is not None:
             env[AGENT_SPEC_ENV] = json.dumps(spec.agent, separators=(",", ":"))
+            # The loopback port the supervised harness (or its ACP endpoint) answers on.
+            env["WARREN_APP_PORT"] = str(spec.agent["port"])
             env["WARREN_APP"] = workspace_shell(spec.app)
             env["WARREN_SHELL_FIRST"] = "1"
         elif shell_first(spec.app, spec.mode):
@@ -230,6 +261,13 @@ class PodmanRuntime:
             remove=False,
             restart_policy={"Name": "no"},
         )
+        if self._userns is not None:
+            create_kwargs["userns_mode"] = {**self._userns}
+            # With keep-id and no explicit user, podman runs the container as the mapped
+            # uid (1000) rather than the image's USER. Pin the image's own user (root when
+            # it sets none) so the entrypoint starts as it did before; only the ownership
+            # of the bind mounts changes.
+            create_kwargs["user"] = await self._image_user(spec.image)
         # Publish the allocated SSH host port (D-05: fixed at provision time,
         # lives for the workspace's whole life). Only include the `ports`
         # kwarg when a port was actually allocated — never auto-assign an
@@ -248,10 +286,16 @@ class PodmanRuntime:
         # Bound to `ssh_publish_host` (loopback by default): rootless podman
         # keeps host loopback unreachable from containers, so other workspaces
         # can't reach this port via the host or the bridge gateway.
+        ports: dict[str, Any] = {}
         if ssh_port is not None and publish_ssh_port:
-            create_kwargs["ports"] = {
-                "22/tcp": (self._ssh_publish_host, ssh_port) if self._ssh_publish_host else ssh_port
-            }
+            ports["22/tcp"] = (self._ssh_publish_host, ssh_port) if self._ssh_publish_host else ssh_port
+        # Template-declared `ports`: each on host loopback, host port 0 = podman picks
+        # a free one at create time (`published_ports` reads it back). Same isolation
+        # argument as the SSH port above; never 0.0.0.0.
+        for key, host in app_port_bindings(spec.ports, self._app_publish_host, taken=set(ports)).items():
+            ports[key] = (host, 0)
+        if ports:
+            create_kwargs["ports"] = ports
 
         # D-04: rootless `pasta` has no veth pair and so no host-readable byte
         # counters (04-RESEARCH.md Pitfall 1), so every workspace is attached to
@@ -313,15 +357,77 @@ class PodmanRuntime:
         except (APIError, PodmanError, ConnectionError) as e:
             raise RuntimeUnreachable(str(e)) from e
 
-        return WorkspaceHandle(
+        handle = WorkspaceHandle(
             workspace_id=spec.workspace_id,
             runtime_id=container.id,
             root_path=spec.root_path,
         )
+        if spec.git_tokens:
+            # git_write: after start, so the files land in the running container's /run.
+            try:
+                await self.install_git_tokens(handle, spec.git_tokens)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("git_write_install_failed", workspace_id=spec.workspace_id, error=type(exc).__name__)
+                spec.git_tokens = {}  # not delivered: the registry revokes them
+        return handle
+
+    def git_write_problem(self) -> str:
+        return ""
+
+    async def _exec_checked(self, handle: WorkspaceHandle, argv: list[str]) -> None:
+        exit_code: int | None = None
+        async for item in self.exec_stream(handle, argv):
+            if isinstance(item, ExecExit):
+                exit_code = item.exit_code
+        if exit_code != 0:
+            raise RuntimeUnreachable(f"{argv[0]} exited {exit_code} in workspace {handle.workspace_id}")
+
+    async def install_git_tokens(self, handle: WorkspaceHandle, tokens: dict[str, str]) -> None:
+        """git_write tokens into /run/warren-git through put_archive: the tar goes over
+        the podman API socket, never into an exec command line or event record. A chown
+        follows (owner names only in argv) since podman may extract as root."""
+        data = _git_tokens_tar(tokens)
+        try:
+            container = await asyncio.to_thread(self._client.containers.get, handle.runtime_id)
+            await asyncio.to_thread(container.put_archive, path=TOKEN_DIR.rsplit("/", 1)[0] or "/", data=data)
+        except (APIError, PodmanError, ConnectionError, NotFound) as e:
+            raise RuntimeUnreachable(str(e)) from e
+        await self._exec_checked(
+            handle, ["chown", f"{TOKEN_UID}:{TOKEN_UID}", *[f"{TOKEN_DIR}/{o}" for o in sorted(tokens)]]
+        )
+
+    async def drop_git_tokens(self, handle: WorkspaceHandle) -> None:
+        await self._exec_checked(handle, ["rm", "-rf", TOKEN_DIR])
+
+    async def _image_user(self, image: str) -> str:
+        """The image's configured USER, or "0:0" when it sets none (podman's default)."""
+        try:
+            obj = await asyncio.to_thread(self._client.images.get, image)
+        except ImageNotFound as e:
+            raise ImageUnavailable(str(e)) from e
+        except (APIError, PodmanError, ConnectionError) as e:
+            raise RuntimeUnreachable(str(e)) from e
+        attrs = getattr(obj, "attrs", None)
+        config = attrs.get("Config") if isinstance(attrs, dict) else None
+        user = config.get("User") if isinstance(config, dict) else None
+        return user.strip() if isinstance(user, str) and user.strip() else "0:0"
 
     async def start(self, handle: WorkspaceHandle) -> None:
         container = await asyncio.to_thread(self._client.containers.get, handle.runtime_id)
         await asyncio.to_thread(container.start)
+
+    async def published_ports(self, handle: WorkspaceHandle) -> dict[int, tuple[str, int]]:
+        """``{container_port: (host_ip, host_port)}`` for the container's loopback-published
+        tcp ports, read from inspect (podman assigns a requested host port 0 at create)."""
+        if not handle.runtime_id:
+            return {}
+        try:
+            container = await asyncio.to_thread(self._client.containers.get, handle.runtime_id)
+        except NotFound:
+            return {}
+        except (APIError, PodmanError, ConnectionError) as e:
+            raise RuntimeUnreachable(str(e)) from e
+        return parse_published((container.attrs.get("NetworkSettings") or {}).get("Ports"))
 
     async def build_image(self, spec: BuildSpec) -> str:
         """Build a project-supplied Containerfile into `spec.tag` (LIFE-04, D-09).
