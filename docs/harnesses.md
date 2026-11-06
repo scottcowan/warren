@@ -140,7 +140,7 @@ next container start removes.
 
 ## What was checked, and how
 
-Checked on 2026-11-01 in a throwaway container (warren-ecs-dev-base 2.0.0, Debian
+Checked on 2026-11-01 in a throwaway container (warren-ecs-dev-base 1.3.0, Debian
 bookworm, glibc, linux/arm64), with `opencode-ai@1.19.5` and `@openai/codex@0.166.0`
 from npm, a fake model endpoint on loopback, and warren's generated `harness.sh`,
 `warren-harness-init`, `warren-state-hook` and `warren-agent-supervisor`:
