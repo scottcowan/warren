@@ -38,6 +38,22 @@ What it checks:
                   the block, or with conflicting blocks, fails this check (a warning in
                   the summary; the other checks still run). Without gpg on PATH the
                   check is reported as skipped.
+    opencode      ``ARG OPENCODE_VERSION`` and ``ARG OPENCODE_SHA256_{AMD64,ARM64}`` in the
+    codex         Dockerfiles (``ARG CODEX_*`` likewise) vs the latest stable GitHub release
+                  of anomalyco/opencode (tag ``vX.Y.Z``) and openai/codex (``rust-vX.Y.Z``).
+                  A bump rewrites the version and both sha256s, which come from the release
+                  API's ``digest`` for each arch's tarball (opencode-linux-{x64,arm64},
+                  codex-{x86_64,aarch64}-unknown-linux-musl); a release without them is
+                  skipped. A codex bump also warns to redo warren's codex profile checks
+                  (docs/harnesses.md: hook-trust hashes depend on codex's hook normalisation).
+    pi            ``@earendil-works/pi-coding-agent`` in images/*/pi/package.json and
+                  packages/warren-server/images/*/pi/package.json vs its npm ``latest``
+                  dist-tag. --write rewrites package.json and regenerates package-lock.json
+                  with ``npm install --package-lock-only --ignore-scripts`` in a Debian Node
+                  container (node:<the ECS dev-base's NODE_VERSION>-bookworm-slim), so no npm
+                  code runs on the host. Without docker the bump is reported as a warning
+                  with the command to run by hand (``pi_lock_command``). It also warns when a
+                  lockfile doesn't resolve the version its package.json pins.
 
 Warnings also print as GitHub Actions ``::warning::`` annotations when GITHUB_ACTIONS=true.
 
@@ -97,6 +113,48 @@ CLAUDE_PIN_PATTERNS = (
 _SSH_KEY = re.compile(r"(ssh-ed25519|ecdsa-sha2-nistp(256|384|521)|ssh-rsa) [A-Za-z0-9+/]+={0,2}")
 _PGP_BLOCK = re.compile(r"-----BEGIN PGP PUBLIC KEY BLOCK-----.*?-----END PGP PUBLIC KEY BLOCK-----", re.S)
 _DEFAULT_GPG = object()  # sentinel: look gpg up on PATH
+_DEFAULT_LOCK = object()  # sentinel: regenerate pi's lockfile with docker if it's on PATH
+_SHA256_DIGEST = re.compile(r"sha256:([0-9a-f]{64})")
+
+GITHUB_LATEST_RELEASE_URL = "https://api.github.com/repos/{repo}/releases/latest"
+
+
+@dataclass(frozen=True)
+class ReleaseBinary:
+    """A harness installed from a GitHub release tarball, pinned by Dockerfile ARGs.
+
+    ``ARG <arg>_VERSION=X.Y.Z`` plus ``ARG <arg>_SHA256_<ARCH>=<hex>`` for each key of
+    ``assets`` (the release asset that arch downloads). Upstream is the repo's latest
+    release (GitHub skips drafts and prereleases); its tag is ``tag_prefix`` + version and
+    the new sha256s are the assets' ``digest`` fields from the release API.
+    """
+    kind: str
+    repo: str
+    tag_prefix: str
+    arg: str
+    assets: "tuple[tuple[str, str], ...]"  # (ARCH suffix, asset name)
+    bump_warning: str = ""  # added to the summary's warnings when this pin is bumped
+
+
+RELEASE_BINARIES = (
+    ReleaseBinary("opencode", "anomalyco/opencode", "v", "OPENCODE",
+                  (("AMD64", "opencode-linux-x64.tar.gz"), ("ARM64", "opencode-linux-arm64.tar.gz"))),
+    ReleaseBinary("codex", "openai/codex", "rust-v", "CODEX",
+                  (("AMD64", "codex-x86_64-unknown-linux-musl.tar.gz"),
+                   ("ARM64", "codex-aarch64-unknown-linux-musl.tar.gz")),
+                  bump_warning="codex {old} -> {new}: warren's codex profile (hook-trust hashes, "
+                               "subcommands, config keys) was checked against {old}. Redo the codex "
+                               "checks in docs/harnesses.md before merging; if codex changed how it "
+                               "normalises hooks, warren's state hooks silently stop running."),
+)
+
+PI_PACKAGE = "@earendil-works/pi-coding-agent"  # was @mariozechner/pi-coding-agent (deprecated after 0.73.1)
+PI_DIST_TAGS_URL = f"https://registry.npmjs.org/-/package/{PI_PACKAGE}/dist-tags"
+PI_PACKAGE_GLOBS = ("images/*/pi/package.json", "packages/warren-server/images/*/pi/package.json")
+# The Node the lockfile is regenerated with: the ECS dev-base's (nodejs.org's tarball on Debian).
+PI_NODE_DOCKERFILE = Path("packages/warren-server/images/warren-ecs-dev-base/Dockerfile")
+PI_LOCK_ARGS = ("npm", "install", "--package-lock-only", "--ignore-scripts", "--omit=dev",
+                "--no-audit", "--no-fund")
 
 # fetch(url) -> (status, body). Injected in tests; never raises for HTTP errors.
 Fetcher = Callable[[str], "tuple[int, bytes]"]
@@ -125,7 +183,7 @@ class Pin:
 
 @dataclass
 class Change:
-    kind: str  # "claude-code" | "github-ssh" | "aws-cli-key"
+    kind: str  # "claude-code" | "github-ssh" | "aws-cli-key" | "opencode" | "codex" | "pi"
     path: Path
     old: str
     new: str
@@ -372,12 +430,207 @@ def bump_aws_cli_key(root: Path, fetch: Fetcher, write: bool, gpg=_DEFAULT_GPG,
     return changes, notes, warnings, expired
 
 
+def _version_arg(spec: ReleaseBinary) -> "re.Pattern[str]":
+    return re.compile(rf"^(ARG {spec.arg}_VERSION=){_SEMVER}[ \t]*$", re.M)
+
+
+def _sha_arg(spec: ReleaseBinary, arch: str) -> "re.Pattern[str]":
+    return re.compile(rf"^(ARG {spec.arg}_SHA256_{arch}=)([0-9a-f]{{64}})[ \t]*$", re.M)
+
+
+def find_release_pins(root: Path, spec: ReleaseBinary) -> list[Pin]:
+    pins: list[Pin] = []
+    for rel in dockerfiles(root):
+        text = (root / rel).read_text()
+        for m in _version_arg(spec).finditer(text):
+            pins.append(Pin(rel, text.count("\n", 0, m.start()) + 1, m.group(2)))
+    return pins
+
+
+def latest_github_release(fetch: Fetcher, spec: ReleaseBinary) -> "tuple[Optional[tuple[str, dict[str, str]]], str]":
+    """((version, {ARCH: sha256}), "") for the repo's latest release, or (None, why not)."""
+    url = GITHUB_LATEST_RELEASE_URL.format(repo=spec.repo)
+    status, body = fetch(url)
+    if status != 200:
+        return None, f"GET {url} returned {status}"
+    try:
+        release = json.loads(body)
+    except ValueError:
+        return None, f"GET {url} returned invalid JSON"
+    tag = release.get("tag_name") or ""
+    version = tag[len(spec.tag_prefix):] if tag.startswith(spec.tag_prefix) else ""
+    if not re.fullmatch(_SEMVER, version) or release.get("draft") or release.get("prerelease"):
+        return None, f"latest release {tag!r} is not a stable {spec.tag_prefix}X.Y.Z release"
+    digests = {a.get("name"): a.get("digest") or "" for a in release.get("assets", [])}
+    shas: dict[str, str] = {}
+    for arch, asset in spec.assets:
+        m = _SHA256_DIGEST.fullmatch(digests.get(asset, ""))
+        if not m:
+            return None, f"{tag} has no sha256 digest for {asset}"
+        shas[arch] = m.group(1)
+    return (version, shas), ""
+
+
+def bump_release_binary(root: Path, fetch: Fetcher, spec: ReleaseBinary,
+                        write: bool) -> "tuple[list[Change], list[str], list[str]]":
+    """Returns (changes, notes, warnings). A bump rewrites the version and every sha256 ARG."""
+    pins = find_release_pins(root, spec)
+    if not pins:
+        return [], [f"{spec.kind}: no pins found"], []
+    latest, why = latest_github_release(fetch, spec)
+    if latest is None:
+        return [], [f"{spec.kind}: {why}; skipped"], []
+    version, shas = latest
+    stale = [p for p in pins if parse_version(p.version) < parse_version(version)]
+    if not stale:
+        return [], [f"{spec.kind}: all {len(pins)} pins at or above {version}"], []
+
+    changes: list[Change] = []
+    warnings: list[str] = []
+    for rel in sorted({p.path for p in stale}):
+        text = (root / rel).read_text()
+        new_text = _version_arg(spec).sub(lambda m: m.group(1) + version, text)
+        missing = []
+        for arch, sha in shas.items():
+            new_text, n = _sha_arg(spec, arch).subn(lambda m, sha=sha: m.group(1) + sha, new_text)
+            if n != 1:
+                missing.append(f"ARG {spec.arg}_SHA256_{arch}")
+        if missing:
+            warnings.append(f"{spec.kind}: {rel.as_posix()} pins {spec.arg}_VERSION but has no single "
+                            f"{', '.join(missing)}; not bumped, update it by hand")
+            continue
+        if write:
+            (root / rel).write_text(new_text)
+        olds = sorted({p.version for p in stale if p.path == rel}, key=parse_version)
+        changes.append(Change(spec.kind, rel, ", ".join(olds), version))
+    if changes and spec.bump_warning:
+        oldest = min((p.version for p in stale), key=parse_version)
+        warnings.append(spec.bump_warning.format(old=oldest, new=version))
+    return changes, [], warnings
+
+
+# pi: the version is pinned in pi/package.json; the lockfile next to it pins the rest.
+# A bump rewrites package.json and regenerates package-lock.json in a Debian Node container
+# (the ECS dev-base's Node version), so nothing from npm runs on the host. By hand, from the
+# repo root, for each pi/ dir (see pi_lock_command):
+#   docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/<image dir>/pi:/w" -w /w -e HOME=/tmp \
+#     node:<NODE_VERSION>-bookworm-slim npm install --package-lock-only --ignore-scripts --omit=dev --no-audit --no-fund
+LockRunner = Callable[[Path, Path], None]  # (repo root, pi dir relative to it); raises on failure
+
+
+def find_pi_pins(root: Path) -> "tuple[list[Pin], list[str]]":
+    pins: list[Pin] = []
+    problems: list[str] = []
+    found: set[Path] = set()
+    for pattern in PI_PACKAGE_GLOBS:
+        found.update(p.relative_to(root) for p in root.glob(pattern))
+    for rel in sorted(found):
+        try:
+            version = json.loads((root / rel).read_text()).get("dependencies", {}).get(PI_PACKAGE, "")
+        except ValueError:
+            version = ""
+        if re.fullmatch(_SEMVER, version):
+            pins.append(Pin(rel, 0, version))
+        else:
+            problems.append(f"pi: {rel.as_posix()} doesn't pin {PI_PACKAGE} to an exact X.Y.Z")
+    return pins, problems
+
+
+def pi_lock_version(lock: Path) -> Optional[str]:
+    """The pi version a package-lock.json resolves, or None if unreadable."""
+    try:
+        packages = json.loads(lock.read_text()).get("packages", {})
+    except (OSError, ValueError):
+        return None
+    return packages.get(f"node_modules/{PI_PACKAGE}", {}).get("version")
+
+
+def pi_node_image(root: Path) -> str:
+    text = (root / PI_NODE_DOCKERFILE).read_text() if (root / PI_NODE_DOCKERFILE).exists() else ""
+    m = re.search(rf"^ARG NODE_VERSION={_SEMVER}[ \t]*$", text, re.M)
+    return f"node:{m.group(1)}-bookworm-slim" if m else "node:lts-bookworm-slim"
+
+
+def pi_lock_command(root: Path, pi_dir: Path, mount: Optional[str] = None) -> list[str]:
+    """docker run that regenerates pi_dir's package-lock.json (``mount`` overrides the host path)."""
+    user = f"{os.getuid()}:{os.getgid()}" if hasattr(os, "getuid") else "0:0"
+    return ["docker", "run", "--rm", "--user", user, "-v", f"{mount or (root / pi_dir).resolve()}:/w",
+            "-w", "/w", "-e", "HOME=/tmp", pi_node_image(root), *PI_LOCK_ARGS]
+
+
+def pi_manual_command(root: Path, pi_dir: Path) -> str:
+    cmd = pi_lock_command(root, pi_dir, mount=f"$PWD/{pi_dir.as_posix()}")
+    cmd[cmd.index("--user") + 1] = "$(id -u):$(id -g)"
+    return " ".join(f'"{c}"' if "$" in c else c for c in cmd)
+
+
+def docker_lock_runner(root: Path, pi_dir: Path) -> None:
+    subprocess.run(pi_lock_command(root, pi_dir), check=True, timeout=900, capture_output=True)
+
+
+def bump_pi(root: Path, fetch: Fetcher, write: bool,
+            lock=_DEFAULT_LOCK) -> "tuple[list[Change], list[str], list[str]]":
+    """Returns (changes, notes, warnings). ``lock`` regenerates a lockfile; None = can't."""
+    pins, warnings = find_pi_pins(root)
+    if not pins:
+        return [], ["pi: no pins found"], warnings
+    for p in pins:
+        locked = pi_lock_version(root / p.path.parent / "package-lock.json")
+        if locked != p.version:
+            warnings.append(f"pi: {p.path.parent.as_posix()}/package-lock.json resolves {locked} but package.json "
+                            f"pins {p.version}; regenerate it: {pi_manual_command(root, p.path.parent)}")
+    status, body = fetch(PI_DIST_TAGS_URL)
+    try:
+        latest = json.loads(body).get("latest") if status == 200 else None
+    except ValueError:
+        latest = None
+    if not latest or not re.fullmatch(_SEMVER, latest):
+        return [], [f"pi: could not read the npm dist-tag 'latest' for {PI_PACKAGE}; skipped"], warnings
+    stale = [p for p in pins if parse_version(p.version) < parse_version(latest)]
+    if not stale:
+        return [], [f"pi: all {len(pins)} pins at or above {latest}"], warnings
+    if lock is _DEFAULT_LOCK:
+        lock = docker_lock_runner if shutil.which("docker") else None
+
+    changes: list[Change] = []
+    notes: list[str] = []
+    for p in stale:
+        pkg, lockfile = root / p.path, root / p.path.parent / "package-lock.json"
+        lock_rel = p.path.parent / "package-lock.json"
+        if not write:
+            changes.append(Change("pi", p.path, p.version, latest))
+            continue
+        if lock is None:
+            warnings.append(f"pi {p.version} -> {latest} in {p.path.as_posix()}: not bumped, docker isn't available "
+                            f"to regenerate the lockfile. Edit package.json, then run: "
+                            f"{pi_manual_command(root, p.path.parent)}")
+            continue
+        old_pkg, old_lock = pkg.read_text(), lockfile.read_text() if lockfile.exists() else None
+        pkg.write_text(re.sub(rf'("{re.escape(PI_PACKAGE)}"\s*:\s*")' + _SEMVER + '"',
+                              lambda m: m.group(1) + latest + '"', old_pkg))
+        try:
+            lock(root, p.path.parent)
+            got = pi_lock_version(lockfile)
+            if got != latest:
+                raise RuntimeError(f"the regenerated lockfile resolves {got}")
+        except Exception as exc:  # noqa: BLE001 -- any failure restores the files and reports it
+            pkg.write_text(old_pkg)
+            if old_lock is not None:
+                lockfile.write_text(old_lock)
+            warnings.append(f"pi {p.version} -> {latest} in {p.path.as_posix()}: lockfile regeneration failed "
+                            f"({exc}); not bumped. By hand: {pi_manual_command(root, p.path.parent)}")
+            continue
+        changes.append(Change("pi", p.path, p.version, latest))
+        changes.append(Change("pi", lock_rel, f"resolves {p.version}", f"regenerated for {latest}"))
+    return changes, notes, warnings
+
+
 def smoke_workflows_for(root: Path, changed: list[Path]) -> list[str]:
-    """Smoke workflows whose path filters cover a changed file's image directory."""
+    """Smoke workflows whose path filters cover a changed file's directory or any parent of it."""
     out: list[str] = []
     for wf in sorted((root / WORKFLOWS_DIR).glob("*-smoke.yml")):
         text = wf.read_text()
-        if any(f"{c.parent.as_posix()}/**" in text for c in changed):
+        if any(f"{d.as_posix()}/**" in text for c in changed for d in c.parents if d != Path(".")):
             out.append(wf.name)
     return out
 
@@ -416,7 +669,7 @@ def github_annotation(message: str) -> str:
 
 
 def main(argv: Optional[list[str]] = None, fetch: Fetcher = http_fetch, root: Path = REPO_ROOT,
-         gpg=_DEFAULT_GPG, today: Optional[dt.date] = None) -> int:
+         gpg=_DEFAULT_GPG, today: Optional[dt.date] = None, lock=_DEFAULT_LOCK) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--write", action="store_true", help="rewrite pins in place")
     ap.add_argument("--channel", default="stable", help="npm dist-tag for Claude Code (default: stable)")
@@ -433,6 +686,15 @@ def main(argv: Optional[list[str]] = None, fetch: Fetcher = http_fetch, root: Pa
     aws_changes, aws_notes, warnings, expired = bump_aws_cli_key(root, fetch, args.write, gpg=gpg, today=today)
     changes += aws_changes
     notes += aws_notes
+    for spec in RELEASE_BINARIES:
+        bin_changes, bin_notes, bin_warnings = bump_release_binary(root, fetch, spec, args.write)
+        changes += bin_changes
+        notes += bin_notes
+        warnings += bin_warnings
+    pi_changes, pi_notes, pi_warnings = bump_pi(root, fetch, args.write, lock=lock)
+    changes += pi_changes
+    notes += pi_notes
+    warnings += pi_warnings
 
     summary = render_summary(changes, notes, warnings)
     print(summary)
