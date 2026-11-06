@@ -245,6 +245,23 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
         )
     app.state.reaper_task = None
 
+    app.state.notifier = None
+    app.state.notify_watcher_task = None
+    if settings.notify_enabled:
+        try:
+            from warren.notify import build_notifier  # noqa: PLC0415
+            from warren.notify.watcher import run_agent_state_watcher  # noqa: PLC0415
+
+            notifier = build_notifier(settings, db)
+            notifier.start()
+            app.state.notifier = notifier
+            registry.notifier = notifier
+            app.state.notify_watcher_task = asyncio.create_task(
+                run_agent_state_watcher(registry, notifier, poll_interval=settings.notify_poll_interval)
+            )
+        except Exception:
+            log.exception("notify_spawn_failed")
+
     if os.environ.get("WARREN_REAPER_ENABLED", "1") != "0":
         try:
             app.state.reaper_task = asyncio.create_task(run_reaper(registry))
@@ -462,6 +479,21 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
                 pass
             except Exception:
                 log.exception("rate_limiter_pruner_shutdown_error")
+        notify_task = getattr(app.state, "notify_watcher_task", None)
+        if notify_task is not None:
+            notify_task.cancel()
+            try:
+                await notify_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                log.exception("notify_watcher_shutdown_error")
+        notifier = getattr(app.state, "notifier", None)
+        if notifier is not None:
+            try:
+                await notifier.stop()
+            except Exception:
+                log.exception("notify_shutdown_error")
         await db.close()
 
 
@@ -488,6 +520,8 @@ from warren.routes import workspace_tokens as workspace_tokens_routes  # noqa: E
 app.include_router(workspace_tokens_routes.router)
 from warren.routes import git_credentials as git_credentials_routes  # noqa: E402
 app.include_router(git_credentials_routes.router)
+from warren.routes import notifications as notifications_routes  # noqa: E402
+app.include_router(notifications_routes.router)
 # AI8: the control-plane MCP endpoint (streamable HTTP). A plain Route, not a Mount, so
 # scope["app"] stays this app and AuthMiddleware's scope state reaches the tools.
 from starlette.routing import Route  # noqa: E402

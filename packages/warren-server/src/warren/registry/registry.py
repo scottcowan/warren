@@ -331,6 +331,8 @@ class WorkspaceRegistry:
         self.git_manager = git_manager
         from warren.registry.events import WorkspaceEventStore
         self.event_store = event_store or WorkspaceEventStore()
+        # warren.notify.Notifier, set by the app lifespan when notifications are on.
+        self.notifier: Any = None
         # LIFE-XX: per-workspace serialization for lifecycle transitions
         # (provision/destroy/stop/ensure_running). Without this, e.g. a
         # destroy() racing an in-flight _do_provision() for the same
@@ -925,12 +927,21 @@ class WorkspaceRegistry:
                     workspace_id=workspace_id,
                     reason=exc.reason,
                 )
+                await self._notify_provision_failed(workspace_id, exc.reason)
             except Exception:
                 await self.store.update_status(workspace_id, "failed")
                 log.exception(
                     "provision_unexpected_error",
                     workspace_id=workspace_id,
                 )
+                await self._notify_provision_failed(workspace_id, "unexpected_error")
+
+    async def _notify_provision_failed(self, workspace_id: str, reason: str) -> None:
+        from warren import notify  # noqa: PLC0415
+
+        await notify.notify_workspace_id(
+            self, notify.PROVISION_FAILED, workspace_id, notify.provision_failed_message(reason)
+        )
 
     async def list_non_terminal(self) -> list[_WorkspaceRow]:
         """Return non-terminal workspaces as rows carrying a WorkspaceHandle.

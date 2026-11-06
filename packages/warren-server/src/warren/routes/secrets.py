@@ -58,6 +58,14 @@ class SecretRotateRequest(BaseModel):
 
 
 def _validate_secret_write(name: str, value: str) -> None:
+    from warren.notify.store import RESERVED_PREFIX  # noqa: PLC0415
+
+    if name.startswith(RESERVED_PREFIX):
+        # Written only through /notifications/webhook, which validates the URL.
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "reserved_secret_name", "detail": f"names starting {RESERVED_PREFIX!r} are reserved"},
+        )
     if not _SAFE_NAME_RE.match(name):
         raise HTTPException(
             status_code=400,

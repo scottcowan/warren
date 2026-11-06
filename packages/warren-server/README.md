@@ -179,6 +179,7 @@ applies to the podman runtime. The docker runtime is rootful and ignores it.
 | `POST` | `/admin/users` | Create a user + mint its first token (admin-only) |
 | `GET` | `/healthz` | Runtime/workspace/secret-store health — always 200 |
 | `GET` | `/peers` | Peer discovery (stub) |
+| `PUT`/`GET`/`DELETE` | `/notifications/webhook` | Your own notification webhook ([docs/notifications.md](../../docs/notifications.md)) |
 
 Workspace routes are owner-scoped: a non-admin can only see/act on workspaces they created.
 
@@ -227,6 +228,7 @@ All settings are `WARREN_*` environment variables, loaded by `src/warren/config.
 - `WARREN_DATA_DIR` — SQLite registry + auth DB location
 - `WARREN_MAX_WORKSPACES` — concurrency cap
 - `WARREN_IDLE_TTL_SECONDS` / `WARREN_IDLE_REAPER_ENABLED` — idle-workspace reaping
+- `WARREN_NOTIFY_WEBHOOK_URL` / `WARREN_NOTIFY_FORMAT` (`json`|`slack`) — webhook on agent waiting/finished/failed, idle stop and provision failure; see [docs/notifications.md](../../docs/notifications.md)
 - `WARREN_ECS_*`, `WARREN_EFS_ID`, `WARREN_AWS_REGION` — only consulted when `runtime_type=ecs`
 
 Full list and defaults in `src/warren/config.py`.
