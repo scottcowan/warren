@@ -21,11 +21,14 @@ start, and runs `_warren_on_connect` when WARREN_CONNECT=1.
 from __future__ import annotations
 
 import importlib.resources
+import json
 import shlex
 from collections.abc import Iterable
 
 from warren_common import agent_state
 from warren_common.harness import (
+    CODEX_BASE_CONFIG,
+    OPENCODE_BASE_CONFIG,
     PROFILES,
     SERVER_HARNESS_ROOT,
     SESSION_DIR,
@@ -184,7 +187,10 @@ def _exec_case(p: HarnessProfile) -> str:
         lines.append(f"      _warren_inpath {_q(first)} && _b={_q(first)}")
     else:
         lines.append(f"      _b={_q(p.command[0])}")
-    env = [f'{var}="{_join(f"$WARREN_HARNESS_ROOT/{p.name}", rel)}"' for var, rel in p.config_env.items()]
+    env = [
+        f'{var}="{_join(f"$WARREN_HARNESS_ROOT/{p.name}", rel)}"'
+        for var, rel in (*p.config_env.items(), *p.process_env.items())
+    ]
     env += [f"{k}={_q(v)}" for k, v in p.env.items()]
     if p.state_hook is not None:
         env.append(f'WARREN_STATE_DIR="$WARREN_HARNESS_ROOT/{SESSION_DIR}"')
@@ -232,12 +238,25 @@ def render() -> str:
     )
 
 
+# Init-script functions writing a profile's `dynamic_config` files ($1 is the harness dir).
+# The trailing "x" keeps command substitution from eating the file's final newline.
+_DYNAMIC_SHELL = {
+    "codex": {"config.toml": '"$(_codex_config "$1/hooks.json"; printf x)"'},
+    "opencode": {"config/opencode.json": '"$(_opencode_config; printf x)"'},
+}
+
+
 def _generate_case(p: HarnessProfile) -> str:
     lines = [f"    {p.name})"]
+    dynamic = _DYNAMIC_SHELL.get(p.name, {}) if p.dynamic_config is not None else {}
+    assert p.dynamic_config is None or dynamic, f"{p.name}: dynamic_config has no shell twin"
     for rel, text in p.generated.items():
         persisted = {e.rstrip("/") for e in p.persist}
         assert rel.split("/")[0] not in persisted, f"{p.name}: generated {rel} is under a persist path"
-        if p.onboarding_version and p.onboarding_version[0] == rel:
+        if rel in dynamic:
+            lines.append(f"      _c={dynamic[rel]}")
+            lines.append(f'      _write "$1/{rel}" "${{_c%x}}"')
+        elif p.onboarding_version and p.onboarding_version[0] == rel:
             body = text.rstrip()
             assert body.endswith("}")
             key = p.onboarding_version[1]
@@ -272,7 +291,18 @@ def render_init() -> str:
         .replace("@CREDS@", creds)
         .replace("@GENERATE_CASES@", "\n".join(_generate_case(p) for p in profiles if p.generated or p.state_hook))
         .replace("@SESSION_DIR@", SESSION_DIR)
+        .replace("@OPENCODE_BASE@", json.dumps(OPENCODE_BASE_CONFIG)[:-1])
+        .replace("@CODEX_BASE@", CODEX_BASE_CONFIG)
+        .replace("@CODEX_TRUST@", _codex_trust_shell())
     )
+
+
+def _codex_trust_shell() -> str:
+    """codex_hook_trust's entries, with the hooks.json path left to the init script."""
+    marker = "/@HOOKS@"
+    text = agent_state.codex_hook_trust(marker)
+    assert "'" not in text and "%" not in text
+    return "  printf '%s' " + _q(text).replace(marker, "'\"$1\"'")
 
 
 def asset_text(name: str = ASSET_NAME) -> str:
@@ -622,6 +652,68 @@ _write() {
   mkdir -p "${1%/*}" || return 1
   _t=$(mktemp "${1%/*}/.warren.XXXXXX") || return 1
   printf '%s' "$2" > "$_t" && chmod 600 "$_t" && mv -f -- "$_t" "$1"
+}
+
+# Model access from the workspace env, as warren_common.harness.opencode_config /
+# codex_config do it (a test keeps them equal). Values outside the allowed characters
+# are dropped, never escaped.
+_truthy() {
+  case "$1" in ''|0|[Ff][Aa][Ll][Ss][Ee]|[Nn][Oo]) return 1 ;; esac
+  return 0
+}
+
+# <value> <max length> <allowed characters>
+_ok() {
+  case "$1" in ''|*[!$3]*) return 1 ;; esac
+  [ "${#1}" -le "$2" ] || return 1
+  printf '%s' "$1"
+}
+
+_url() {
+  case "$1" in
+    http://*) _ok "${1#http://}" 512 'A-Za-z0-9._~:/%+-' >/dev/null || return 1 ;;
+    https://*) _ok "${1#https://}" 512 'A-Za-z0-9._~:/%+-' >/dev/null || return 1 ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$1"
+}
+
+_opencode_config() {
+  _c='@OPENCODE_BASE@'
+  _gw=$(_url "${ANTHROPIC_BEDROCK_BASE_URL:-}") || _gw=
+  if _truthy "${CLAUDE_CODE_USE_BEDROCK:-}" || [ -n "$_gw" ]; then
+    _c="$_c, \"enabled_providers\": [\"amazon-bedrock\"]"
+    _m=$(_ok "${ANTHROPIC_MODEL:-}" 200 'A-Za-z0-9._:/-') && _c="$_c, \"model\": \"amazon-bedrock/$_m\""
+    _m=$(_ok "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}" 200 'A-Za-z0-9._:/-') && _c="$_c, \"small_model\": \"amazon-bedrock/$_m\""
+    _o=
+    _r=$(_ok "${AWS_REGION:-}" 32 'a-z0-9-') && _o="\"region\": \"$_r\""
+    if [ -n "$_gw" ]; then
+      _o="${_o:+$_o, }\"endpoint\": \"$_gw\""
+      _truthy "${CLAUDE_CODE_SKIP_BEDROCK_AUTH:-}" && _o="$_o, \"apiKey\": \"{env:ANTHROPIC_AUTH_TOKEN}\""
+    fi
+    [ -z "$_o" ] || _c="$_c, \"provider\": {\"amazon-bedrock\": {\"options\": {$_o}}}"
+  fi
+  printf '%s}' "$_c"
+}
+
+# <hooks.json path>
+_codex_config() {
+  if _truthy "${CLAUDE_CODE_USE_BEDROCK:-}" && [ -z "${ANTHROPIC_BEDROCK_BASE_URL:-}" ]; then
+    printf 'model_provider = "amazon-bedrock"\n'
+    printf '%s' '@CODEX_BASE@'
+    _r=$(_ok "${AWS_REGION:-}" 32 'a-z0-9-') && printf '\n[model_providers.amazon-bedrock.aws]\nregion = "%s"\n' "$_r"
+  else
+    printf '%s' '@CODEX_BASE@'
+  fi
+  case "$1" in
+    /*) ;;
+    *) return 0 ;;
+  esac
+  case "$1" in
+    *[\"\\]*|*'
+'*) return 0 ;;
+  esac
+@CODEX_TRUST@
 }
 
 _generate() {

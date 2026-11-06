@@ -168,6 +168,29 @@ async def test_provision_harness_app_starts_at_the_warren_shell():
 
 
 @pytest.mark.asyncio
+async def test_provision_server_mode_agent_runs_under_the_supervisor():
+    """`agent.mode: serve`: entrypoint.py starts the supervisor, which runs
+    `opencode serve` on agent.port; WARREN_APP_PORT names the port."""
+    import json
+
+    from warren_common.agent_launch import launch_spec
+    from warren_common.models import AgentConfig
+
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.create.return_value = MagicMock(id="ctr-abc")
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        spec = _spec()
+        spec.harnesses = ["opencode"]
+        spec.agent = launch_spec("opencode", AgentConfig(mode="serve", port=4096))
+        await runtime.provision(spec)
+        env = client.containers.create.call_args.kwargs["environment"]
+        assert json.loads(env["WARREN_AGENT_SPEC"])["argv"][:2] == ["opencode", "serve"]
+        assert env["WARREN_APP_PORT"] == "4096"
+        assert env["WARREN_SHELL_FIRST"] == "1"
+
+
+@pytest.mark.asyncio
 async def test_provision_defaults_warren_app_to_bash():
     with patch("warren.runtime.podman.PodmanClient") as ClientCls:
         client = ClientCls.return_value
