@@ -63,6 +63,14 @@ def test_template_selects_a_mode():
     check_agent_template(cfg)
 
 
+# The init script and warren shell are POSIX sh, the supervisor uses process groups,
+# and codex's hook trust key is the POSIX path warren writes: Windows runs these under
+# WSL, not natively (the warren-cli windows job runs warren-common's suite natively).
+_POSIX_SH = pytest.mark.skipif(sys.platform == "win32", reason="POSIX sh scripts")
+_POSIX_PROCS = pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+_POSIX_PATHS = pytest.mark.skipif(sys.platform == "win32", reason="POSIX workspace paths")
+
+
 @pytest.mark.parametrize(
     "harness, agent, match",
     [
@@ -143,6 +151,7 @@ def _run_init(root: Path, harnesses: str, env: dict | None = None) -> None:
     assert r.returncode == 0, r.stderr
 
 
+@_POSIX_SH
 def test_init_keeps_opencode_and_codex_history_and_drops_credentials(tmp_path):
     root = tmp_path / "harness"
     oc = root / "opencode"
@@ -243,6 +252,7 @@ def test_codex_hook_trust_matches_codex_hashes():
         assert agent_state.codex_hook_trust(path) == ""
 
 
+@_POSIX_SH
 @pytest.mark.parametrize(
     "env",
     [
@@ -262,6 +272,7 @@ def test_init_script_generates_the_same_config_as_python(tmp_path, env):
     assert (root / "codex" / "config.toml").read_text() == codex_config(f"{root}/codex/hooks.json", env)
 
 
+@_POSIX_PATHS
 def test_local_prepare_writes_model_config_and_trust_for_its_own_path(tmp_path):
     root = tmp_path / "ws" / "harness"
     prepare_harness_dirs(["opencode", "codex"], root, home=tmp_path / "home", env=GATEWAY_ENV)
@@ -278,6 +289,7 @@ def test_local_prepare_writes_model_config_and_trust_for_its_own_path(tmp_path):
 # --- the warren shell runs opencode with its process-only env ---
 
 
+@_POSIX_SH
 def test_shell_runs_opencode_with_xdg_dirs_but_never_exports_them(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -308,6 +320,7 @@ def _serving_child(port: int) -> list[str]:
     return [sys.executable, "-c", code]
 
 
+@_POSIX_PROCS
 @pytest.mark.asyncio
 async def test_self_serving_mode_is_supervised_not_proxied(tmp_path):
     from test_agent_supervisor import free_port  # noqa: PLC0415
@@ -343,6 +356,7 @@ async def test_self_serving_mode_is_supervised_not_proxied(tmp_path):
     assert "agent.self_serving" in names and "acp.listening" not in names
 
 
+@_POSIX_PROCS
 @pytest.mark.asyncio
 async def test_self_serving_mode_still_rejects_a_wide_listener(tmp_path):
     from test_agent_supervisor import free_port  # noqa: PLC0415
