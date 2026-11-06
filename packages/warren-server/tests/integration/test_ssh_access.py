@@ -222,3 +222,59 @@ async def test_ssh_access_end_to_end(
         )
 
         # Let itest_env's teardown remove the container; no competing cleanup here.
+
+
+async def test_ssh_access_with_the_shipped_docker_ssh_base_image(
+    itest_env: dict[str, object],
+    itest_docker_ssh_base_image: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same server path against images/warren-docker-ssh-base, the image editors use
+    with `warren ssh-config`: the server publishes its port 22 on loopback, the minted key
+    logs in both users with a plain shell (this image has no ACP ForceCommand), root and
+    passwords are refused, and stopping the workspace invalidates the key (D-03)."""
+    if shutil.which("ssh") is None:
+        pytest.skip("ssh (openssh-client) not installed on this host")
+
+    projects_dir = tmp_path / "projects"
+    _write_project_yaml(projects_dir, itest_docker_ssh_base_image)
+    monkeypatch.setenv("WARREN_PROJECTS_DIR", str(projects_dir))
+    monkeypatch.setenv("WARREN_SSH_ACCESS_ENABLED", "true")
+
+    from warren.app import app, lifespan
+
+    auth_headers = {"Authorization": "Bearer itest-bootstrap-token00000000000"}
+    async with lifespan(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test", headers=auth_headers
+    ) as client:
+        workspace_id = await _provision_and_wait(client)
+        connect_response = await client.post(f"/workspaces/{workspace_id}/connect")
+        assert connect_response.status_code == 200, connect_response.text
+        payload = connect_response.json()
+        keyfile = tmp_path / "id_ed25519"
+        keyfile.write_text(payload["private_key"])
+        keyfile.chmod(0o600)
+        port = payload["port"]
+
+        for user in (payload["break_glass_user"], payload["user"]):
+            result = await _run_ssh_with_retry(_ssh_argv(keyfile, port, user, "id -un"))
+            assert result.returncode == 0, f"{user}: stdout={result.stdout!r} stderr={result.stderr!r}"
+            assert result.stdout.strip() == user
+
+        root_result = await _run_ssh_with_retry(_ssh_argv(keyfile, port, "root", "true"))
+        assert root_result.returncode != 0 and "Permission denied" in root_result.stderr
+        password_argv = ["ssh", "-o", "PubkeyAuthentication=no", "-p", str(port), *_SSH_COMMON_OPTS,
+                         "warren-shell@127.0.0.1", "true"]
+        password_result = await _run_ssh_with_retry(password_argv)
+        assert "Permission denied (publickey)" in password_result.stderr
+
+        from warren_common.runtime.base import WorkspaceHandle
+
+        stored_ws = await app.state.registry.store.get(workspace_id)
+        assert stored_ws is not None and stored_ws.container_id
+        await app.state.registry.runtime.stop(
+            WorkspaceHandle(workspace_id=workspace_id, runtime_id=stored_ws.container_id, root_path=stored_ws.root_path)
+        )
+        post_stop = await _run_ssh_with_retry(_ssh_argv(keyfile, port, "warren-shell", "true"))
+        assert post_stop.returncode != 0

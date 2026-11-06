@@ -430,6 +430,13 @@ class TestRealRepo(unittest.TestCase):
         keys = bump_pins.parse_known_hosts((bump_pins.REPO_ROOT / bump_pins.KNOWN_HOSTS).read_text())
         self.assertEqual({k.split()[0] for k in keys}, {"ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa"})
 
+    def test_dev_base_bump_dispatches_the_ssh_base_smoke_too(self):
+        # warren-ecs-ssh-base builds FROM dev-base, so a dev-base pin bump is smoke-tested there too.
+        changed = [Path("packages/warren-server/images/warren-ecs-dev-base/Dockerfile")]
+        smoke = bump_pins.smoke_workflows_for(bump_pins.REPO_ROOT, changed)
+        self.assertIn("warren-ecs-dev-base-smoke.yml", smoke)
+        self.assertIn("warren-ecs-ssh-base-smoke.yml", smoke)
+
 
 if __name__ == "__main__":
     unittest.main()

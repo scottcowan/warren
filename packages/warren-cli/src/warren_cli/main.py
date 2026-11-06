@@ -42,6 +42,7 @@ from .commands.doctor import doctor as _doctor
 from .commands.proxy import proxy_app
 from .commands.remote import remote_app
 from .commands.run import run_app
+from .commands.ssh import ssh_config as _ssh_config
 from .config import (
     WarrenCLIConfig,
     ServerProfile,
@@ -117,6 +118,7 @@ app.add_typer(remote_app, name="remote")
 app.add_typer(proxy_app, name="proxy")
 app.add_typer(run_app, name="run")
 app.command(name="doctor")(_doctor)
+app.command(name="ssh-config")(_ssh_config)
 
 # Workspaces are what this CLI is for, so workspace commands (new/destroy/connect/list/
 # status/exec/tunnel) live at the top level rather than behind a `workspaces` subcommand —

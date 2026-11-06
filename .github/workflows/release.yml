@@ -81,6 +81,17 @@ jobs:
     with:
       tag: ${{ fromJSON(needs.tag.outputs.released)['warren-docker-dev-base'] }}
 
+  # FROMs a published warren-docker-dev-base by digest, so it doesn't wait on this run's.
+  warren-docker-ssh-base:
+    needs: tag
+    if: fromJSON(needs.tag.outputs.released)['warren-docker-ssh-base']
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/warren-docker-ssh-base-image.yml
+    with:
+      tag: ${{ fromJSON(needs.tag.outputs.released)['warren-docker-ssh-base'] }}
+
   warren-ecs-base:
     needs: tag
     if: fromJSON(needs.tag.outputs.released)['warren-ecs-base']
@@ -103,6 +114,18 @@ jobs:
     uses: ./.github/workflows/warren-ecs-dev-base-image.yml
     with:
       tag: ${{ fromJSON(needs.tag.outputs.released)['warren-ecs-dev-base'] }}
+
+  # After warren-ecs-dev-base, for the same reason: ssh-base builds FROM the dev-base
+  # release named in its Dockerfile (WARREN_ECS_DEV_BASE).
+  warren-ecs-ssh-base:
+    needs: [tag, warren-ecs-dev-base]
+    if: ${{ !cancelled() && needs.tag.result == 'success' && needs.warren-ecs-dev-base.result != 'failure' && fromJSON(needs.tag.outputs.released)['warren-ecs-ssh-base'] }}
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/warren-ecs-ssh-base-image.yml
+    with:
+      tag: ${{ fromJSON(needs.tag.outputs.released)['warren-ecs-ssh-base'] }}
 
   release-pr:
     needs: tag
