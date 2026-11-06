@@ -3,12 +3,12 @@
 # ../workspace-base, which targets Docker instead — see that Containerfile's own header).
 # Published as ghcr.io/scottcowan/warren-ecs-base.
 #
-# Debian bookworm-slim (glibc) since 2.0.0; 1.x was Alpine (musl). Prebuilt PyPI
+# Debian bookworm-slim (glibc) since 1.5.0; 1.4 and earlier were Alpine (musl). Prebuilt PyPI
 # manylinux wheels, prebuilt npm native addons and glibc-only tools (T3 Code,
 # Playwright/Chrome) run here as published; on musl they don't, or need compiling.
-# Images built FROM this one install packages with apt, not apk. The 1.x Alpine
+# Images built FROM this one install packages with apt, not apk. The 1.4 Alpine
 # Dockerfile is in git history and its images stay on GHCR. The paths, modes, user and
-# USER/WORKDIR/ENTRYPOINT are the same as 1.x.
+# USER/WORKDIR/ENTRYPOINT are the same as 1.4.
 #
 # No sshd, no SSH host keys, no authorized_keys injection: ECS Exec
 # (enableExecuteCommand=True, src/warren/runtime/ecs.py) gives interactive access over SSM
@@ -73,16 +73,16 @@ RUN apt-get update \
         ca-certificates git openssh-client bash zsh tmux \
     && rm -rf /var/lib/apt/lists/* \
     # Debian's zsh runs zsh-newuser-install (an interactive menu) for a user with no
-    # ~/.zshrc (1.x's Alpine zsh didn't), and the workspace's home has none, so remove it.
+    # ~/.zshrc (1.4's Alpine zsh didn't), and the workspace's home has none, so remove it.
     && rm -f /usr/share/zsh/*/scripts/newuser
 
-# su-exec at the 1.x (Alpine) path. Debian's /sbin is a symlink to /usr/sbin (merged /usr), so
+# su-exec at the 1.4 (Alpine) path. Debian's /sbin is a symlink to /usr/sbin (merged /usr), so
 # /sbin/su-exec, which entrypoint.sh, warren-session and git-init call, resolves here.
 COPY --from=su-exec --chown=0:0 --chmod=0755 /out-su-exec /usr/sbin/su-exec
 
 # AD3: non-root workspace user. uid/gid 1000 matches the EFS access point's PosixUser
 # (src/warren/runtime/efs.py), so files under /var/lib/warren are owned by it. Home 2755
-# with no skel files, /bin/bash, locked password (as 1.x's busybox `adduser -D` made it).
+# with no skel files, /bin/bash, locked password (as 1.4's busybox `adduser -D` made it).
 # /workspace is a real (empty) directory in the image. When the task has git folders
 # (AH1), entrypoint.sh replaces it, as root and before dropping privileges, with a
 # symlink to the checkout on the volume ($WARREN_WORKSPACE_DIR).
@@ -103,7 +103,7 @@ RUN groupadd -g 1000 warren \
 COPY packages/warren-common/src/warren_common/assets/warren_banner.zsh /etc/zsh/zshrc
 # AG2a: the template's harnesses as warren shell commands, plus `warren resume`, for zsh
 # and bash. Generated from the harness profiles. Debian's bash reads /etc/bash.bashrc,
-# so the hooks go there; /etc/bash/bashrc (1.x's Alpine path) links to it for images
+# so the hooks go there; /etc/bash/bashrc (1.4's Alpine path) links to it for images
 # that append to that path.
 COPY --chown=0:0 --chmod=0644 packages/warren-common/src/warren_common/assets/warren_harness.sh /etc/warren/harness.sh
 COPY --chown=0:0 --chmod=0644 packages/warren-common/src/warren_common/assets/warren_banner.bash /etc/warren/banner.bash

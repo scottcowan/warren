@@ -125,6 +125,32 @@ class PlanTests(RepoTest):
         self.commit("feat: b", "images/dev/b")
         self.assertEqual(self.pending()["dev"].next, "2.4.0")
 
+    def test_release_as_overrides_the_bump(self):
+        self.commit("feat(base)!: new os\n\nBREAKING CHANGE: apt", "server/images/base/Dockerfile", "server/app.py")
+        self.commit("chore: pin server\n\nRelease-As: server 1.1.1", "docs/x.md")
+        got = self.pending()
+        self.assertEqual(got["server"].next, "1.1.1")
+        self.assertEqual(got["base"].next, "2.0.0")
+
+    def test_newest_release_as_wins(self):
+        self.commit("chore: pin\n\nRelease-As: dev 2.5.0", "docs/a.md")
+        self.commit("chore: repin\n\nRelease-As: dev 2.4.0", "docs/b.md")
+        self.assertEqual(self.pending()["dev"].next, "2.4.0")
+
+    def test_release_as_without_input_changes_still_releases(self):
+        self.commit("chore: pin\n\nRelease-As: dev 2.4.0", "docs/a.md")
+        self.assertEqual(self.pending()["dev"].next, "2.4.0")
+
+    def test_release_as_must_go_up(self):
+        self.commit("chore: pin\n\nRelease-As: dev 2.3.4", "docs/a.md")
+        with self.assertRaises(release.ReleaseError):
+            self.pending()
+
+    def test_release_as_ignores_other_images_and_prose(self):
+        self.commit("fix: a\n\nsee Release-As: dev 9.9.9 in docs", "images/dev/a")
+        self.commit("chore: pin\n\nRelease-As: base 1.2.0", "docs/a.md")
+        self.assertEqual(self.pending()["dev"].next, "2.3.5")
+
     def test_existing_tag_is_the_base(self):
         self.commit("fix: a", "images/dev/a")
         self.git("tag", "dev-v2.3.4")

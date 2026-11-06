@@ -25,7 +25,7 @@ Pick one at a time via `WARREN_RUNTIME_TYPE`:
 See [`resources/ecs/`](../../resources/ecs/) for the Terraform/CDK to stand up the ECS path.
 
 ECS workspaces default to `ghcr.io/scottcowan/warren-ecs-base`, built from
-[`images/ecs-base`](images/ecs-base/Dockerfile): Debian bookworm-slim since 2.0.0 (1.x was
+[`images/ecs-base`](images/ecs-base/Dockerfile): Debian bookworm-slim since 1.5.0 (1.4 and earlier were
 Alpine), so images built on it use `apt`. See
 [ECS workspace images](../../resources/ecs/README.md#ecs-workspace-images).
 

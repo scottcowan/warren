@@ -9,11 +9,11 @@ connects to it.
 in `.github/releases.json`, and no image-workflow path filter matches `examples/`. If you
 want to use it, build and push it yourself.
 
-## Base image: `warren-ecs-base` 2.0.0
+## Base image: `warren-ecs-base` 1.5.0
 
-This image targets **`warren-ecs-base` 2.0.0**, the first Debian bookworm-slim (glibc)
-release. T3 Code's prebuilt server is glibc-only: on the 1.x Alpine images it fails with
-`fcntl64: symbol not found`, even with gcompat. So build it on 2.0.0 or later, not 1.x.
+This image targets **`warren-ecs-base` 1.5.0**, the first Debian bookworm-slim (glibc)
+release. T3 Code's prebuilt server is glibc-only: on the 1.4 and earlier Alpine images it fails with
+`fcntl64: symbol not found`, even with gcompat. So build it on 1.5.0 or later, not 1.4 or earlier.
 
 Everything warren needs comes from ecs-base unchanged: `entrypoint.sh`,
 `warren-session`, `warren-init-volume`, `warren-git-materialize`, the harness and
@@ -24,15 +24,15 @@ same as ecs-base. It idles on `tail -f /dev/null` as uid 1000 for ECS Exec, runs
 `WARREN_APP_CMD` when one is set, and uses the same git-init and secrets handling. It
 also works as the task's `git-init` container.
 
-2.0.0 isn't published yet, so `WARREN_ECS_BASE` defaults to the
-`ghcr.io/scottcowan/warren-ecs-base:2.0.0` tag. Once it's published, pin it by digest
-for your own builds (`--build-arg WARREN_ECS_BASE=ghcr.io/scottcowan/warren-ecs-base:2.0.0@sha256:...`).
+1.5.0 isn't published yet, so `WARREN_ECS_BASE` defaults to the
+`ghcr.io/scottcowan/warren-ecs-base:1.5.0` tag. Once it's published, pin it by digest
+for your own builds (`--build-arg WARREN_ECS_BASE=ghcr.io/scottcowan/warren-ecs-base:1.5.0@sha256:...`).
 
 ## What's in the image
 
 | | Version | Pinned by |
 | --- | --- | --- |
-| base | warren-ecs-base 2.0.0 (Debian bookworm-slim) | `WARREN_ECS_BASE` (tag until 2.0.0 is published; pin by digest) |
+| base | warren-ecs-base 1.5.0 (Debian bookworm-slim) | `WARREN_ECS_BASE` (tag until 1.5.0 is published; pin by digest) |
 | t3 | 0.1.6 (stable) | `T3_VERSION` plus the per-arch sha256 from the release's `SHA256SUMS` |
 | Claude Code | 2.1.308 | `CLAUDE_CODE_VERSION`, sha256 from Anthropic's GPG-signed manifest |
 | apt (on top of ecs-base) | curl, python3 (3.11), jq, ripgrep | the bookworm archive at build time (not version-pinned) |
@@ -67,7 +67,7 @@ docker buildx build --platform linux/arm64 --load -t warren-ecs-t3code:local exa
 docker buildx build --platform linux/amd64 --load -t warren-ecs-t3code:local examples/ecs-t3code
 ```
 
-To build on an ecs-base you built from this repo (for example before 2.0.0 is
+To build on an ecs-base you built from this repo (for example before 1.5.0 is
 published):
 
 ```bash
@@ -166,7 +166,7 @@ Pairing links and codes are passwords. Keep them out of logs, screenshots and is
 ## Verified locally (2026-10-31)
 
 Host: Apple Silicon Mac, colima (BuildKit v0.30.0), native linux/arm64, on an ecs-base
-built from this repo (`--build-arg WARREN_ECS_BASE=<local tag>`, the 2.0.0 Dockerfile).
+built from this repo (`--build-arg WARREN_ECS_BASE=<local tag>`, the 1.5.0 Dockerfile).
 linux/amd64 was not run.
 
 - The build-time checks print `t3 v0.1.6` and `2.1.308 (Claude Code)`.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke checks for a built warren-ecs-base image (Debian bookworm since 2.0.0). Run by
+# Smoke checks for a built warren-ecs-base image (Debian bookworm since 1.5.0). Run by
 # .github/workflows/warren-ecs-base-smoke.yml, and locally the same way:
 #
 #   .github/scripts/ecs-base-smoke.sh IMAGE [ECS_EXEC_CMD_FILE]
