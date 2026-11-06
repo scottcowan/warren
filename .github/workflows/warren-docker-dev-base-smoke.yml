@@ -52,10 +52,11 @@ jobs:
           docker run --rm --entrypoint npm warren-docker-dev-base:smoke --version
           docker run --rm --entrypoint python warren-docker-dev-base:smoke --version
           docker run --rm --entrypoint claude warren-docker-dev-base:smoke --version
-          docker run --rm --entrypoint opencode warren-docker-dev-base:smoke --version
           docker run --rm --entrypoint codex warren-docker-dev-base:smoke --version | grep -q '^codex-cli '
           docker run --rm --entrypoint pi warren-docker-dev-base:smoke --version
           # A non-root container user can run every harness too.
-          docker run --rm --user 1000:1000 -e HOME=/tmp --entrypoint sh warren-docker-dev-base:smoke -c 'claude --version && opencode --version && codex --version && pi --version'
+          docker run --rm --user 1000:1000 -e HOME=/tmp --entrypoint sh warren-docker-dev-base:smoke -c 'claude --version && codex --version && pi --version'
           docker run --rm -w /opt/pi --entrypoint node warren-docker-dev-base:smoke -e 'require("@silvia-odwyer/photon-node")'
-          docker run --rm --entrypoint sh warren-docker-dev-base:smoke -c 'test "$DISABLE_AUTOUPDATER$OPENCODE_DISABLE_AUTOUPDATE$PI_SKIP_VERSION_CHECK" = 111 && grep -qx "check_for_update_on_startup = false" /etc/codex/config.toml'
+          # No warren image ships opencode (docs/harnesses.md); self-updates are off.
+          docker run --rm --entrypoint sh warren-docker-dev-base:smoke -c '! command -v opencode'
+          docker run --rm --entrypoint sh warren-docker-dev-base:smoke -c 'test "$DISABLE_AUTOUPDATER$PI_SKIP_VERSION_CHECK" = 11 && grep -qx "check_for_update_on_startup = false" /etc/codex/config.toml'

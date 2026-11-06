@@ -1,8 +1,8 @@
 name: warren pin bumps
 # AI6: weekly check of pinned harness/tool versions in the image Dockerfiles
-# (Claude Code; opencode and codex with their per-arch sha256s from GitHub's release
-# API; pi's pi/package.json, with package-lock.json regenerated in a node container via
-# the runner's docker), the GitHub SSH known_hosts baked into ecs-base (#29) and the AWS
+# (Claude Code; codex with its per-arch sha256s from GitHub's release API; pi's
+# pi/package.json, with package-lock.json regenerated in a node container via the
+# runner's docker), the GitHub SSH known_hosts baked into ecs-base (#29) and the AWS
 # CLI Team PGP key checked in for warren-ecs-dev-base (aws-cli-team.asc, compared
 # with AWS's CLI install guide) against upstream. On drift it pushes chore/pin-bumps
 # and opens (or updates) one PR. An AWS key rotation also rewrites the Dockerfile's

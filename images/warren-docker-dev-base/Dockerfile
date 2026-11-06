@@ -1,7 +1,7 @@
 # warren-docker-dev-base — convenience layer on top of warren-docker-base (D-10 sibling
 # pattern), NOT a fork of it. Projects that don't need D-09's arbitrary-Containerfile
 # escape hatch can use this tag directly as their docker_image and get the agent
-# harnesses (Claude Code, opencode, codex, pi) plus common dev tools preinstalled, for
+# harnesses (Claude Code, codex, pi) plus common dev tools preinstalled, for
 # the common case: a local Podman/Docker daemon
 # reached by direct exec (warren-docker-base itself carries no sshd — see
 # images/warren-docker-base/Dockerfile for why sshd is the exception, not the default).
@@ -18,13 +18,13 @@
 # an unreviewed CLI upgrade can't silently change agent behavior inside every future
 # workspace built from this tag; the script itself is TOFU, and unlike the ECS dev-base
 # this image doesn't yet check the binary against Anthropic's signed manifest),
-# opencode's and codex's GitHub release
-# tarballs (version and sha256 pinned below, each sha256 from GitHub's asset digest for
+# codex's GitHub release
+# tarball (version and sha256 pinned below, each sha256 from GitHub's asset digest for
 # that architecture), and the npm registry for pi, through `npm ci` against the
 # lockfile checked in under pi/ (every package pinned by version and sha512 integrity;
 # no install scripts run). Each harness is root-owned in /usr/local/bin with its
 # self-update turned off (the ENV block after the installs); the set is Claude Code,
-# opencode, codex and pi (docs/harnesses.md). The plain warren-docker-base remains
+# codex and pi, the same as warren-ecs-dev-base's (docs/harnesses.md). The plain warren-docker-base remains
 # available and untouched for anyone who prefers to decline this layer's supply-chain
 # surface.
 FROM ghcr.io/scottcowan/warren-docker-base:latest@sha256:6102cea6f4a8a3668bd14c8aa87d14238b97e132b7efdb5960341107667e6990
@@ -92,30 +92,7 @@ RUN curl -fsSL https://claude.ai/install.sh | bash -s 2.1.309 \
     && claude --version \
     && rm -rf /root/.local/bin/claude /root/.local/share/claude /root/.claude /root/.claude.json
 
-# opencode (github.com/anomalyco/opencode): the release's single static-ish binary,
-# pinned by version and sha256, not npm (whose opencode-ai package fetches the binary
-# in a postinstall script, the same failure mode as Claude Code's npm package above).
-# The glibc builds, matching this image's Debian base (python:3.11-slim); the -musl
-# assets are for Alpine. The sha256s are the release assets' digests from GitHub's
-# release API (`gh api repos/anomalyco/opencode/releases/tags/v<version>`). warren's
-# opencode profile was checked against this version (docs/harnesses.md).
 ARG TARGETARCH
-ARG OPENCODE_VERSION=1.19.5
-ARG OPENCODE_SHA256_AMD64=588310a336fa3b9df36b3f0225b26f679d453efaad0cf3d66c3651ef3ec1647a
-ARG OPENCODE_SHA256_ARM64=fae5be262d693b7c5e562856cc473e59e741772936db0c0600ac0d5ed5bd088b
-RUN case "${TARGETARCH}" in \
-         amd64) _OC_ARCH=x64; _OC_SHA256="${OPENCODE_SHA256_AMD64}" ;; \
-         arm64) _OC_ARCH=arm64; _OC_SHA256="${OPENCODE_SHA256_ARM64}" ;; \
-         *) echo "unsupported TARGETARCH for opencode: ${TARGETARCH}" >&2; exit 1 ;; \
-       esac \
-    && _OC_DIR="$(mktemp -d)" \
-    && curl -fsSL --retry 3 -o "${_OC_DIR}/opencode.tar.gz" \
-         "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${_OC_ARCH}.tar.gz" \
-    && echo "${_OC_SHA256}  ${_OC_DIR}/opencode.tar.gz" | sha256sum -c - \
-    && tar -xzf "${_OC_DIR}/opencode.tar.gz" -C "${_OC_DIR}" opencode \
-    && install -m 0755 "${_OC_DIR}/opencode" /usr/local/bin/opencode \
-    && rm -rf "${_OC_DIR}" \
-    && [ "$(opencode --version)" = "${OPENCODE_VERSION}" ]
 
 # codex (github.com/openai/codex): the release's standalone binary, pinned by version and
 # sha256, not npm (@openai/codex fetches the platform binary as an optionalDependency, the
@@ -175,12 +152,9 @@ RUN cd /opt/pi \
 # No self-updates: the harnesses are root-owned and pinned, so an update could only fail
 # or drift from the pin; rebuild with new pins instead (scripts/bump_pins.py proposes
 # them weekly). DISABLE_AUTOUPDATER: Claude Code's auto-updater.
-# OPENCODE_DISABLE_AUTOUPDATE: opencode's (warren's harness profile also sets it, and
-# `autoupdate: false` in its generated config, on opencode's own process).
 # PI_SKIP_VERSION_CHECK: pi's startup check for a newer release (it only notifies;
 # `pi update` is manual). codex: /etc/codex/config.toml above.
 ENV DISABLE_AUTOUPDATER=1 \
-    OPENCODE_DISABLE_AUTOUPDATE=1 \
     PI_SKIP_VERSION_CHECK=1
 
 # Deliberately NOT here: anything agent-specific — purpose-built agent images

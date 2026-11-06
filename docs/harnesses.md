@@ -65,7 +65,7 @@ that isn't a shell or a harness (ECS), as before; an agent workspace never sets 
 | Agent auto-start (`kind: agent`) | `entrypoint.sh` execs the supervisor as PID 1 after dropping to `warren` (uid 1000); the shell attaches over ECS Exec | `entrypoint.py` starts the supervisor next to tmux session `main`; it runs as the container user (root in these images, which rootless podman maps to the operator's uid) | not run locally (no supervisor) |
 | Env the harness sees | task env (template env, secrets, bedrock/gateway env) | container env (template env, secrets) | the template's `env_snapshot` |
 | Model config from env | at container start | at container start | on create/connect |
-| Harnesses installed | `warren-ecs-dev-base`: claude, codex, pi | `warren-docker-dev-base`: claude, opencode, codex, pi | whatever is on the host |
+| Harnesses installed | `warren-ecs-dev-base`: claude, codex, pi | `warren-docker-dev-base`: claude, codex, pi | whatever is on the host |
 
 The image's `harness.sh`, `warren-harness-init`, `warren-state-hook` and
 `warren-agent-supervisor` come from `warren-docker-base` / `warren-ecs-base`. A dev-base
@@ -75,12 +75,11 @@ pins its base by digest, so these changes reach `warren-docker-dev-base` only af
 ## Which image ships which harness
 
 The base images (`warren-ecs-base`, `warren-docker-base`) carry the workspace contract
-and no harnesses. The dev-bases carry them:
+and no harnesses. The two dev-bases carry the same set:
 
 | Harness | `warren-ecs-dev-base` (1.3.0) | `warren-docker-dev-base` (1.1.0) | Installed from | Verified by | Self-update off by |
 |---|---|---|---|---|---|
 | claude | 2.1.309 | 2.1.309 | Anthropic's `claude.ai/install.sh`, pinned version | ECS: the binary's sha256 against Anthropic's GPG-signed release manifest; docker: none beyond the installer's own | `DISABLE_AUTOUPDATER=1` |
-| opencode | no | 1.19.5 | GitHub release `opencode-linux-{x64,arm64}.tar.gz` (glibc) | sha256 pinned per arch (GitHub asset digest) | `OPENCODE_DISABLE_AUTOUPDATE=1` (the harness profile also sets `autoupdate: false`) |
 | codex | 0.166.0 | 0.166.0 | GitHub release `codex-{x86_64,aarch64}-unknown-linux-musl.tar.gz` (static, runs on glibc) | sha256 pinned per arch (GitHub asset digest) | `check_for_update_on_startup = false` in `/etc/codex/config.toml` (codex has no env var) |
 | pi | 1.5.0 | 1.5.0 | npm `@earendil-works/pi-coding-agent`, `npm ci --ignore-scripts` from `pi/package-lock.json` into `/opt/pi` | the lockfile's sha512 integrity for every package | `PI_SKIP_VERSION_CHECK=1` (pi only notifies; `pi update` is manual) |
 
@@ -97,13 +96,18 @@ sandbox are WebAssembly, and pi-tui's prebuilt X11 clipboard addon is only loade
 re-run against 1.5.0. codex reads `/etc/codex/config.toml`: a wrong-typed
 `check_for_update_on_startup` there makes it fail to load its config.
 
+No warren image ships opencode. warren's opencode profile still works in an image that
+installs it: put the binary on `PATH` (for example opencode's `opencode-linux-*.tar.gz`
+release asset, checked against its sha256) and list
+`opencode` in the template's `harnesses`. The profile sets `OPENCODE_DISABLE_AUTOUPDATE=1`
+and `autoupdate: false` on opencode's own process.
+
 `warren-ecs-ssh-base` (FROM `warren-ecs-dev-base:1.3.0`) gets the same harnesses as
 the ECS dev-base. `warren-docker-ssh-base` pins `warren-docker-dev-base` by digest, so it
 gets them once dev-base 1.1.0 is published and that digest is bumped.
 
 `scripts/bump_pins.py` checks every pin weekly (Claude Code's npm `stable` tag,
-opencode's and codex's latest GitHub release with their asset digests, pi's npm `latest`
-tag). A pi bump rewrites `pi/package.json` and regenerates `pi/package-lock.json` in a
+codex's latest GitHub release with its asset digests, pi's npm `latest` tag). A pi bump rewrites `pi/package.json` and regenerates `pi/package-lock.json` in a
 `node:<NODE_VERSION>-bookworm-slim` container. To do it by hand, from the repo root, for
 each `pi/` dir:
 

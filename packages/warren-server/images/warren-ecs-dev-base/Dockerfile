@@ -3,7 +3,7 @@
 # pattern as ../../../../images/warren-dev-base, the Docker-env counterpart). Gets the
 # agent harnesses (Claude Code, codex, pi) plus common dev tools preinstalled, without
 # touching ecs-base's own minimal, no-sshd, no-harness design (see ../ecs-base/Dockerfile's
-# header). opencode is in the Docker-env dev-base only (docs/harnesses.md).
+# header). The Docker-env dev-base ships the same set (docs/harnesses.md).
 #
 # Debian bookworm (glibc) since 1.3.0, because warren-ecs-base 1.5.0 is; 1.2 and earlier were Alpine.
 # Packages come from apt. Node is nodejs.org's official linux tarball (glibc-linked, so

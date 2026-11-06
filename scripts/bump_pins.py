@@ -38,14 +38,15 @@ What it checks:
                   the block, or with conflicting blocks, fails this check (a warning in
                   the summary; the other checks still run). Without gpg on PATH the
                   check is reported as skipped.
-    opencode      ``ARG OPENCODE_VERSION`` and ``ARG OPENCODE_SHA256_{AMD64,ARM64}`` in the
-    codex         Dockerfiles (``ARG CODEX_*`` likewise) vs the latest stable GitHub release
-                  of anomalyco/opencode (tag ``vX.Y.Z``) and openai/codex (``rust-vX.Y.Z``).
-                  A bump rewrites the version and both sha256s, which come from the release
-                  API's ``digest`` for each arch's tarball (opencode-linux-{x64,arm64},
-                  codex-{x86_64,aarch64}-unknown-linux-musl); a release without them is
-                  skipped. A codex bump also warns to redo warren's codex profile checks
+    codex         ``ARG CODEX_VERSION`` and ``ARG CODEX_SHA256_{AMD64,ARM64}`` in the
+                  Dockerfiles vs openai/codex's latest stable GitHub release (tag
+                  ``rust-vX.Y.Z``). A bump rewrites the version and both sha256s, which come
+                  from the release API's ``digest`` for each arch's tarball
+                  (codex-{x86_64,aarch64}-unknown-linux-musl); a release without them is
+                  skipped. It also warns to redo warren's codex profile checks
                   (docs/harnesses.md: hook-trust hashes depend on codex's hook normalisation).
+                  RELEASE_BINARIES takes other release-tarball harnesses the same way. (No
+                  warren image installs opencode, so nothing pins it.)
     pi            ``@earendil-works/pi-coding-agent`` in images/*/pi/package.json and
                   packages/warren-server/images/*/pi/package.json vs its npm ``latest``
                   dist-tag. --write rewrites package.json and regenerates package-lock.json
@@ -137,8 +138,6 @@ class ReleaseBinary:
 
 
 RELEASE_BINARIES = (
-    ReleaseBinary("opencode", "anomalyco/opencode", "v", "OPENCODE",
-                  (("AMD64", "opencode-linux-x64.tar.gz"), ("ARM64", "opencode-linux-arm64.tar.gz"))),
     ReleaseBinary("codex", "openai/codex", "rust-v", "CODEX",
                   (("AMD64", "codex-x86_64-unknown-linux-musl.tar.gz"),
                    ("ARM64", "codex-aarch64-unknown-linux-musl.tar.gz")),
@@ -183,7 +182,7 @@ class Pin:
 
 @dataclass
 class Change:
-    kind: str  # "claude-code" | "github-ssh" | "aws-cli-key" | "opencode" | "codex" | "pi"
+    kind: str  # "claude-code" | "github-ssh" | "aws-cli-key" | "codex" | "pi"
     path: Path
     old: str
     new: str

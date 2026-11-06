@@ -389,8 +389,10 @@ class TestAwsCliKeyGpg(AwsKeyFixture):
 
 
 SHA = {c: c * 64 for c in "abcdef"}
-OPENCODE = bump_pins.RELEASE_BINARIES[0]
-CODEX = bump_pins.RELEASE_BINARIES[1]
+CODEX = bump_pins.RELEASE_BINARIES[0]
+# A second release-tarball harness with no bump warning, to test the generic path.
+OTHER = bump_pins.ReleaseBinary("other", "example/other", "v", "OTHER",
+                                (("AMD64", "other-linux-x64.tar.gz"), ("ARM64", "other-linux-arm64.tar.gz")))
 
 
 def release_fetch(releases, base=None):
@@ -425,14 +427,14 @@ class ReleaseFixture(RepoFixture):
 
     def setUp(self):
         super().setUp()
-        self.write(self.DOCKER, "FROM x\nARG OPENCODE_VERSION=1.19.5\n"
-                   f"ARG OPENCODE_SHA256_AMD64={SHA['a']}\nARG OPENCODE_SHA256_ARM64={SHA['b']}\n" + codex_args())
+        self.write(self.DOCKER, "FROM x\nARG OTHER_VERSION=1.19.5\n"
+                   f"ARG OTHER_SHA256_AMD64={SHA['a']}\nARG OTHER_SHA256_ARM64={SHA['b']}\n" + codex_args())
         self.write(self.ECS, "FROM x\nARG CLAUDE_CODE_VERSION=2.1.301\nARG NODE_VERSION=24.22.2\n" + codex_args())
 
 
 class TestReleaseBinary(ReleaseFixture):
     def test_finds_pins_per_harness(self):
-        self.assertEqual([p.path.as_posix() for p in bump_pins.find_release_pins(self.root, OPENCODE)], [self.DOCKER])
+        self.assertEqual([p.path.as_posix() for p in bump_pins.find_release_pins(self.root, OTHER)], [self.DOCKER])
         self.assertEqual(sorted(p.path.as_posix() for p in bump_pins.find_release_pins(self.root, CODEX)),
                          sorted([self.DOCKER, self.ECS]))
 
@@ -447,20 +449,21 @@ class TestReleaseBinary(ReleaseFixture):
             self.assertIn(f"ARG CODEX_SHA256_AMD64={SHA['c']}\n", text)
             self.assertIn(f"ARG CODEX_SHA256_ARM64={SHA['d']}\n", text)
             self.assertIn("rust-v${CODEX_VERSION}", text)  # the ARG reference is untouched
-        self.assertIn(f"ARG OPENCODE_SHA256_AMD64={SHA['a']}\n", self.read(self.DOCKER))  # other harness untouched
+        self.assertIn(f"ARG OTHER_SHA256_AMD64={SHA['a']}\n", self.read(self.DOCKER))  # other harness untouched
         self.assertEqual(len(warnings), 1)
         self.assertIn("codex 0.166.0 -> 0.170.0", warnings[0])
         self.assertIn("docs/harnesses.md", warnings[0])
 
-    def test_opencode_bump_has_no_extra_warning(self):
-        fetch = release_fetch({"anomalyco/opencode": release("v1.20.0", {
-            "opencode-linux-x64.tar.gz": f"sha256:{SHA['e']}", "opencode-linux-arm64.tar.gz": f"sha256:{SHA['f']}"})})
-        changes, _, warnings = bump_pins.bump_release_binary(self.root, fetch, OPENCODE, write=True)
-        self.assertEqual([(c.kind, c.path.as_posix(), c.new) for c in changes], [("opencode", self.DOCKER, "1.20.0")])
+    def test_spec_without_bump_warning_adds_none(self):
+        fetch = release_fetch({"example/other": release("v1.20.0", {
+            "other-linux-x64.tar.gz": f"sha256:{SHA['e']}", "other-linux-arm64.tar.gz": f"sha256:{SHA['f']}"})})
+        changes, _, warnings = bump_pins.bump_release_binary(self.root, fetch, OTHER, write=True)
+        self.assertEqual([(c.kind, c.path.as_posix(), c.new) for c in changes], [("other", self.DOCKER, "1.20.0")])
         self.assertEqual(warnings, [])
         text = self.read(self.DOCKER)
-        self.assertIn("ARG OPENCODE_VERSION=1.20.0\n", text)
-        self.assertIn(f"ARG OPENCODE_SHA256_AMD64={SHA['e']}\nARG OPENCODE_SHA256_ARM64={SHA['f']}\n", text)
+        self.assertIn("ARG OTHER_VERSION=1.20.0\n", text)
+        self.assertIn(f"ARG OTHER_SHA256_AMD64={SHA['e']}\nARG OTHER_SHA256_ARM64={SHA['f']}\n", text)
+        self.assertIn("ARG CODEX_VERSION=0.166.0\n", text)  # codex untouched
 
     def test_report_only_does_not_write(self):
         before = self.read(self.ECS)
@@ -616,17 +619,15 @@ class TestPi(ReleaseFixture):
         self.assertEqual(bump_pins.smoke_workflows_for(self.root, changed), ["warren-ecs-dev-base-smoke.yml"])
 
     def test_main_reports_every_harness(self):
-        fetch = release_fetch({"openai/codex": codex_release(), "anomalyco/opencode": None},
+        fetch = release_fetch({"openai/codex": None},
                               base=lambda url: pi_fetch("1.6.0")(url))
         summary, smoke = self.root / "summary.md", self.root / "smoke.txt"
         with contextlib.redirect_stdout(io.StringIO()):
             bump_pins.main(["--write", "--summary", str(summary), "--smoke-workflows", str(smoke)],
                            fetch=fetch, root=self.root, gpg=None, lock=self.fake_lock)
         body = summary.read_text()
-        self.assertIn(f"| codex | `{self.ECS}` | 0.166.0 | 0.170.0 |", body)
+        self.assertIn("codex: GET https://api.github.com/repos/openai/codex/releases/latest returned 503", body)
         self.assertIn(f"| pi | `{PI_PKG}` | 1.5.0 | 1.6.0 |", body)
-        self.assertIn("opencode: GET https://api.github.com/repos/anomalyco/opencode/releases/latest returned 503", body)
-        self.assertIn("Redo the codex checks", body)
         self.assertEqual(smoke.read_text().split(), ["warren-docker-dev-base-smoke.yml"])
 
 
@@ -670,10 +671,12 @@ class TestRealRepo(unittest.TestCase):
         self.assertNotIn(info.fingerprint, dockerfile)
 
     def test_repo_harness_pins_match_the_images(self):
-        # opencode is only in the Docker-env dev-base; codex and pi are in both dev-bases.
+        # Both dev-bases ship the same harnesses: codex and pi pinned here, Claude Code above.
         def paths(spec):
             return sorted(p.path.as_posix() for p in bump_pins.find_release_pins(bump_pins.REPO_ROOT, spec))
-        self.assertEqual(paths(OPENCODE), ["images/warren-docker-dev-base/Dockerfile"])
+        self.assertEqual([s.kind for s in bump_pins.RELEASE_BINARIES], ["codex"])
+        for rel in bump_pins.dockerfiles(bump_pins.REPO_ROOT):  # no warren image installs opencode
+            self.assertNotIn("OPENCODE_VERSION", (bump_pins.REPO_ROOT / rel).read_text(), rel)
         self.assertEqual(paths(CODEX), ["images/warren-docker-dev-base/Dockerfile",
                                         "packages/warren-server/images/warren-ecs-dev-base/Dockerfile"])
         pins, problems = bump_pins.find_pi_pins(bump_pins.REPO_ROOT)

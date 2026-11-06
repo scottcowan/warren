@@ -138,7 +138,7 @@ local runtimes (warren-common, used by the warren CLI directly, no server involv
 
 container images
 ├── warren-base / warren-ecs-base           minimal — git, ssh-client/jq/curl, uv; no sshd
-├── warren-dev-base / warren-ecs-dev-base   + harnesses (Claude Code, codex, pi; opencode on docker), Node/Python, dev tools
+├── warren-dev-base / warren-ecs-dev-base   + harnesses (Claude Code, codex, pi), Node/Python, dev tools
 ├── warren-agent-base / warren-ecs-agent-base   stubs for purpose-built agent tooling (deferred)
 └── warren-docker-ssh-base / warren-ecs-ssh-base   opt-in: + hardened sshd for editors (docs/workspace-ssh.md)
 
