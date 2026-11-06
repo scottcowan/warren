@@ -55,6 +55,25 @@ def _pick_server(cfg: WarrenCLIConfig, server: Optional[str]) -> str:
     raise typer.Exit(1)
 
 
+def _pick_ecs_server(cfg: WarrenCLIConfig, server: Optional[str]) -> str:
+    """`proxy stdio`'s server: --server, else [defaults] server if it's an ecs remote,
+    else the only ecs remote. Its relay is an SSM port-forward, so podman/docker remotes
+    (which the rest of `warren proxy` reaches) don't count towards the default."""
+    if server:
+        return server
+    ecs = sorted(name for name, r in cfg.remotes.items() if r.runtime_type == "ecs")
+    default = cfg.defaults.server
+    if default and default in ecs:
+        return default
+    if len(ecs) == 1:
+        return ecs[0]
+    if not ecs:
+        ui.error("no ecs remotes: `warren proxy stdio` reaches ECS workspaces only (add one with `warren remote add`)")
+    else:
+        ui.error(f"more than one ecs remote ({', '.join(ecs)}): pass --server")
+    raise typer.Exit(1)
+
+
 def _declared_ports(cfg: WarrenCLIConfig, server: str, workspace: str) -> dict[str, int]:
     """The workspace's template `ports` ({name: port}), read from the control plane."""
     ws = core.match_workspace(asyncio.run(core.fetch_workspaces(cfg, server)), workspace)
@@ -246,7 +265,7 @@ def proxy_stdio(
     from .. import ssh_access  # noqa: PLC0415
 
     cfg = _load_cfg(config)
-    server = _pick_server(cfg, server)
+    server = _pick_ecs_server(cfg, server)
     # stdin/stdout carry the SSH stream: keep private copies for the relay, and point
     # fds 0/1 at /dev/null and stderr so no child (aws, session-manager-plugin) or stray
     # print can read from or write into it.

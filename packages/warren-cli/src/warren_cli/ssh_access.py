@@ -348,7 +348,16 @@ def run_stdio(
     (incl. ``WorkspaceUnavailable``/``AwsCredentialsExpired``) for the operator."""
     if not 1 <= remote_port <= 65535:
         raise proxy.ProxyError(f"remote port {remote_port} is not a TCP port")
-    proxy.remote_for(cfg, server)
+    remote = proxy.remote_for(cfg, server)
+    # `warren proxy` itself also reaches podman/docker remotes (published loopback
+    # ports), but this relay is an SSM port-forward: ECS only. podman/docker
+    # workspaces get a ProxyJump/ProxyCommand route from `warren ssh-config` instead.
+    if remote.runtime_type != "ecs":
+        raise proxy.ProxyError(
+            f"remote {server!r} is runtime_type {remote.runtime_type!r}: `warren proxy stdio` only reaches ECS "
+            "workspaces (over SSM); for podman/docker workspaces use `warren ssh-config`, which routes "
+            "through the server host"
+        )
     resolver = resolver or proxy.ControlPlaneResolver(cfg)
     mapping = proxy.Mapping(server=server, workspace=workspace, remote_port=remote_port, local_port=0)
     target = asyncio.run(resolver.resolve(mapping))
