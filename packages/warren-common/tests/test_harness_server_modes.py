@@ -308,6 +308,7 @@ def _serving_child(port: int) -> list[str]:
     return [sys.executable, "-c", code]
 
 
+@pytest.mark.asyncio
 async def test_self_serving_mode_is_supervised_not_proxied(tmp_path):
     from test_agent_supervisor import free_port  # noqa: PLC0415
 
@@ -342,6 +343,7 @@ async def test_self_serving_mode_is_supervised_not_proxied(tmp_path):
     assert "agent.self_serving" in names and "acp.listening" not in names
 
 
+@pytest.mark.asyncio
 async def test_self_serving_mode_still_rejects_a_wide_listener(tmp_path):
     from test_agent_supervisor import free_port  # noqa: PLC0415
 
