@@ -60,6 +60,11 @@ class WorkspaceSpec:
     # The resolved template's named ports, {name: {"port": int, "description": str}};
     # persisted in spec_json and surfaced by the workspace API (`warren proxy add --from-template`).
     ports: dict[str, dict] = field(default_factory=dict)
+    # git_write templates (warren-server git/write_tokens.py): persisted opt-in flag, and
+    # this launch's {github owner: installation token}, delivered with the launch-time
+    # secrets. git_tokens is transient: never in spec_json, repr or logs.
+    git_write: bool = False
+    git_tokens: dict[str, str] = field(default_factory=dict, repr=False)
 
 
 def harness_state(spec: WorkspaceSpec) -> dict:

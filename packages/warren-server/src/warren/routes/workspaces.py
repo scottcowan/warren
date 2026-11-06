@@ -333,6 +333,9 @@ async def _provision_workspace(
     folders = template_cfg.effective_folders() if template_cfg is not None else []
     if settings is not None:
         folders = _server_sanctioned_local_paths(folders, body.project, settings)
+    git_write = bool(getattr(template_cfg, "git_write", False)) if template_cfg is not None else False
+    if git_write:
+        _require_git_write(request, folders)
     app_cmd = template_cfg.app if template_cfg is not None else "bash"
     harnesses = (
         sorted(selected_harnesses(app_cmd, template_cfg.harnesses)) if template_cfg is not None else []
@@ -465,6 +468,7 @@ async def _provision_workspace(
             if template_cfg is not None
             else {}
         ),
+        git_write=git_write,
     )
 
     # Insert row with status=provisioning. D-11: owner_id is set to the creating user so
@@ -560,6 +564,27 @@ async def _provision_workspace(
         )
 
     return WorkspaceView.from_workspace(ws)
+
+
+def _require_git_write(request: Request, folders) -> None:
+    """`git_write: true` is opt-in and only allowed when this deployment has a GitHub
+    App issuer (WARREN_GITHUB_APP_ID + WARREN_GITHUB_WORKSPACE_TOKEN_KEY_SOURCE), a
+    runtime that can deliver the tokens, and the template has a repo to push to."""
+    from warren.git.write_tokens import grants_for, runtime_problem  # noqa: PLC0415
+
+    registry = request.app.state.registry
+    problem = ""
+    if getattr(registry, "git_write_tokens", None) is None:
+        problem = (
+            "the template sets git_write: true, but this deployment has no GitHub App "
+            "configured (WARREN_GITHUB_APP_ID and WARREN_GITHUB_WORKSPACE_TOKEN_KEY_SOURCE)"
+        )
+    else:
+        problem = runtime_problem(registry.runtime)
+        if not problem and not grants_for(folders):
+            problem = "git_write needs at least one writable github.com git-worktree folder"
+    if problem:
+        raise HTTPException(status_code=422, detail={"error": "template_denied", "detail": problem})
 
 
 def _resolve_ecs_storage(template_cfg, settings) -> str:

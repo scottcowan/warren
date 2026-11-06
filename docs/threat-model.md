@@ -28,6 +28,7 @@ Warren's own processes are trusted: the CLI on the user's host, the control plan
 | Project secrets (`secrets.env`, warren-server's encrypted store) | host / control plane | only workspaces whose template declares them |
 | GitHub App private key | OS credential store (local issuer) or Secrets Manager (control-plane issuer) | the issuer only; never a workspace |
 | GitHub installation tokens | minted per workspace, 1 hour | that workspace's git credential helper |
+| `git_write` GitHub tokens (push + PRs) | minted by the control plane per running `git_write: true` workspace, 1 hour, refreshed, revoked on stop/destroy; `/run/warren-git/<owner>` in the container (not the volume) | that workspace's agent, for its template's writable repos only |
 | git-crypt key | operator | materialization step only, and only with `git_crypt: unlock_and_drop` |
 | AWS credentials | host SSO session; ECS task roles | template's single profile (local `export` mode); the minimal task role (ECS) |
 | Model access (Bedrock today) | AWS credentials / proxy secret | the harness, scoped to specific models |
@@ -113,6 +114,18 @@ credentials endpoint `169.254.170.2` from the agent. So:
   The seed is deleted from the volume before the workspace container starts; a bad seed
   falls back to a network clone. The control plane's `git ls-remote` (to skip unchanged
   refreshes) passes the PAT only through `GIT_ASKPASS` in the child environment.
+- `git_write: true` templates (T19) get GitHub write tokens in the workspace container.
+  The launch's tokens ride with that container's launch-time secrets (EBS envelope / EFS
+  file; podman: `put_archive`). Refreshes on ECS go over ECS Exec, and the channel was
+  chosen so the token is never in a record: the control plane seals the new tokens into
+  a fresh KMS envelope (same context as the launch envelope, `container=workspace`) and
+  only that ciphertext is the ExecuteCommand `command`, which CloudTrail records. Nothing
+  is written to the session's stdin, so the TTY (ECS Exec always allocates one) has
+  nothing to echo, and `warren-git-token` (root, decrypts with the task role) prints only
+  a count, so the ECS Exec session log in CloudWatch holds no token either. Piping the
+  token over stdin was rejected: the session log records the PTY stream, echo included,
+  and there's no way to turn echo off before the first byte arrives. Needs
+  `WARREN_ECS_SECRETS_KMS_KEY_ID` on ECS whatever the storage mode.
 - No plan should add an in-task bwrap/nsjail layer. Runtime detection on Fargate is
   GuardDuty Runtime Monitoring plus CloudTrail alerting on the task role (AF1, deployment
   IaC, deferred).
@@ -138,6 +151,7 @@ credentials endpoint `169.254.170.2` from the agent. So:
 | T15 | Repudiation: no record of who issued a secret or token | Structured `event="audit"` records for secret write/delete/delivery, provision/connect/destroy, credential issuance; caller identity from the server, never the client; secret values rejected as fields | #33 |
 | T17 | An agent driving warren over MCP provisions, execs in or destroys workspaces beyond its own | `/mcp` sits behind the same AuthMiddleware; each tool calls the REST handler (owner check, audit). A workspace-scoped token's tools only take its own workspace id; only a reservation token (`POST /workspace-tokens`) can provision, exactly once, the id the server chose for it. After a single-turn completion the token can only read status/events and make the idempotent destroy call. Exec output and time are capped (`WARREN_EXEC_MAX_*`) | this PR |
 | T18 | Agent steals the operator's Claude login, or uses it to bypass a template meant to run on Bedrock | The sandbox can't read the Keychain or host `~/.claude`. In subscription mode, warren copies in the access token without the refresh token on each connect, so a stolen copy expires and a sandbox refresh can't rotate the host's token. In Bedrock mode (`model_access: bedrock`, or `CLAUDE_CODE_USE_BEDROCK`/`ANTHROPIC_BEDROCK_BASE_URL` in env), warren reads no Keychain item, deletes any earlier copy, rejects a `CLAUDE_CODE_OAUTH_TOKEN` secret, and only connects with the workspace's own AWS credentials (`export` endpoint locally, task role on ECS) | this PR |
+| T19 | An agent steered by untrusted input (issue, PR comment, dependency, web page) pushes malicious commits, rewrites branches or opens PRs with its `git_write` token | Opt-in per template (`git_write: true`), rejected at provision unless the deployment has a GitHub App issuer. The token covers only the template's writable `git-worktree` github.com repos, with exactly `contents: write` + `pull_requests: write` (never administration, workflows or secrets). 1-hour GitHub lifetime, re-minted 10 minutes before expiry and the old one revoked; revoked (`DELETE /installation/token`) and its file removed on stop/destroy; mint/refresh/revoke audited without the token. Stored 0600 under `/run/warren-git` in the container (never env, URLs, `.git/config` or the volume). **Operators must protect `main`** (and release branches): require pull-request reviews, disallow force-push and deletion, so the agent's pushes land only on its own `warren/...` branches and reach `main` through human review | git/write_tokens.py |
 | T16 | Data exfiltration over the network | **Observed, not blocked.** Podman egress byte counters feed the idle reaper only (D-05). Fail-closed egress (NET-01) is future work; see residual risks | — |
 
 ## Known residual risks
@@ -202,3 +216,8 @@ credentials endpoint `169.254.170.2` from the agent. So:
     process or user can likewise reach a workspace's published template ports on
     `127.0.0.1`. Whatever the app on that port enforces (for example T3 Code's
     pairing) is the only remaining check. Don't run the proxy on a shared host.
+13. **`git_write` tokens are live inside the workspace.** Until revoked on stop or
+    superseded (at most an hour), the agent can push to and open PRs on every repo the
+    token covers, and can send the token anywhere (open egress). Only branch protection
+    on those repos keeps that from reaching `main`. A refresh revokes the superseded
+    token, so a push in flight across a refresh can fail once and needs a retry.

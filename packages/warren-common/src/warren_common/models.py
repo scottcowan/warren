@@ -375,6 +375,12 @@ class ProjectConfig(BaseModel):
     # with the key in secret `git_crypt_key_secret` (base64), then deletes it.
     git_crypt: Literal["none", "unlock_and_drop"] = "none"
     git_crypt_key_secret: str = "GIT_CRYPT_KEY"
+    # Opt-in: the agent may push branches and open PRs. The control plane mints a GitHub
+    # App installation token for only this template's writable github.com worktree repos
+    # (contents + pull_requests write), keeps it refreshed while the workspace runs and
+    # revokes it on stop/destroy (warren-server git/write_tokens.py). Rejected at
+    # provision unless the deployment has a GitHub App configured.
+    git_write: bool = False
     # Destroy a workspace this long after the idle reaper stopped it (AH10). None
     # falls back to WarrenSettings.idle_destroy_seconds, which is off by default.
     idle_destroy_seconds: float | None = None

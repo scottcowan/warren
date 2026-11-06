@@ -50,6 +50,7 @@ from warren.runtime.ebs import (
     EBSVolumes,
     storage_configured,
 )
+from warren.git.write_tokens import TOKEN_INSTALLER, TOKENS_SECRET, encode_tokens
 from warren.runtime.ecs_kms_secrets import BLOB_ENV, seal_with_kms
 from warren.runtime.ecs_storage import (
     LEGACY,
@@ -483,6 +484,10 @@ class ECSRuntime:
         # (runtime/ecs_secrets.py), written just before RunTask, or on EBS storage as
         # KMS ciphertext in the overrides (runtime/ecs_kms_secrets.py).
         delivered = await self._resolve_secrets(spec)
+        if getattr(spec, "git_tokens", None):
+            # git_write (git/write_tokens.py): the launch's tokens ride with the workspace
+            # container's secrets (never git-init's); the entrypoint installs and unsets them.
+            delivered[TOKENS_SECRET] = encode_tokens(spec.git_tokens)
         if delivered and not ebs and not (placement.volume is not None and placement.local_mount):
             raise ProvisionError(
                 "this workspace declares secrets, and ECS delivers them through its EFS "
@@ -500,6 +505,8 @@ class ECSRuntime:
             adopted_arn = await self._find_live_task(spec.workspace_id, exclude=generation)
             if adopted_arn:
                 log.info("ecs_adopted_task", workspace_id=spec.workspace_id, task_arn=adopted_arn)
+                if getattr(spec, "git_tokens", None):
+                    spec.git_tokens = {}  # not delivered: the registry revokes them
                 return WorkspaceHandle(workspace_id=spec.workspace_id, runtime_id=adopted_arn, root_path="")
             # Snapshot the previous task's retained volume if nothing did yet, and wait
             # for the newest snapshot to complete; None = first launch, empty volume.
@@ -1166,6 +1173,45 @@ class ECSRuntime:
             if proc.returncode is None:
                 proc.kill()
                 await proc.wait()
+
+    def git_write_problem(self) -> str:
+        """git_write refreshes travel as a KMS envelope (git/write_tokens.py), EFS too."""
+        if not getattr(self._settings, "ecs_secrets_kms_key_id", ""):
+            return "git_write on ECS needs WARREN_ECS_SECRETS_KMS_KEY_ID (refreshed tokens are KMS-sealed)"
+        return ""
+
+    async def _run_installer(self, handle: WorkspaceHandle, argv: list[str]) -> None:
+        exit_code: int | None = None
+        async for item in self.exec_stream(handle, argv):
+            if isinstance(item, ExecExit):
+                exit_code = item.exit_code
+        if exit_code != 0:
+            raise ProvisionError(f"warren-git-token exited {exit_code} in workspace {handle.workspace_id}")
+
+    async def install_git_tokens(self, handle: WorkspaceHandle, tokens: dict[str, str]) -> None:
+        """Write refreshed git_write tokens into the running workspace.
+
+        The tokens are sealed into a KMS envelope first; only that ciphertext is in the
+        ExecuteCommand `command` (recorded by CloudTrail). Nothing goes over the
+        session's stdin, so the TTY has nothing to echo, and the installer prints only
+        a count into the session log."""
+        problem = self.git_write_problem()
+        if problem:
+            raise ProvisionError(problem)
+        self._ensure_clients()
+        region = getattr(self._settings, "aws_region", "us-east-1") or "us-east-1"
+        blob = await seal_with_kms(
+            self._kms, self._settings.ecs_secrets_kms_key_id, {TOKENS_SECRET: encode_tokens(tokens)},
+            workspace_id=handle.workspace_id, container="workspace", region=region,
+        )
+        await self._run_installer(
+            handle,
+            ["env", f"WARREN_WORKSPACE_ID={handle.workspace_id}", f"{BLOB_ENV}={blob}",
+             TOKEN_INSTALLER, "install-envelope"],
+        )
+
+    async def drop_git_tokens(self, handle: WorkspaceHandle) -> None:
+        await self._run_installer(handle, [TOKEN_INSTALLER, "remove"])
 
     async def tunnel(self, handle: WorkspaceHandle, port: int) -> None:
         """Not implemented here — same reasoning as ``exec`` above: port

@@ -32,6 +32,8 @@ if [ "$(/usr/bin/id -u)" = 0 ]; then
     # container's own filesystem, not the volume): ECS Exec doesn't carry PID 1's env.
     . /usr/local/lib/warren/secrets.sh
     warren_secrets_load /run/warren/secrets.env
+    # git_write tokens are files for git-credential-warren, never session env.
+    unset WARREN_GIT_TOKENS
     HOME=/home/warren
     export HOME
     exec /sbin/su-exec warren:warren /usr/local/bin/warren-session "$@"

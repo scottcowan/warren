@@ -20,6 +20,7 @@ from podman import PodmanClient
 from podman.errors import APIError, BuildError, ImageNotFound, NotFound
 from podman.errors.exceptions import PodmanError
 
+from warren.git.write_tokens import TOKEN_DIR, TOKEN_UID, encode_tokens
 from warren.images.build_spec import BuildSpec
 from warren.runtime.userns import DEFAULT_PODMAN_USERNS, parse_podman_userns
 from warren_common.errors import ImageUnavailable, RuntimeUnreachable
@@ -77,6 +78,26 @@ def _parse_memory_bytes(memory: str) -> int:
     if text and text[-1] in _MEMORY_SUFFIXES:
         return int(float(text[:-1]) * _MEMORY_SUFFIXES[text[-1]])
     return int(text)
+
+
+def _git_tokens_tar(tokens: dict[str, str]) -> bytes:
+    """git_write tokens as `warren-git/<owner>` (0600, TOKEN_UID) under a root-owned
+    0755 dir, for put_archive at /run. Validated by encode_tokens first."""
+    encode_tokens(tokens)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        top = tarfile.TarInfo(name=TOKEN_DIR.rsplit("/", 1)[1])
+        top.type = tarfile.DIRTYPE
+        top.mode = 0o755
+        tar.addfile(top)
+        for owner, token in sorted(tokens.items()):
+            payload = (token + "\n").encode()
+            info = tarfile.TarInfo(name=f"{top.name}/{owner}")
+            info.size = len(payload)
+            info.mode = 0o600
+            info.uid = info.gid = TOKEN_UID
+            tar.addfile(info, io.BytesIO(payload))
+    return buf.getvalue()
 
 
 def _authorized_keys_tar(pubkey_line: str) -> bytes:
@@ -336,11 +357,47 @@ class PodmanRuntime:
         except (APIError, PodmanError, ConnectionError) as e:
             raise RuntimeUnreachable(str(e)) from e
 
-        return WorkspaceHandle(
+        handle = WorkspaceHandle(
             workspace_id=spec.workspace_id,
             runtime_id=container.id,
             root_path=spec.root_path,
         )
+        if spec.git_tokens:
+            # git_write: after start, so the files land in the running container's /run.
+            try:
+                await self.install_git_tokens(handle, spec.git_tokens)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("git_write_install_failed", workspace_id=spec.workspace_id, error=type(exc).__name__)
+                spec.git_tokens = {}  # not delivered: the registry revokes them
+        return handle
+
+    def git_write_problem(self) -> str:
+        return ""
+
+    async def _exec_checked(self, handle: WorkspaceHandle, argv: list[str]) -> None:
+        exit_code: int | None = None
+        async for item in self.exec_stream(handle, argv):
+            if isinstance(item, ExecExit):
+                exit_code = item.exit_code
+        if exit_code != 0:
+            raise RuntimeUnreachable(f"{argv[0]} exited {exit_code} in workspace {handle.workspace_id}")
+
+    async def install_git_tokens(self, handle: WorkspaceHandle, tokens: dict[str, str]) -> None:
+        """git_write tokens into /run/warren-git through put_archive: the tar goes over
+        the podman API socket, never into an exec command line or event record. A chown
+        follows (owner names only in argv) since podman may extract as root."""
+        data = _git_tokens_tar(tokens)
+        try:
+            container = await asyncio.to_thread(self._client.containers.get, handle.runtime_id)
+            await asyncio.to_thread(container.put_archive, path=TOKEN_DIR.rsplit("/", 1)[0] or "/", data=data)
+        except (APIError, PodmanError, ConnectionError, NotFound) as e:
+            raise RuntimeUnreachable(str(e)) from e
+        await self._exec_checked(
+            handle, ["chown", f"{TOKEN_UID}:{TOKEN_UID}", *[f"{TOKEN_DIR}/{o}" for o in sorted(tokens)]]
+        )
+
+    async def drop_git_tokens(self, handle: WorkspaceHandle) -> None:
+        await self._exec_checked(handle, ["rm", "-rf", TOKEN_DIR])
 
     async def _image_user(self, image: str) -> str:
         """The image's configured USER, or "0:0" when it sets none (podman's default)."""
