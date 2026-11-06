@@ -57,6 +57,9 @@ class WorkspaceSpec:
     mode: str = "interactive"
     # AG2b/AM3: a `kind: agent` workspace's supervisor launch spec (warren_common.agent_launch); None for user workspaces.
     agent: dict | None = None
+    # The resolved template's named ports, {name: {"port": int, "description": str}};
+    # persisted in spec_json and surfaced by the workspace API (`warren proxy add --from-template`).
+    ports: dict[str, dict] = field(default_factory=dict)
 
 
 def harness_state(spec: WorkspaceSpec) -> dict:

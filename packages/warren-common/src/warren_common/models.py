@@ -246,6 +246,44 @@ class AgentConfig(BaseModel):
         return v
 
 
+_PORT_NAME_RE = re.compile(r"^[a-z0-9-]+$")
+
+
+class PortSpec(BaseModel):
+    """One named port a workspace serves (e.g. `t3: 3773`). Declarative only:
+    nothing is exposed by declaring it; `warren proxy add --from-template`
+    reads the names back from the workspace API to map each one locally."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    port: int = Field(ge=1, le=65535)
+    description: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _bare_port(cls, data: Any) -> Any:
+        # `t3: 3773` is shorthand for `t3: {port: 3773}`.
+        if isinstance(data, bool):
+            raise ValueError("port must be an integer, not a boolean")
+        if isinstance(data, int):
+            return {"port": data}
+        if isinstance(data, dict) and isinstance(data.get("port"), bool):
+            raise ValueError("port must be an integer, not a boolean")
+        return data
+
+
+def check_ports(ports: dict[str, PortSpec]) -> dict[str, PortSpec]:
+    """Port names are `[a-z0-9-]+`; no two names share a port number."""
+    seen: dict[int, str] = {}
+    for name, spec in ports.items():
+        if not isinstance(name, str) or not _PORT_NAME_RE.match(name):
+            raise ValueError(f"port name {name!r} must match [a-z0-9-]+")
+        if spec.port in seen:
+            raise ValueError(f"ports {seen[spec.port]!r} and {name!r} both declare port {spec.port}")
+        seen[spec.port] = name
+    return ports
+
+
 class CustomHarness(BaseModel):
     """AJ1: the program a `custom` harness runs. `readonly` and `persist` are
     workspace-relative; it gets no known harness's grants."""
@@ -347,6 +385,11 @@ class ProjectConfig(BaseModel):
     # First turn handed to the app on provision, where the app supports one
     # (warren_common/seed_prompt.py lists which); ignored otherwise. Not a secret.
     seed_prompt: str | None = None
+    # Named ports the workspace serves, e.g. `{t3: 3773, code: {port: 8080,
+    # description: "code-server"}}`. Merged key-by-key through templates (child
+    # wins). Surfaced in the workspace API so `warren proxy add --from-template`
+    # can map each one; declaring a port exposes nothing by itself.
+    ports: dict[str, PortSpec] = {}
     ecs_image: str = "ghcr.io/scottcowan/warren-ecs-base:latest"  # used for ecs runtimes — a distinct, Debian-based image (Alpine before 1.5.0) built in images/ecs-base/ (no sshd; ECS Exec/SSM instead) — set independently of docker_image, no fallback between them
 
     templates: dict[str, "ProjectConfig"] = {}
@@ -360,6 +403,11 @@ class ProjectConfig(BaseModel):
             if is_reserved_env_name(name):
                 raise ValueError(f"env name {name!r} is reserved by warren")
         return v
+
+    @field_validator("ports")
+    @classmethod
+    def _ports_valid(cls, v: dict[str, PortSpec]) -> dict[str, PortSpec]:
+        return check_ports(v)
 
     @field_validator("harnesses")
     @classmethod

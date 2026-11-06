@@ -89,6 +89,7 @@ _SPEC_EXTRA_FIELDS = (
     "mode",
     "idle_destroy_seconds",
     "agent",
+    "ports",
 )
 
 # Audit R11: "aws"/"scope" are pydantic models (warren_common.models.AwsConfig/

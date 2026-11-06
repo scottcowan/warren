@@ -36,11 +36,31 @@ class Workspace(BaseModel):
     spec_json: str | None = None
 
 
+class WorkspacePort(BaseModel):
+    port: int
+    description: str = ""
+
+
+def _ports_view(raw: object) -> dict[str, WorkspacePort]:
+    """spec_json's `ports`, skipping anything malformed (rows predating the field have none)."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, WorkspacePort] = {}
+    for name, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        port, desc = entry.get("port"), entry.get("description", "")
+        if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535:
+            out[str(name)] = WorkspacePort(port=port, description=desc if isinstance(desc, str) else "")
+    return out
+
+
 class WorkspaceView(BaseModel):
     """What GET/POST /workspaces return (BB15): the row minus anything the CLI
     doesn't read. The persisted spec (secret names, folders, mounts, template
     env, aws/ssh/scope) and the host root_path never leave the server; only
-    `app` does, also as a one-key `spec_json` for clients that read it there."""
+    `app` does, also as a one-key `spec_json` for clients that read it there,
+    plus the template's declared `ports` (names and numbers, no secrets)."""
 
     workspace_id: str
     project: str
@@ -60,6 +80,8 @@ class WorkspaceView(BaseModel):
     # AG2b/AM3: an agent workspace's harness and its loopback ACP port (`warren tunnel`).
     agent_harness: str | None = None
     acp_port: int | None = None
+    # The template's named ports ({name: {port, description}}), for `warren proxy add --from-template`.
+    ports: dict[str, WorkspacePort] = {}
 
     @classmethod
     def from_workspace(cls, ws: Workspace) -> "WorkspaceView":
@@ -68,9 +90,11 @@ class WorkspaceView(BaseModel):
             app = extra.get("app")
             harnesses = extra.get("harnesses")
             agent = extra.get("agent") if isinstance(extra.get("agent"), dict) else {}
+            ports = _ports_view(extra.get("ports"))
         except (ValueError, AttributeError):
             app = harnesses = None
             agent = {}
+            ports = {}
         port = agent.get("port")
         return cls(
             workspace_id=ws.workspace_id,
@@ -90,6 +114,7 @@ class WorkspaceView(BaseModel):
             spec_json=json.dumps({"app": app}) if app is not None else None,
             agent_harness=agent.get("harness") if isinstance(agent.get("harness"), str) else None,
             acp_port=port if isinstance(port, int) and not isinstance(port, bool) else None,
+            ports=ports,
         )
 
 

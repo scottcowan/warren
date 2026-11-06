@@ -265,6 +265,148 @@ def test_cli_add_refuses_a_non_ecs_remote(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# named ports (template `ports:`)
+# ---------------------------------------------------------------------------
+
+_DECLARED = {"t3": {"port": 3773, "description": ""}, "code": {"port": 8080, "description": "code-server"}}
+
+
+def _ws_row(ports: dict | None = None) -> dict:
+    row = {"workspace_id": _WS, "status": "running", "container_id": _TASK1}
+    if ports is not None:
+        row["ports"] = ports
+    return row
+
+
+@pytest.fixture
+def control_plane(monkeypatch):
+    """`GET /workspaces` through a faked orchestrator tunnel; yields the respx router."""
+    monkeypatch.setattr(dispatch, "start_orchestrator_port_forward", lambda *a, **kw: (MagicMock(), 54323))
+    with respx.mock(base_url="http://127.0.0.1:54323", assert_all_called=False) as m:
+        yield m
+
+
+def _add(cfg: Path, *args: str):
+    return runner.invoke(app, ["proxy", "add", *args, "--config", str(cfg)])
+
+
+def test_declared_ports_reads_the_api_shape():
+    assert proxy.declared_ports(_ws_row(_DECLARED)) == {"t3": 3773, "code": 8080}
+    assert proxy.declared_ports(_ws_row()) == {}  # a server predating named ports
+    assert proxy.declared_ports(_ws_row({"bad": {"port": 0}, "flag": {"port": True}, "ok": 22})) == {"ok": 22}
+
+
+def test_cli_add_from_template_maps_every_declared_port_and_is_idempotent(tmp_path, control_plane):
+    control_plane.get("/workspaces").mock(return_value=httpx.Response(200, json=[_ws_row(_DECLARED)]))
+    cfg = _config(tmp_path)
+    r = _add(cfg, "abc12345", "--from-template")
+    assert r.exit_code == 0, r.output
+    assert "prodecs/abc12345/code added: http://127.0.0.1:" in r.output
+    assert "prodecs/abc12345/t3 added: http://127.0.0.1:" in r.output
+    first = {(m.name, m.remote_port): m.local_port for m in proxy.MappingStore().load()}
+    assert set(first) == {("t3", 3773), ("code", 8080)}
+
+    again = _add(cfg, "abc12345", "--from-template")
+    assert again.exit_code == 0, again.output
+    assert "added" not in again.output and again.output.count("already mapped") == 2
+    assert {(m.name, m.remote_port): m.local_port for m in proxy.MappingStore().load()} == first
+
+    listed = runner.invoke(app, ["proxy", "list"])
+    assert "-> prodecs/abc12345/t3 (port 3773)" in listed.output
+    as_json = json.loads(runner.invoke(app, ["proxy", "list", "--json"]).output)
+    assert {m["name"] for m in as_json} == {"t3", "code"}
+
+    assert runner.invoke(app, ["proxy", "rm", "abc12345/t3"]).exit_code == 0
+    assert [m.name for m in proxy.MappingStore().load()] == ["code"]
+
+
+def test_cli_add_by_port_name(tmp_path, control_plane):
+    control_plane.get("/workspaces").mock(return_value=httpx.Response(200, json=[_ws_row(_DECLARED)]))
+    cfg = _config(tmp_path)
+    r = _add(cfg, "abc12345", "t3", "--local-port", "50123")
+    assert r.exit_code == 0, r.output
+    assert "prodecs/abc12345/t3 added: http://127.0.0.1:50123" in r.output
+    # --from-template afterwards keeps t3's address and only adds the rest.
+    r2 = _add(cfg, "abc12345", "--from-template")
+    assert "prodecs/abc12345/t3 already mapped: http://127.0.0.1:50123" in r2.output
+    assert "prodecs/abc12345/code added" in r2.output
+
+    unknown = _add(cfg, "abc12345", "acp")
+    assert unknown.exit_code == 1
+    assert "no port named 'acp' (declared: code, t3)" in " ".join(unknown.output.split())
+
+
+def test_cli_add_names_an_existing_numeric_mapping_without_moving_it(tmp_path, control_plane):
+    control_plane.get("/workspaces").mock(return_value=httpx.Response(200, json=[_ws_row(_DECLARED)]))
+    cfg = _config(tmp_path)
+    numeric = _add(cfg, "abc12345", "3773")
+    address = numeric.output.split("added: ")[1].split()[0]
+    named = _add(cfg, "abc12345", "--from-template")
+    assert f"prodecs/abc12345/t3 already mapped: {address}" in named.output
+    assert len(proxy.MappingStore().load()) == 2
+
+
+def test_cli_add_numeric_port_needs_no_control_plane(tmp_path, monkeypatch):
+    def unreachable(*_a, **_kw):
+        raise AssertionError("a numeric port must not contact the control plane")
+
+    monkeypatch.setattr(dispatch, "start_orchestrator_port_forward", unreachable)
+    assert _add(_config(tmp_path), "ws1", "3773").exit_code == 0
+
+
+def test_cli_add_from_template_with_no_declared_ports(tmp_path, control_plane):
+    control_plane.get("/workspaces").mock(return_value=httpx.Response(200, json=[_ws_row()]))
+    r = _add(_config(tmp_path), "abc12345", "--from-template")
+    assert r.exit_code == 1
+    assert "declares no ports" in " ".join(r.output.split())
+    assert proxy.MappingStore().load() == []
+
+
+def test_cli_add_from_template_unknown_workspace(tmp_path, control_plane):
+    control_plane.get("/workspaces").mock(return_value=httpx.Response(200, json=[]))
+    r = _add(_config(tmp_path), "nope", "--from-template")
+    assert r.exit_code == 1 and "not found" in r.output
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["abc12345", "3773", "--from-template"], ["abc12345"], ["abc12345", "--from-template", "--local-port", "5000"]],
+)
+def test_cli_add_rejects_bad_argument_combinations(tmp_path, args):
+    assert _add(_config(tmp_path), *args).exit_code == 2
+
+
+def test_store_moves_a_renumbered_name_and_keeps_its_address(tmp_path):
+    store = proxy.MappingStore(tmp_path / "proxy.json")
+    free = {"port_free": lambda p: True}
+    t3, _ = store.add("prodecs", "ws1", 3773, name="t3", **free)
+    moved, created = store.add("prodecs", "ws1", 3774, name="t3", **free)
+    assert not created and moved.local_port == t3.local_port and moved.remote_port == 3774
+    assert [(m.name, m.remote_port) for m in store.load()] == [("t3", 3774)]
+
+
+def test_store_name_conflict_with_an_existing_mapping(tmp_path):
+    store = proxy.MappingStore(tmp_path / "proxy.json")
+    free = {"port_free": lambda p: True}
+    store.add("prodecs", "ws1", 3773, name="t3", **free)
+    store.add("prodecs", "ws1", 3774, **free)
+    with pytest.raises(proxy.ProxyError, match="already maps; remove one with `warren proxy rm`"):
+        store.add("prodecs", "ws1", 3774, name="t3", **free)
+    assert len(store.load()) == 2
+
+
+def test_store_without_names_still_reads_old_files(tmp_path):
+    path = tmp_path / "proxy.json"
+    path.write_text(json.dumps({"mappings": [
+        {"server": "prodecs", "workspace": "ws1", "remote_port": 3773, "local_port": 47100}
+    ]}))
+    [m] = proxy.MappingStore(path).load()
+    assert m.name is None and m.label == "prodecs/ws1:3773"
+    proxy.MappingStore(path).add("prodecs", "ws1", 8080, port_free=lambda p: True)
+    assert all("name" not in row for row in json.loads(path.read_text())["mappings"])
+
+
+# ---------------------------------------------------------------------------
 # loopback only
 # ---------------------------------------------------------------------------
 

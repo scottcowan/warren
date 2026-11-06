@@ -460,6 +460,11 @@ async def _provision_workspace(
         mode=body.mode,
         operation_id=body.operation_id or "",
         agent=agent_spec,
+        ports=(
+            {name: p.model_dump() for name, p in template_cfg.ports.items()}
+            if template_cfg is not None
+            else {}
+        ),
     )
 
     # Insert row with status=provisioning. D-11: owner_id is set to the creating user so
