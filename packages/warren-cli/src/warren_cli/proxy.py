@@ -483,6 +483,12 @@ class MappingProxy:
         self._server: asyncio.AbstractServer | None = None
         self._idle_task: asyncio.Task | None = None
         self._keepalive_task: asyncio.Task | None = None
+        # Strong references to every connection's task. asyncio holds tasks only
+        # weakly, and once a client half-closes its transport stops reading, so
+        # nothing else reaches the task (the upstream protocol holds its reader
+        # weakly too): a garbage collection mid-relay would destroy it and drop
+        # the connection.
+        self._connections: set[asyncio.Task] = set()
         self._log = log.bind(mapping=mapping.label, local_port=mapping.local_port)
 
     async def listen(self) -> None:
@@ -549,6 +555,10 @@ class MappingProxy:
         raise ProxyError("the SSM port-forward is not accepting connections")
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._connections.add(task)
+            task.add_done_callback(self._connections.discard)
         self.active += 1
         if self._idle_task is not None:
             self._idle_task.cancel()
