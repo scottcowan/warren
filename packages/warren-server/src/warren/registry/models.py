@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
+from warren_common.runtime.ports import is_loopback
 
 WorkspaceStatus = Literal[
     "provisioning", "running", "stopping", "stopped", "failed", "unknown", "destroyed"
@@ -34,6 +35,9 @@ class Workspace(BaseModel):
     # instead of as an empty shell. JSON-encoded; see registry.py's
     # serialize_spec_extra/deserialize_spec_extra.
     spec_json: str | None = None
+    # podman/docker: where each declared port is published on the server host's
+    # loopback ({name: {"host", "port"}}, JSON); see WorkspaceStore.update_host_ports.
+    host_ports_json: str | None = None
 
 
 class WorkspacePort(BaseModel):
@@ -55,12 +59,45 @@ def _ports_view(raw: object) -> dict[str, WorkspacePort]:
     return out
 
 
+class WorkspaceHostPort(BaseModel):
+    """Where a declared port is published on the server host (podman/docker): always a
+    loopback address, reached with an SSH forward to the host or, on the host, directly."""
+
+    host: str
+    port: int
+
+
+def _host_ports_view(raw: str | None, declared: dict[str, WorkspacePort]) -> dict[str, WorkspaceHostPort]:
+    """The recorded host bindings for names the template still declares, loopback only."""
+    try:
+        data = json.loads(raw or "{}")
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, WorkspaceHostPort] = {}
+    for name, entry in data.items():
+        if name not in declared or not isinstance(entry, dict):
+            continue
+        host, port = entry.get("host"), entry.get("port")
+        if (
+            isinstance(host, str)
+            and is_loopback(host)
+            and isinstance(port, int)
+            and not isinstance(port, bool)
+            and 1 <= port <= 65535
+        ):
+            out[name] = WorkspaceHostPort(host=host, port=port)
+    return out
+
+
 class WorkspaceView(BaseModel):
     """What GET/POST /workspaces return (BB15): the row minus anything the CLI
     doesn't read. The persisted spec (secret names, folders, mounts, template
     env, aws/ssh/scope) and the host root_path never leave the server; only
     `app` does, also as a one-key `spec_json` for clients that read it there,
-    plus the template's declared `ports` (names and numbers, no secrets)."""
+    plus the template's declared `ports` (names and numbers, no secrets) and, on
+    podman/docker, `host_ports`: where each is published on the server host's loopback."""
 
     workspace_id: str
     project: str
@@ -82,6 +119,10 @@ class WorkspaceView(BaseModel):
     acp_port: int | None = None
     # The template's named ports ({name: {port, description}}), for `warren proxy add --from-template`.
     ports: dict[str, WorkspacePort] = {}
+    # podman/docker only: {name: {host, port}}, each declared port's loopback binding on
+    # the server host (`warren proxy` forwards to it). Empty on ECS and before the
+    # container exists; a container that's recreated (docker: restarted) gets new ones.
+    host_ports: dict[str, WorkspaceHostPort] = {}
 
     @classmethod
     def from_workspace(cls, ws: Workspace) -> "WorkspaceView":
@@ -115,6 +156,7 @@ class WorkspaceView(BaseModel):
             agent_harness=agent.get("harness") if isinstance(agent.get("harness"), str) else None,
             acp_port=port if isinstance(port, int) and not isinstance(port, bool) else None,
             ports=ports,
+            host_ports=_host_ports_view(getattr(ws, "host_ports_json", None), ports),
         )
 
 

@@ -35,6 +35,7 @@ _TASK1 = "arn:aws:ecs:us-east-1:1:task/prod-cluster/task1111"
 _TASK2 = "arn:aws:ecs:us-east-1:1:task/prod-cluster/task2222"
 
 _CONFIG = (
+    '[defaults]\nserver = "prodecs"\n'
     '[remotes.prodecs]\nruntime_type = "ecs"\necs_cluster = "prod-cluster"\n'
     'ecs_service = "warren-orchestrator"\naws_audience = "warren-prod"\n'
     '[remotes.homelab]\nruntime_type = "ssh"\nssh_host = "node2"\n'
@@ -257,11 +258,34 @@ def test_cli_add_list_rm(tmp_path):
     assert runner.invoke(app, ["proxy", "rm", "ws1"]).exit_code == 1
 
 
-def test_cli_add_refuses_a_non_ecs_remote(tmp_path):
-    r = runner.invoke(app, ["proxy", "add", "ws1", "3773", "--server", "homelab", "--config", str(_config(tmp_path))])
+def test_cli_add_refuses_an_http_remote_on_another_host(tmp_path):
+    cfg = _config(tmp_path, '[remotes.lan]\nurl = "http://10.0.0.5:8420"\n')
+    r = runner.invoke(app, ["proxy", "add", "ws1", "3773", "--server", "lan", "--config", str(cfg)])
     assert r.exit_code == 1
-    assert "only reaches ECS workspaces" in " ".join(r.output.split())
+    assert "add the server as an ssh remote" in " ".join(r.output.split())
     assert not proxy.default_store_path().exists()
+
+
+def test_cli_add_accepts_an_ssh_remote(tmp_path):
+    r = runner.invoke(app, ["proxy", "add", "ws1", "3773", "--server", "homelab", "--config", str(_config(tmp_path))])
+    assert r.exit_code == 0, r.output
+    assert "homelab/ws1:3773 added: http://127.0.0.1:" in r.output
+
+
+def test_pick_server_without_a_default_needs_one_capable_remote(tmp_path):
+    two = tmp_path / "two.toml"
+    two.write_text(_CONFIG.replace('[defaults]\nserver = "prodecs"\n', ""))
+    r = runner.invoke(app, ["proxy", "add", "ws1", "3773", "--config", str(two)])
+    assert r.exit_code == 1
+    assert "more than one remote warren proxy can reach (homelab, prodecs): pass --server" in " ".join(
+        r.output.split()
+    )
+    # An http remote on another host doesn't count; a local one does.
+    one = tmp_path / "one.toml"
+    one.write_text('[remotes.lan]\nurl = "http://10.0.0.5:8420"\n[remotes.here]\nurl = "http://127.0.0.1:8420"\n')
+    r = runner.invoke(app, ["proxy", "add", "ws1", "3773", "--config", str(one)])
+    assert r.exit_code == 0, r.output
+    assert "here/ws1:3773 added" in r.output
 
 
 # ---------------------------------------------------------------------------
@@ -686,10 +710,288 @@ def test_other_errors_are_not_mistaken_for_expiry():
     assert proxy.credentials_error("TargetNotConnected: ecs:prod_x_y is not connected.") is None
 
 
-def test_non_ecs_remote_is_refused_by_the_resolver(tmp_path):
-    cfg = WarrenCLIConfig.load(_config(tmp_path))
-    with pytest.raises(proxy.ProxyError, match="only reaches ECS workspaces"):
-        proxy.remote_for(cfg, "homelab")
+def test_remote_for_accepts_ecs_ssh_and_local_http_only(tmp_path):
+    cfg = WarrenCLIConfig.load(
+        _config(
+            tmp_path,
+            '[remotes.here]\nurl = "http://localhost:8420"\n'
+            '[remotes.here6]\nurl = "http://[::1]:8420"\n'
+            '[remotes.lan]\nurl = "http://10.0.0.5:8420"\n',
+        )
+    )
+    assert proxy.remote_for(cfg, "prodecs").runtime_type == "ecs"
+    assert proxy.remote_for(cfg, "homelab").runtime_type == "ssh"
+    assert proxy.is_local_remote(proxy.remote_for(cfg, "here"))
+    assert proxy.is_local_remote(proxy.remote_for(cfg, "here6"))
+    with pytest.raises(proxy.ProxyError, match="http remote on another host"):
+        proxy.remote_for(cfg, "lan")
+
+
+# ---------------------------------------------------------------------------
+# podman/docker: published host ports, ssh and direct targets
+# ---------------------------------------------------------------------------
+
+_HOST_PORTS = {"t3": {"host": "127.0.0.1", "port": 41001}, "code": {"host": "127.0.0.1", "port": 41002}}
+
+
+def _podman_row(status: str = "running", host_ports: dict | None = None, ports: dict | None = None) -> dict:
+    return {
+        "workspace_id": _WS,
+        "status": status,
+        "container_id": "c0ffee" if status == "running" else None,
+        "ports": _DECLARED if ports is None else ports,
+        "host_ports": _HOST_PORTS if host_ports is None else host_ports,
+    }
+
+
+def _remote(tmp_path, name: str, extra: str = ""):
+    return WarrenCLIConfig.load(_config(tmp_path, extra)).get_remote(name)
+
+
+def test_published_target_for_an_ssh_remote(tmp_path):
+    remote = _remote(tmp_path, "homelab")
+    target = proxy.published_target(_podman_row(), remote_port=3773, remote=remote, server="homelab")
+    assert target == proxy.Target(
+        workspace_id=_WS, kind="ssh", host="127.0.0.1", host_port=41001, ssh_host="node2", ssh_key_path=None
+    )
+    assert target.endpoint == "127.0.0.1:41001"
+
+
+def test_published_target_for_a_local_server_is_direct(tmp_path):
+    remote = _remote(tmp_path, "here", '[remotes.here]\nurl = "http://127.0.0.1:8420"\n')
+    target = proxy.published_target(_podman_row(), remote_port=8080, remote=remote, server="here")
+    assert (target.kind, target.host, target.host_port) == ("direct", "127.0.0.1", 41002)
+
+
+def test_published_target_errors(tmp_path):
+    remote = _remote(tmp_path, "homelab")
+    with pytest.raises(proxy.ProxyError, match=r"port 5173 isn't one of workspace abc12345's template ports"):
+        proxy.published_target(_podman_row(), remote_port=5173, remote=remote, server="homelab")
+    with pytest.raises(proxy.WorkspaceUnavailable, match="reports no host port for 't3'"):
+        proxy.published_target(_podman_row(host_ports={}), remote_port=3773, remote=remote, server="homelab")
+    with pytest.raises(proxy.WorkspaceUnavailable, match="is stopped"):
+        proxy.published_target(_podman_row(status="stopped"), remote_port=3773, remote=remote, server="homelab")
+    # The server only publishes on loopback; anything else is refused, not forwarded to.
+    lan = {"t3": {"host": "0.0.0.0", "port": 41001}}
+    with pytest.raises(proxy.ProxyError, match="not a loopback address"):
+        proxy.published_target(_podman_row(host_ports=lan), remote_port=3773, remote=remote, server="homelab")
+
+
+@pytest.mark.asyncio
+async def test_control_plane_resolver_for_an_ssh_remote(tmp_path, monkeypatch):
+    """The control plane is reached over the ssh remote's own tunnel; the target is the
+    port's host binding on that host."""
+    calls = []
+
+    def fake_forward(*a, **kw):
+        calls.append((a, kw))
+        return MagicMock(), 54324
+
+    monkeypatch.setattr(dispatch, "start_ssh_port_forward", fake_forward)
+    resolver = proxy.ControlPlaneResolver(WarrenCLIConfig.load(_config(tmp_path)))
+    mapping = proxy.Mapping(server="homelab", workspace=_WS[:8], remote_port=3773, local_port=47100)
+    with respx.mock(base_url="http://127.0.0.1:54324") as m:
+        m.get("/workspaces").mock(return_value=httpx.Response(200, json=[_podman_row()]))
+        target = await resolver.resolve(mapping)
+    assert calls == [(("node2", 8420), {"ssh_key_path": None})]
+    assert (target.kind, target.ssh_host, target.host, target.host_port) == ("ssh", "node2", "127.0.0.1", 41001)
+
+
+@pytest.mark.asyncio
+async def test_ssh_forwarder_forwards_to_the_published_loopback_port(monkeypatch):
+    calls = []
+
+    def fake_forward(*a, **kw):
+        calls.append((a, kw))
+        return MagicMock(poll=MagicMock(return_value=None)), 55555
+
+    monkeypatch.setattr(dispatch, "start_ssh_port_forward", fake_forward)
+    target = proxy.Target(
+        workspace_id=_WS, kind="ssh", host="127.0.0.1", host_port=41001, ssh_host="node2", ssh_key_path="~/.ssh/k"
+    )
+    session = await proxy.RuntimeForwarder().start(target, 3773)
+    assert calls == [(("node2", 41001), {"ssh_key_path": "~/.ssh/k", "remote_host": "127.0.0.1"})]
+    assert (session.host, session.local_port, session.alive()) == ("127.0.0.1", 55555, True)
+
+
+@pytest.mark.asyncio
+async def test_runtime_forwarder_picks_by_kind():
+    picked = []
+
+    class Rec:
+        def __init__(self, name):
+            self.name = name
+
+        async def start(self, target, remote_port):
+            picked.append(self.name)
+            return MagicMock()
+
+    fwd = proxy.RuntimeForwarder(ecs=Rec("ecs"), ssh=Rec("ssh"), direct=Rec("direct"))
+    for kind in ("ecs", "ssh", "direct"):
+        await fwd.start(proxy.Target(workspace_id=_WS, kind=kind), 1)
+    assert picked == ["ecs", "ssh", "direct"]
+    direct = await proxy.DirectForwarder().start(
+        proxy.Target(workspace_id=_WS, kind="direct", host="127.0.0.1", host_port=41001), 3773
+    )
+    assert (direct.host, direct.local_port, direct.alive()) == ("127.0.0.1", 41001, True)
+
+
+async def _echo_server(body_prefix: bytes = b"") -> asyncio.AbstractServer:
+    async def handle(r, w):
+        if body_prefix:
+            w.write(body_prefix)
+        await _echo(r, w)
+
+    return await asyncio.start_server(handle, "127.0.0.1", 0)
+
+
+async def _closing_server() -> asyncio.AbstractServer:
+    """Accepts and closes without a byte: an SSH forward whose host port went away."""
+
+    async def handle(r, w):
+        w.close()
+
+    return await asyncio.start_server(handle, "127.0.0.1", 0)
+
+
+def _port_of(server: asyncio.AbstractServer) -> int:
+    return server.sockets[0].getsockname()[1]
+
+
+class SequenceResolver:
+    def __init__(self, *targets: proxy.Target) -> None:
+        self.targets = list(targets)
+        self.calls = 0
+
+    async def resolve(self, mapping):
+        self.calls += 1
+        return self.targets[min(self.calls, len(self.targets)) - 1]
+
+
+def _direct(port: int) -> proxy.Target:
+    return proxy.Target(workspace_id=_WS, kind="direct", host="127.0.0.1", host_port=port)
+
+
+@pytest.mark.asyncio
+async def test_direct_target_follows_a_moved_host_port():
+    """Local server: the proxy connects straight to the published port. When the
+    container comes back on another host port, the old one refuses, and the next
+    connection resolves again and reaches the new one."""
+    old, new = await _echo_server(), await _echo_server()
+    old_port, new_port = _port_of(old), _port_of(new)
+    resolver = SequenceResolver(_direct(old_port), _direct(new_port))
+    mp = await _started(resolver, proxy.DirectForwarder(), revalidate_seconds=3600)
+    try:
+        assert await _roundtrip(mp.mapping.local_port, b"one") == b"one"
+        old.close()
+        await old.wait_closed()
+        with capture_logs() as logs:
+            assert await _roundtrip(mp.mapping.local_port, b"two") == b"two"
+        assert resolver.calls == 2
+        assert mp.target.endpoint == f"127.0.0.1:{new_port}"
+        assert "proxy_host_port_changed" in [e["event"] for e in logs]
+        assert mp._keepalive_task is None  # no SSM session to keep busy
+    finally:
+        await mp.close()
+        new.close()
+
+
+def _ssh(port: int) -> proxy.Target:
+    return proxy.Target(workspace_id=_WS, kind="ssh", host="127.0.0.1", host_port=port, ssh_host="node2")
+
+
+class FakeSshForwarder:
+    """Each 'ssh -L' is a local listener relaying to the target's host port, which stays
+    up (like ssh) even when nothing answers on the far side."""
+
+    def __init__(self, upstreams: dict[int, int]) -> None:
+        self.upstreams = upstreams
+        self.started: list[proxy.Target] = []
+        self.sessions: list = []
+
+    async def start(self, target, remote_port):
+        self.started.append(target)
+        upstream = self.upstreams[target.host_port]
+        session = _ForwardSession(upstream)
+        await session.start()
+        self.sessions.append(session)
+        return session
+
+
+class _ForwardSession:
+    host = "127.0.0.1"
+
+    def __init__(self, upstream: int) -> None:
+        self.upstream = upstream
+        self.local_port = 0
+        self.stopped = False
+        self._server = None
+
+    async def start(self):
+        async def handle(r, w):
+            ur, uw = await asyncio.open_connection("127.0.0.1", self.upstream)
+            await proxy.relay(r, w, ur, uw)
+
+        self._server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        self.local_port = _port_of(self._server)
+
+    def alive(self):
+        return not self.stopped
+
+    def stop(self):
+        self.stopped = True
+        self._server.close()
+
+
+@pytest.mark.asyncio
+async def test_ssh_target_revalidates_after_a_dead_looking_connection():
+    """SSH remote: the forward stays up after the container moved to a new host port,
+    and connections through it just close. The next connection checks the control
+    plane, finds the new port and starts a new forward to it."""
+    gone, new = await _closing_server(), await _echo_server()
+    resolver = SequenceResolver(_ssh(41001), _ssh(41002))
+    forwarder = FakeSshForwarder({41001: _port_of(gone), 41002: _port_of(new)})
+    mp = await _started(resolver, forwarder, revalidate_seconds=3600)
+    try:
+        assert await _roundtrip(mp.mapping.local_port, b"lost") == b""
+        assert await _roundtrip(mp.mapping.local_port, b"found") == b"found"
+        assert [t.host_port for t in forwarder.started] == [41001, 41002]
+        assert forwarder.sessions[0].stopped
+        # A healthy session isn't re-checked again until revalidate_seconds pass.
+        assert await _roundtrip(mp.mapping.local_port, b"again") == b"again"
+        assert resolver.calls == 2
+    finally:
+        await mp.close()
+        gone.close()
+        new.close()
+
+
+@pytest.mark.asyncio
+async def test_ssh_target_revalidation_keeps_the_forward_when_nothing_moved():
+    up = await _echo_server()
+    resolver = SequenceResolver(_ssh(41001))
+    forwarder = FakeSshForwarder({41001: _port_of(up)})
+    mp = await _started(resolver, forwarder, revalidate_seconds=0)
+    try:
+        for payload in (b"a", b"b", b"c"):
+            assert await _roundtrip(mp.mapping.local_port, payload) == payload
+        assert resolver.calls == 3  # checked before each lone connection...
+        assert len(forwarder.started) == 1  # ...but the same forward is reused
+    finally:
+        await mp.close()
+        up.close()
+
+
+@pytest.mark.asyncio
+async def test_ecs_targets_are_not_revalidated():
+    resolver, forwarder = FakeResolver(_TASK1), FakeForwarder()
+    mp = await _started(resolver, forwarder, revalidate_seconds=0)
+    try:
+        for payload in (b"a", b"b"):
+            assert await _roundtrip(mp.mapping.local_port, payload) == payload
+        assert resolver.calls == 1
+    finally:
+        await mp.close()
 
 
 # ---------------------------------------------------------------------------

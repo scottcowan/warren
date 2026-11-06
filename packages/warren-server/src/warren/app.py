@@ -108,7 +108,7 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
         )
     elif settings.runtime_type == "docker":
         from warren_common.runtime.docker import DockerRuntime  # noqa: PLC0415
-        runtime = DockerRuntime(server_id=settings.server_id)
+        runtime = DockerRuntime(server_id=settings.server_id, port_publish_host=settings.ssh_publish_host)
     else:
         # default: podman
         runtime = PodmanRuntime(

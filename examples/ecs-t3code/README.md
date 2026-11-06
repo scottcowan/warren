@@ -141,6 +141,32 @@ t3 serve --port 3773 --no-browser --base-dir /var/lib/warren/t3   # in a tmux wi
 
 Pairing links and codes are passwords. Keep them out of logs, screenshots and issues.
 
+## On a podman or docker server
+
+`warren proxy` reaches podman/docker workspaces too, through an `ssh` remote (an
+SSH forward to the server host) or a local `http` remote (no SSH). The server
+publishes each declared port on its own loopback; see
+[docs/proxy.md](../../docs/proxy.md#podmandocker-servers). Three differences from
+ECS:
+
+- **Declare the port.** Only ports under `ports:` are published, so keep
+  `ports: {t3: 3773}` in the template; `warren proxy add <workspace> 3773` without
+  it has nothing to reach. Recreate a workspace made before the port was declared.
+- **Bind `0.0.0.0` inside the container.** The published port enters through the
+  container's interface, not its loopback, so run
+  `t3 serve --host 0.0.0.0 --port 3773 --no-browser`. It is still only reachable
+  from the server host's loopback: the workspace's bridge network is isolated from
+  other workspaces, and the host port is bound to `127.0.0.1`. Under rootless
+  podman, run slirp4netns rather than pasta if other workspaces on the host aren't
+  trusted (residual risk 6 in [threat-model.md](../../docs/threat-model.md)).
+- **Start it in a session.** This image's entrypoint (from ecs-base) runs
+  `WARREN_APP_CMD`, which only the ECS runtime sets; on podman/docker it idles, so
+  start `t3 serve` from `warren connect`, or use a podman workspace image that runs
+  the template's `app`.
+
+Then `warren proxy add <workspace> --from-template --server <ssh-remote>` and pair
+the app with the printed address, as above.
+
 ## Things to know
 
 - **Don't use T3 Connect (`t3 up`, `t3 connect`) for company code.** It relays the
@@ -184,4 +210,5 @@ linux/amd64 was not run.
 
 Not verified here: linux/amd64 runtime, and a real ECS task (Fargate pull, ECS Exec,
 EFS/EBS volumes, KMS decrypt against the real service). Pairing the desktop app
-through `warren proxy add` wasn't tested.
+through `warren proxy add` wasn't tested, on ECS or on podman/docker, and this image
+hasn't been run as a podman workspace.

@@ -301,6 +301,15 @@ def _spec_mode(spec_json: str | None) -> str:
         return "interactive"
 
 
+def _spec_ports(spec_json: str | None) -> dict:
+    """The persisted spec's template `ports` ({} for old or unreadable rows)."""
+    try:
+        ports = (json.loads(spec_json) if spec_json else {}).get("ports")
+    except (ValueError, AttributeError):
+        return {}
+    return ports if isinstance(ports, dict) else {}
+
+
 class WorkspaceRegistry:
     def __init__(
         self,
@@ -500,6 +509,23 @@ class WorkspaceRegistry:
             log.info("client_attached_unknown", workspace_id=ws.workspace_id)
             return False
         return code in (0, None) and b"attached" in out
+
+    async def _record_host_ports(self, workspace_id: str, handle: WorkspaceHandle, ports: object) -> None:
+        """Store where the container's template-declared ports landed on host loopback
+        (podman/docker, `published_ports` capability), for `warren proxy`. Called each
+        time a container is created or started: docker picks new host ports on every
+        start, and a reprovisioned podman container gets new ones too. Best-effort; a
+        failure leaves the ports unreachable through the proxy, nothing else."""
+        published_ports = getattr(self.runtime, "published_ports", None)
+        if published_ports is None or not isinstance(ports, dict) or not ports:
+            return
+        from warren_common.runtime.ports import host_ports_by_name  # noqa: PLC0415
+
+        try:
+            mapping = host_ports_by_name(ports, await published_ports(handle))
+            await self.store.update_host_ports(workspace_id, mapping)
+        except Exception:
+            log.warning("host_ports_record_failed", workspace_id=workspace_id, exc_info=True)
 
     def _start_log_tail(self, workspace_id: str, runtime_id: str) -> None:
         """Start (or restart) `workspace_id`'s log-tailing task (D-08/D-15).
@@ -835,6 +861,7 @@ class WorkspaceRegistry:
                     workspace_id, spec, branch_from=branch_from
                 )
                 await self.store.mark_running(workspace_id, handle.runtime_id)
+                await self._record_host_ports(workspace_id, handle, spec.ports)
                 self._start_log_tail(workspace_id, handle.runtime_id)
             except ProvisionError as exc:
                 await self.store.update_status(workspace_id, "failed")
@@ -1166,6 +1193,7 @@ class WorkspaceRegistry:
             if status == "stopped" and hasattr(self.runtime, "supports_ssh_access"):
                 await self.runtime.start(handle)
                 await self.store.update_status(workspace_id, "running")
+                await self._record_host_ports(workspace_id, handle, _spec_ports(ws.spec_json))
                 self._start_log_tail(workspace_id, handle.runtime_id)
                 return handle
 
@@ -1191,6 +1219,7 @@ class WorkspaceRegistry:
                 await self.store.update_image(workspace_id, spec.image)
             await self.store.update_ssh_port(workspace_id, port)
             await self.store.mark_running(workspace_id, new_handle.runtime_id)
+            await self._record_host_ports(workspace_id, new_handle, spec.ports)
             self._start_log_tail(workspace_id, new_handle.runtime_id)
             log.info(
                 "workspace_reprovisioned_for_connect",
