@@ -99,6 +99,9 @@ def _provision_http_error(exc: ProvisionError) -> HTTPException:
 
 
 _OPERATION_ID_PATTERN = r"^[A-Za-z0-9._:-]{1,64}$"
+_MAX_PROMPT_CHARS = 65536
+# ECS caps a RunTask's containerOverrides at 8 KiB, and the prompt rides in WARREN_APP_CMD.
+_MAX_ECS_PROMPT_BYTES = 4096
 
 
 class ProvisionRequest(BaseModel):
@@ -108,6 +111,19 @@ class ProvisionRequest(BaseModel):
     mode: Literal["interactive", "single-turn"] = "interactive"
     # AM2: a retry with the same operationId (per caller) returns the original workspace.
     operation_id: str | None = Field(default=None, pattern=_OPERATION_ID_PATTERN)
+    # Headless runs (routes/runs.py, warren_common/headless.py): single-turn only. The
+    # template's app runs once on this prompt, headless; not a secret (it is in the
+    # workspace's env and spec, like seed_prompt).
+    prompt: str | None = Field(default=None, min_length=1, max_length=_MAX_PROMPT_CHARS)
+    # A single-turn run still going after this long is ended as timed_out. None: the
+    # server's run_default_timeout_seconds.
+    timeout_seconds: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _run_fields_single_turn(self):
+        if (self.prompt is not None or self.timeout_seconds is not None) and self.mode != "single-turn":
+            raise ValueError("prompt and timeout_seconds need mode single-turn")
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -364,7 +380,12 @@ async def _provision_workspace(
                 "detail": "mode single-turn needs a template whose `app` runs to completion, not bash",
             },
         )
-    template_env = dict(template_cfg.env) if template_cfg is not None else {}
+    seed_prompt = template_cfg.seed_prompt if template_cfg is not None else None
+    run_timeout = _run_timeout(body, settings)
+    if body.prompt is not None:
+        app_cmd = _headless_app(app_cmd, body.prompt, settings)
+        seed_prompt = None
+    template_env =dict(template_cfg.env) if template_cfg is not None else {}
     # Bedrock: models via the workspace's task role / AWS identity, never a Claude login.
     model_access = (
         "bedrock" if template_cfg is not None and bedrock_mode(template_cfg.model_access, template_env) else ""
@@ -442,7 +463,7 @@ async def _provision_workspace(
         root_path="",
         env=secret_env,
         template_env=template_env,
-        seed_prompt=template_cfg.seed_prompt if template_cfg is not None else None,
+        seed_prompt=seed_prompt,
         secret_names=secret_names,
         owner_id=secret_owner_id,
         storage_key=storage_key,
@@ -518,6 +539,13 @@ async def _provision_workspace(
     else:
         await registry.store.update_status(workspace_id, "provisioning")
 
+    run_store = getattr(request.app.state, "run_store", None)
+    if body.mode == "single-turn" and run_store is not None:
+        await run_store.create(
+            run_id=workspace_id, owner_id=user.user_id, project=body.project,
+            template=body.template, timeout_seconds=run_timeout,
+        )
+
     # Fetch inserted row to return in response
     ws = await registry.store.get(workspace_id)
 
@@ -528,6 +556,8 @@ async def _provision_workspace(
         else:
             await registry._do_provision(workspace_id, spec, branch_from=branch_from)
     except ProvisionError as exc:
+        if body.mode == "single-turn" and run_store is not None:
+            await _fail_run(run_store, workspace_id, f"provision failed ({exc.reason}): {exc}")
         audit_event(
             "workspace.provision",
             request=request,
@@ -644,6 +674,55 @@ def _raise_capacity_exhausted(exc: CapacityExhausted) -> NoReturn:
     else:
         detail = f"max_workspaces_per_user ({exc.limit}) reached for this user"
     raise HTTPException(status_code=503, detail={"error": "capacity_exhausted", "detail": detail})
+
+
+def _run_timeout(body: ProvisionRequest, settings) -> float | None:
+    """A single-turn run's timeout: the request's, else the server default; 422 above the max."""
+    if body.mode != "single-turn":
+        return None
+    default = float(getattr(settings, "run_default_timeout_seconds", 3600.0)) if settings is not None else 3600.0
+    maximum = float(getattr(settings, "run_max_timeout_seconds", 86400.0)) if settings is not None else 86400.0
+    timeout = body.timeout_seconds if body.timeout_seconds is not None else min(default, maximum)
+    if timeout > maximum:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "timeout_too_long", "detail": f"timeout_seconds may be at most {maximum:.0f}"},
+        )
+    return timeout
+
+
+def _headless_app(app_cmd: str, prompt: str, settings) -> str:
+    """The template's app run headless on `prompt` (warren_common/headless.py)."""
+    from warren_common.headless import headless_command  # noqa: PLC0415
+
+    if settings is not None and getattr(settings, "runtime_type", "podman") == "ecs":
+        if len(prompt.encode("utf-8")) > _MAX_ECS_PROMPT_BYTES:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "prompt_too_large",
+                    "detail": f"on ECS the prompt rides in the task's env overrides; at most "
+                    f"{_MAX_ECS_PROMPT_BYTES} bytes",
+                },
+            )
+    try:
+        return headless_command(app_cmd, prompt)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422, detail={"error": "invalid_template", "detail": str(exc)}
+        ) from exc
+
+
+async def _fail_run(run_store, run_id: str, error: str) -> None:
+    from warren.registry import runs  # noqa: PLC0415
+
+    run = await run_store.get(run_id)
+    if run is None or run["status"] != runs.RUNNING:
+        return
+    ended = runs.utcnow()
+    await run_store.finish(
+        run_id, status=runs.FAILED, result=runs.failure_result(run=run, error=error, ended_at=ended), ended_at=ended
+    )
 
 
 def _deny_scoped_provision(request: Request, workspace_id: str) -> None:

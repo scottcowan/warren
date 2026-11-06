@@ -316,6 +316,18 @@ class DockerRuntime:
             return "stopped"
         return "unknown"
 
+    async def exit_code(self, handle: WorkspaceHandle) -> int | None:
+        """AH2/headless runs: State.ExitCode of an exited container (None while running)."""
+        container = await self._get_container(handle)
+        if container is None:
+            return None
+        await asyncio.to_thread(lambda: container.reload())
+        state = (getattr(container, "attrs", None) or {}).get("State") or {}
+        if str(state.get("Status", "")).lower() == "running":
+            return None
+        code = state.get("ExitCode")
+        return int(code) if isinstance(code, int) else None
+
     async def _get_container(self, handle: WorkspaceHandle) -> Any:
         import docker.errors
 
