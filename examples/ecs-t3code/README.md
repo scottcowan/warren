@@ -24,9 +24,8 @@ same as ecs-base. It idles on `tail -f /dev/null` as uid 1000 for ECS Exec, runs
 `WARREN_APP_CMD` when one is set, and uses the same git-init and secrets handling. It
 also works as the task's `git-init` container.
 
-1.5.0 isn't published yet, so `WARREN_ECS_BASE` defaults to the
-`ghcr.io/scottcowan/warren-ecs-base:1.5.0` tag. Once it's published, pin it by digest
-for your own builds (`--build-arg WARREN_ECS_BASE=ghcr.io/scottcowan/warren-ecs-base:1.5.0@sha256:...`).
+`WARREN_ECS_BASE` defaults to `ghcr.io/scottcowan/warren-ecs-base:1.5.0`, pinned by digest.
+To use a newer base, pass `--build-arg WARREN_ECS_BASE=ghcr.io/scottcowan/warren-ecs-base:<version>@sha256:...`.
 
 ## What's in the image
 
@@ -67,8 +66,8 @@ docker buildx build --platform linux/arm64 --load -t warren-ecs-t3code:local exa
 docker buildx build --platform linux/amd64 --load -t warren-ecs-t3code:local examples/ecs-t3code
 ```
 
-To build on an ecs-base you built from this repo (for example before 1.5.0 is
-published):
+To build on an ecs-base you built from this repo (for example to test changes to
+the base before they are released):
 
 ```bash
 docker buildx build --platform linux/arm64 --load -t warren-ecs-base:local \
