@@ -12,6 +12,7 @@ bug when `PodmanRuntime` builds its own client.
 from __future__ import annotations
 
 import os
+import shutil
 import uuid
 from pathlib import Path
 from typing import Iterator
@@ -268,3 +269,73 @@ def itest_env(
             log.warning("itest_env teardown: failed to list networks", server_id=itest_server_id)
         finally:
             client.close()
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[4]
+
+
+def _build_image(build_dir: Path, dockerfile: str, tag: str, buildargs: dict[str, str] | None = None) -> None:
+    from podman import PodmanClient
+
+    client = PodmanClient(base_url=f"unix://{os.environ['PODMAN_SOCKET']}", timeout=60)
+    try:
+        client.images.build(
+            path=str(build_dir), dockerfile=dockerfile, tag=tag, rm=True, timeout=1800, buildargs=buildargs or {}
+        )
+    finally:
+        client.close()
+
+
+@pytest.fixture(scope="session")
+def itest_docker_base_image(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """warren-docker-base as this checkout builds it (the workload user, the entrypoint's
+    privilege drop, the tmux wrapper), or the image named by WARREN_ITEST_DOCKER_BASE.
+
+    Built from a pruned copy of the repo (just the files its Dockerfile COPYs or installs),
+    not the checkout, so a local .venv or node_modules never reaches the build context.
+    WARREN_ITEST_BASE_REGISTRY picks where the digest-pinned python base is pulled from
+    (CI uses mirror.gcr.io/library, as the image's own workflows do)."""
+    if not os.environ.get("PODMAN_SOCKET"):
+        pytest.skip("PODMAN_SOCKET not set")
+    named = os.environ.get("WARREN_ITEST_DOCKER_BASE", "")
+    if named:
+        return named
+    root = _repo_root()
+    ctx = tmp_path_factory.mktemp("docker-base-context")
+    for rel in (
+        "images/warren-docker-base",
+        "packages/warren-sidecar",
+        "packages/warren-common/src/warren_common/assets",
+        "packages/warren-common/src/warren_common/agent_supervisor.py",
+    ):
+        src, dst = root / rel, ctx / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(src, dst, ignore=shutil.ignore_patterns("__pycache__", "tests", ".venv", "*.pyc"))
+        else:
+            shutil.copy2(src, dst)
+    buildargs = {}
+    if os.environ.get("WARREN_ITEST_BASE_REGISTRY"):
+        buildargs["BASE_REGISTRY"] = os.environ["WARREN_ITEST_BASE_REGISTRY"]
+    tag = "localhost/warren-itest-docker-base:latest"
+    _build_image(ctx, "images/warren-docker-base/Dockerfile", tag, buildargs)
+    return tag
+
+
+@pytest.fixture(scope="session")
+def itest_docker_ssh_on_new_base(itest_docker_base_image: str, tmp_path_factory: pytest.TempPathFactory) -> str:
+    """The shipped warren-docker-ssh-base files (sshd_config, warren-sshd-start.sh, its
+    users and hardening) on top of the docker-base this checkout builds, instead of the
+    multi-GB dev-base it normally pins: same sshd, same entrypoint hand-off, new base."""
+    src = _repo_root() / "images" / "warren-docker-ssh-base"
+    ctx = tmp_path_factory.mktemp("docker-ssh-context")
+    shutil.copytree(src, ctx, dirs_exist_ok=True)
+    lines = (src / "Dockerfile").read_text().splitlines()
+    froms = [i for i, line in enumerate(lines) if line.startswith("FROM ")]
+    assert len(froms) == 1, "expected a single FROM in warren-docker-ssh-base"
+    lines[froms[0]] = f"FROM {itest_docker_base_image}"
+    (ctx / "Dockerfile").write_text("\n".join(lines) + "\n")
+    tag = "localhost/warren-itest-docker-ssh-on-new-base:latest"
+    _build_image(ctx, "Dockerfile", tag)
+    return tag

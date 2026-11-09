@@ -143,17 +143,41 @@ images. As a result:
   privileges: container root is still an unprivileged subuid on the host, and it can't
   act as the server user.
 
-The container still starts as the image's `USER` (root for warren's images). The server
-passes it to podman explicitly, because with keep-id and no explicit user podman would
-start the entrypoint as uid 1000. Processes running as root inside the workspace (the
-default tmux session and harnesses in `warren-docker-base`) can still write the checkout,
-but what they create there is owned by a subuid on the host. The server handles that
-itself: destroy removes such files with `podman unshare rm -rf` when a plain delete is
-refused, and harness state files it can't read on the host are read through the podman
-API instead. The entrypoint gives what its harness init writes to the harness dir's
-owner. Host-side git operations on files root created in the checkout (for example
-`POST /workspaces/{id}/git/pull` into a directory root made) can fail with
-`Permission denied`. Run the processes that write the checkout as `warren` to avoid this.
+**The workload runs as `warren`.** `warren-docker-base` (and the dev, ssh and harness
+images built on it) still *starts* as container root, which is the image's `USER` (none is
+set: `warren-docker-ssh-base`'s sshd needs root at start). The entrypoint does the few
+things that need root (writes `/etc/warren/session.env` and `/etc/warren/workload`), then
+drops itself to `warren` (uid/gid 1000) before it starts the harness init, the agent
+supervisor, the state recorder, the tmux session and the app. It drops only when the bind
+mounts are owned by uid 1000, so the files the agent creates in the checkout are the
+server user's on the host and the server's own `git/pull` and cleanup work on them:
+
+| Runtime / mapping | Mounts as seen in the container | Workload | Why |
+|---|---|---|---|
+| podman `keep-id:uid=1000,gid=1000` (default) | uid 1000 | `warren` (1000) | the server user is 1000 here, so 1000's writes are the server's on the host |
+| podman `host` (`WARREN_PODMAN_USERNS=host`) | root | root, as before | the server user is container root; a uid-1000 workload would write as a subuid the server can't read or delete |
+| docker (rootful), server uid 1000 | uid 1000 | `warren` | same ownership as keep-id |
+| docker (rootful), any other server uid | that uid | root, as before | chowning the checkout to 1000 would take it from the server's user; root can write it |
+| podman `keep-id` with an image from before the drop | uid 1000 | root | old images keep the old behaviour, including the cleanup workarounds below |
+
+`WARREN_WORKLOAD_USER=root` or `warren` (workspace env) overrides the probe. Server-side
+`exec` sessions (the `POST /workspaces/{id}/exec` relay) run as uid 1000 too when the
+mapping is `keep-id` with uid 1000 and the image carries the label
+`dev.warren.workload-uid=1000` (the container gets a `warren.exec_user` label); a root
+`podman exec ... tmux` (what `warren connect` runs) reaches the workload's tmux server as
+`warren` through a wrapper at `/usr/local/bin/tmux`. git_write token files (a root-owned
+directory of uid-1000, mode 0600 files, written and chowned as root) are readable by the
+workload either way.
+Because the image sets no `USER`, the server's explicit `User` handling is unchanged: it
+still passes the image's own `USER` (root here) to podman, and an image that does set
+`USER warren` is honored as is.
+
+What still works around root-owned files, kept for `host`-era checkouts, older images and
+rootful docker with a non-1000 server uid: destroy removes subuid-owned files with
+`podman unshare rm -rf` when a plain delete is refused, harness state files the server
+can't read on the host are read through the podman API, and a still-root entrypoint gives
+what its harness init writes to the harness dir's owner. A new keep-id workspace on a
+new image needs none of them.
 
 The first start of an image under a new mapping can take longer, because podman may
 have to re-own the image's layers for the new user namespace.
