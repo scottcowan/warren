@@ -18,8 +18,8 @@
 # in the image: one is generated at the container's first start.
 #
 # Pinned by digest like warren-docker-dev-base pins warren-docker-base:
-# warren-docker-dev-base:latest (warren-docker-dev-base-v1.0.1, multi-arch) as of 2026-11-01.
-FROM ghcr.io/scottcowan/warren-docker-dev-base:latest@sha256:32296404a24f2dda002d7489e60548a517c0918ec8d1a3265ff710121f68761c
+# warren-docker-dev-base 1.1.0 (multi-arch), the first release with codex and pi, as of 2026-11-09.
+FROM ghcr.io/scottcowan/warren-docker-dev-base:1.1.0@sha256:33be0122920dc1956fa5d655ebcc5df4803e4b704a75d28b22db28ec953168ca
 
 # openssh-server from Debian's archive. Its postinst host keys are deleted (no image, and
 # so no two workspaces, share a host key), the default sshd_config is replaced and the

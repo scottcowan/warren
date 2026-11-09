@@ -32,7 +32,7 @@ for your own builds (`--build-arg WARREN_ECS_BASE=ghcr.io/scottcowan/warren-ecs-
 
 | | Version | Pinned by |
 | --- | --- | --- |
-| base | warren-ecs-base 1.5.0 (Debian bookworm-slim) | `WARREN_ECS_BASE` (tag until 1.5.0 is published; pin by digest) |
+| base | warren-ecs-base 1.5.0 (Debian bookworm-slim) | `WARREN_ECS_BASE` (pinned by tag and digest) |
 | t3 | 0.1.6 (stable) | `T3_VERSION` plus the per-arch sha256 from the release's `SHA256SUMS` |
 | Claude Code | 2.1.308 | `CLAUDE_CODE_VERSION`, sha256 from Anthropic's GPG-signed manifest |
 | apt (on top of ecs-base) | curl, python3 (3.11), jq, ripgrep | the bookworm archive at build time (not version-pinned) |
