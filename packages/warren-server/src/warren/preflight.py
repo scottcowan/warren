@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import socket as _socket_mod
 from pathlib import Path
 from typing import Any
@@ -18,8 +19,9 @@ from typing import Any
 import structlog
 
 from warren.errors import PreflightError
-from warren.podman_host import pasta_apparmor_warning, read_local_pasta_profile
+from warren.podman_host import pasta_apparmor_warning, pasta_host_loopback_warning, read_local_pasta_profile
 from warren.runtime import podman as _podman_module
+from warren.runtime.userns import KEEP_ID_OPTIONS_MIN_PODMAN, needs_keep_id_options
 
 log = structlog.get_logger(__name__)
 _stdlib_log = logging.getLogger(__name__)
@@ -69,7 +71,43 @@ def _warn_pasta_apparmor(info: dict[str, Any], socket: Path, same_host: bool) ->
     )
 
 
-async def run_preflight(socket_path: str | Path, *, same_host: bool = False) -> None:
+def _podman_version(info: dict[str, Any]) -> tuple[int, int] | None:
+    version = info.get("version") or info.get("Version") or {}
+    text = version.get("Version") or version.get("version") if isinstance(version, dict) else None
+    m = re.match(r"\s*v?(\d+)\.(\d+)", str(text or ""))
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _check_userns_support(info: dict[str, Any], userns: str) -> None:
+    """keep-id's uid/gid options need podman >= 4.3; older podman rejects the create."""
+    if not needs_keep_id_options(userns):
+        return
+    version = _podman_version(info)
+    if version is not None and version < KEEP_ID_OPTIONS_MIN_PODMAN:
+        want = ".".join(str(p) for p in KEEP_ID_OPTIONS_MIN_PODMAN)
+        raise PreflightError(
+            f"WARREN_PODMAN_USERNS={userns!r} needs podman >= {want} "
+            f"(found {version[0]}.{version[1]}). Upgrade podman, or set "
+            "WARREN_PODMAN_USERNS=host to keep podman's default mapping."
+        )
+
+
+def _warn_pasta_host_loopback(info: dict[str, Any], socket: Path) -> None:
+    warning = pasta_host_loopback_warning(info)
+    if warning is None:
+        return
+    log.warning("podman_pasta_host_loopback", socket=str(socket), **warning)
+    _stdlib_log.warning(
+        "Podman %s runs rootless networking through pasta: workspaces can reach host loopback "
+        "via 169.254.1.2, including other workspaces' published ports (docs/threat-model.md, "
+        "residual risk 6)",
+        warning["podman_version"],
+    )
+
+
+async def run_preflight(
+    socket_path: str | Path, *, same_host: bool = False, userns: str = ""
+) -> None:
     """Raise PreflightError on fatal misconfiguration; log warning for `vfs`.
 
     Fatal:
@@ -80,6 +118,7 @@ async def run_preflight(socket_path: str | Path, *, same_host: bool = False) -> 
     Warning (non-fatal):
       * graphDriverName == "vfs" (Pitfall #5)
       * rootless pasta under AppArmor on podman 5.x (warren.podman_host)
+      * rootless pasta at all: host loopback reachable from containers (warren.podman_host)
 
     `same_host` says the server shares podman's filesystem, so the pasta AppArmor
     profile can be read locally to rule the pasta warning out.
@@ -119,6 +158,8 @@ async def run_preflight(socket_path: str | Path, *, same_host: bool = False) -> 
         )
 
     _warn_pasta_apparmor(info, socket, same_host)
+    _check_userns_support(info, userns)
+    _warn_pasta_host_loopback(info, socket)
 
 
 async def check_podman_health(socket_path: str | Path) -> dict:

@@ -103,6 +103,7 @@ PROMPT = {"sessionId": "sess-1", "prompt": [{"type": "text", "text": "hi"}]}
 
 # --- AG2b: restart policy ---
 
+@pytest.mark.asyncio
 async def test_restarts_with_backoff_then_gives_up(tmp_path):
     spec = make_spec(tmp_path, [sys.executable, "-c", "import sys; sys.exit(1)"])
     rc = await asyncio.wait_for(sv.Supervisor(spec).run(), 10)
@@ -115,6 +116,7 @@ async def test_restarts_with_backoff_then_gives_up(tmp_path):
     assert state(tmp_path)["state"] == "exited"
 
 
+@pytest.mark.asyncio
 async def test_clean_exit_is_not_restarted_on_failure_policy(tmp_path):
     spec = make_spec(tmp_path, [sys.executable, "-c", "pass"])
     assert await asyncio.wait_for(sv.Supervisor(spec).run(), 10) == 0
@@ -122,6 +124,7 @@ async def test_clean_exit_is_not_restarted_on_failure_policy(tmp_path):
     assert state(tmp_path)["state"] == "exited"
 
 
+@pytest.mark.asyncio
 async def test_always_policy_restarts_a_clean_exit(tmp_path):
     spec = make_spec(tmp_path, [sys.executable, "-c", "pass"],
                      restart={"policy": "always", "max_restarts": 1, "backoff_seconds": 0})
@@ -129,12 +132,14 @@ async def test_always_policy_restarts_a_clean_exit(tmp_path):
     assert [e["event"] for e in events(tmp_path)].count("agent.started") == 2
 
 
+@pytest.mark.asyncio
 async def test_signal_exit_recorded_as_128_plus_signal(tmp_path):
     spec = make_spec(tmp_path, [sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"],
                      restart={"policy": "never"})
     assert await asyncio.wait_for(sv.Supervisor(spec).run(), 10) == 137
 
 
+@pytest.mark.asyncio
 async def test_stop_terminates_the_agent(tmp_path):
     spec = make_spec(tmp_path, [sys.executable, FAKE])
     sup = sv.Supervisor(spec)
@@ -174,6 +179,7 @@ def test_newest_session_record_wins(tmp_path):
     assert sv.Supervisor(make_spec(tmp_path, ["x"])).recorded_session() == "old-id"
 
 
+@pytest.mark.asyncio
 async def test_restart_reloads_the_connected_peers_session(tmp_path):
     spec = make_spec(tmp_path, [sys.executable, FAKE])
     sup = sv.Supervisor(spec)
@@ -197,6 +203,7 @@ async def test_restart_reloads_the_connected_peers_session(tmp_path):
     await finish(sup, task)
 
 
+@pytest.mark.asyncio
 async def test_relaunch_picks_up_the_recorded_session(tmp_path):
     spec = make_spec(tmp_path, [sys.executable, FAKE])
     (tmp_path / "state").mkdir()
@@ -211,6 +218,7 @@ async def test_relaunch_picks_up_the_recorded_session(tmp_path):
 
 # --- AM1 state mapping ---
 
+@pytest.mark.asyncio
 async def test_states_follow_the_acp_traffic(tmp_path):
     spec = make_spec(tmp_path, [sys.executable, FAKE])
     sup = sv.Supervisor(spec)

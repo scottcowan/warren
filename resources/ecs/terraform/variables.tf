@@ -183,3 +183,43 @@ variable "ebs_size_gib" {
     error_message = "ebs_size_gib must be between 1 and 16384."
   }
 }
+
+# ---------------------------------------------------------------------------
+# Optional AWS state backends (warren-server warren/state/, README "State backends").
+# ---------------------------------------------------------------------------
+
+variable "enable_dynamodb_state" {
+  description = "Create the DynamoDB state table (PITR, SSE, TTL) and run the control plane with WARREN_STATE_BACKEND=dynamodb. Default false: SQLite on EFS."
+  type        = bool
+  default     = false
+}
+
+variable "dynamodb_table_name" {
+  description = "Name of the DynamoDB state table (WARREN_DYNAMODB_TABLE). Empty (default) uses warren-state-<env_suffix>."
+  type        = string
+  default     = ""
+}
+
+variable "dynamodb_kms_key_arn" {
+  description = "Customer managed KMS key ARN for the state table's encryption at rest. Empty (default) uses the AWS managed aws/dynamodb key."
+  type        = string
+  default     = ""
+}
+
+variable "enable_secretsmanager_secrets" {
+  description = "Store user secrets in AWS Secrets Manager (WARREN_SECRETS_BACKEND=secretsmanager) and grant the control plane access to <secretsmanager_prefix>/*. Default false: Fernet-encrypted rows in SQLite."
+  type        = bool
+  default     = false
+}
+
+variable "secretsmanager_prefix" {
+  description = "Secret name prefix (WARREN_SECRETSMANAGER_PREFIX). Empty (default) uses <ecs_resource_prefix>/<env_suffix>."
+  type        = string
+  default     = ""
+}
+
+variable "secretsmanager_kms_key_arn" {
+  description = "Customer managed KMS key ARN for the secrets (WARREN_SECRETSMANAGER_KMS_KEY_ID). Empty (default) uses aws/secretsmanager."
+  type        = string
+  default     = ""
+}

@@ -1,0 +1,76 @@
+name: warren-ecs-ssh-base smoke test
+# Build-only validation, path-scoped like the other image smoke tests. Publishing stays
+# separate, in warren-ecs-ssh-base-image.yml, triggered only by a version tag.
+#
+# Builds ecs-base and dev-base from this same commit first and passes dev-base in as
+# WARREN_ECS_DEV_BASE (the way warren-ecs-dev-base-smoke.yml passes ecs-base), so a
+# change to either parent is tested with this image too. ecs-base's entrypoint is
+# covered because this image wraps it.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - packages/warren-server/images/warren-ecs-ssh-base/**
+      - packages/warren-server/images/warren-ecs-dev-base/**
+      - packages/warren-server/images/ecs-base/Dockerfile
+      - packages/warren-server/images/ecs-base/entrypoint.sh
+      - .github/workflows/warren-ecs-ssh-base-smoke.yml
+      - .github/scripts/ecs-ssh-base-smoke.sh
+  push:
+    branches: [main]
+    paths:
+      - packages/warren-server/images/warren-ecs-ssh-base/**
+      - packages/warren-server/images/warren-ecs-dev-base/**
+      - packages/warren-server/images/ecs-base/Dockerfile
+      - packages/warren-server/images/ecs-base/entrypoint.sh
+      - .github/workflows/warren-ecs-ssh-base-smoke.yml
+      - .github/scripts/ecs-ssh-base-smoke.sh
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The docker driver builds into the runner's own image store, so each later build's
+      # FROM finds the image the previous one loaded (a docker-container builder can't).
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver: docker
+      # Same registry fallback as warren-ecs-base-smoke.yml: the digest-pinned bases from
+      # a registry verified to serve the identical manifests.
+      - id: base
+        name: Resolve base-image registry
+        run: .github/scripts/resolve-base-registry.sh packages/warren-server/images/ecs-base/Dockerfile mirror.gcr.io/library public.ecr.aws/docker/library docker.io/library
+      - name: Build ecs-base from this commit
+        env:
+          PRIMARY: ${{ steps.base.outputs.primary }}
+          FALLBACK: ${{ steps.base.outputs.fallback }}
+        run: |
+          build() {
+            docker buildx build --load -t warren-ecs-base:smoke --build-arg BASE_REGISTRY="$1" \
+              -f packages/warren-server/images/ecs-base/Dockerfile .
+          }
+          build "$PRIMARY" || { sleep 30; build "$FALLBACK"; }
+      - name: Build dev-base from this commit
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: packages/warren-server/images/warren-ecs-dev-base
+          file: packages/warren-server/images/warren-ecs-dev-base/Dockerfile
+          build-args: WARREN_ECS_BASE=warren-ecs-base:smoke
+          push: false
+          load: true
+          tags: warren-ecs-dev-base:smoke
+      - name: Build ssh-base
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: packages/warren-server/images/warren-ecs-ssh-base
+          file: packages/warren-server/images/warren-ecs-ssh-base/Dockerfile
+          build-args: WARREN_ECS_DEV_BASE=warren-ecs-dev-base:smoke
+          push: false
+          load: true
+          tags: warren-ecs-ssh-base:smoke
+
+      - name: Smoke-test the built image
+        run: .github/scripts/ecs-ssh-base-smoke.sh warren-ecs-ssh-base:smoke

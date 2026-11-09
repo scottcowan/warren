@@ -9,11 +9,11 @@ connects to it.
 in `.github/releases.json`, and no image-workflow path filter matches `examples/`. If you
 want to use it, build and push it yourself.
 
-## Base image: `warren-ecs-base` 2.0.0
+## Base image: `warren-ecs-base` 1.5.0
 
-This image targets **`warren-ecs-base` 2.0.0**, the first Debian bookworm-slim (glibc)
-release. T3 Code's prebuilt server is glibc-only: on the 1.x Alpine images it fails with
-`fcntl64: symbol not found`, even with gcompat. So build it on 2.0.0 or later, not 1.x.
+This image targets **`warren-ecs-base` 1.5.0**, the first Debian bookworm-slim (glibc)
+release. T3 Code's prebuilt server is glibc-only: on the 1.4 and earlier Alpine images it fails with
+`fcntl64: symbol not found`, even with gcompat. So build it on 1.5.0 or later, not 1.4 or earlier.
 
 Everything warren needs comes from ecs-base unchanged: `entrypoint.sh`,
 `warren-session`, `warren-init-volume`, `warren-git-materialize`, the harness and
@@ -24,15 +24,15 @@ same as ecs-base. It idles on `tail -f /dev/null` as uid 1000 for ECS Exec, runs
 `WARREN_APP_CMD` when one is set, and uses the same git-init and secrets handling. It
 also works as the task's `git-init` container.
 
-2.0.0 isn't published yet, so `WARREN_ECS_BASE` defaults to the
-`ghcr.io/scottcowan/warren-ecs-base:2.0.0` tag. Once it's published, pin it by digest
-for your own builds (`--build-arg WARREN_ECS_BASE=ghcr.io/scottcowan/warren-ecs-base:2.0.0@sha256:...`).
+1.5.0 isn't published yet, so `WARREN_ECS_BASE` defaults to the
+`ghcr.io/scottcowan/warren-ecs-base:1.5.0` tag. Once it's published, pin it by digest
+for your own builds (`--build-arg WARREN_ECS_BASE=ghcr.io/scottcowan/warren-ecs-base:1.5.0@sha256:...`).
 
 ## What's in the image
 
 | | Version | Pinned by |
 | --- | --- | --- |
-| base | warren-ecs-base 2.0.0 (Debian bookworm-slim) | `WARREN_ECS_BASE` (tag until 2.0.0 is published; pin by digest) |
+| base | warren-ecs-base 1.5.0 (Debian bookworm-slim) | `WARREN_ECS_BASE` (tag until 1.5.0 is published; pin by digest) |
 | t3 | 0.1.6 (stable) | `T3_VERSION` plus the per-arch sha256 from the release's `SHA256SUMS` |
 | Claude Code | 2.1.308 | `CLAUDE_CODE_VERSION`, sha256 from Anthropic's GPG-signed manifest |
 | apt (on top of ecs-base) | curl, python3 (3.11), jq, ripgrep | the bookworm archive at build time (not version-pinned) |
@@ -67,7 +67,7 @@ docker buildx build --platform linux/arm64 --load -t warren-ecs-t3code:local exa
 docker buildx build --platform linux/amd64 --load -t warren-ecs-t3code:local examples/ecs-t3code
 ```
 
-To build on an ecs-base you built from this repo (for example before 2.0.0 is
+To build on an ecs-base you built from this repo (for example before 1.5.0 is
 published):
 
 ```bash
@@ -110,6 +110,7 @@ templates:
     permission: write
     harnesses: [claude]
     app: t3 serve --host 127.0.0.1 --port 3773 --no-browser --base-dir /var/lib/warren/t3
+    ports: {t3: 3773}   # lets `warren proxy add <workspace> --from-template` find it
 ```
 
 warren treats an `app` that isn't a shell or a harness as a service and passes it to the
@@ -126,9 +127,11 @@ t3 serve --port 3773 --no-browser --base-dir /var/lib/warren/t3   # in a tmux wi
 
 ## Pairing the T3 desktop app
 
-1. On your machine, run `warren proxy add <workspace> 3773`. It prints a stable
-   `127.0.0.1:<local-port>` that forwards to port 3773 inside the workspace. (`warren
-   proxy` is a new CLI command, being added separately.)
+1. On your machine, run `warren proxy add <workspace> --from-template` (and keep
+   `warren proxy run` going). With `ports: {t3: 3773}` in the template, it prints a
+   stable `127.0.0.1:<local-port>` for `<server>/<workspace>/t3` that forwards to port
+   3773 inside the workspace. Without `ports`, `warren proxy add <workspace> 3773` does
+   the same. See [docs/proxy.md](../../docs/proxy.md).
 2. Get a pairing link inside the workspace. `t3 serve` prints one when it starts. For
    a fresh one, run `t3 pair` from a warren shell in the workspace (pass `--ttl` and
    `--scope` to narrow it).
@@ -137,6 +140,32 @@ t3 serve --port 3773 --no-browser --base-dir /var/lib/warren/t3   # in a tmux wi
    its host swapped for `127.0.0.1:<local-port>`. The token's `#token=…` stays the same.
 
 Pairing links and codes are passwords. Keep them out of logs, screenshots and issues.
+
+## On a podman or docker server
+
+`warren proxy` reaches podman/docker workspaces too, through an `ssh` remote (an
+SSH forward to the server host) or a local `http` remote (no SSH). The server
+publishes each declared port on its own loopback; see
+[docs/proxy.md](../../docs/proxy.md#podmandocker-servers). Three differences from
+ECS:
+
+- **Declare the port.** Only ports under `ports:` are published, so keep
+  `ports: {t3: 3773}` in the template; `warren proxy add <workspace> 3773` without
+  it has nothing to reach. Recreate a workspace made before the port was declared.
+- **Bind `0.0.0.0` inside the container.** The published port enters through the
+  container's interface, not its loopback, so run
+  `t3 serve --host 0.0.0.0 --port 3773 --no-browser`. It is still only reachable
+  from the server host's loopback: the workspace's bridge network is isolated from
+  other workspaces, and the host port is bound to `127.0.0.1`. Under rootless
+  podman, run slirp4netns rather than pasta if other workspaces on the host aren't
+  trusted (residual risk 6 in [threat-model.md](../../docs/threat-model.md)).
+- **Start it in a session.** This image's entrypoint (from ecs-base) runs
+  `WARREN_APP_CMD`, which only the ECS runtime sets; on podman/docker it idles, so
+  start `t3 serve` from `warren connect`, or use a podman workspace image that runs
+  the template's `app`.
+
+Then `warren proxy add <workspace> --from-template --server <ssh-remote>` and pair
+the app with the printed address, as above.
 
 ## Things to know
 
@@ -160,13 +189,13 @@ Pairing links and codes are passwords. Keep them out of logs, screenshots and is
   previews isn't installed. At startup the server warns that the sandbox is blocked.
   `t3 browser setup` needs root and apt, so add Chrome's libraries in a derived image if
   you need the panel.
-- **You'll need a different port if 3773 is taken.** Pick another `--port` and pass
-  the same number to `warren proxy add`.
+- **You'll need a different port if 3773 is taken.** Pick another `--port` and put
+  the same number in the template's `ports` (or pass it to `warren proxy add`).
 
 ## Verified locally (2026-10-31)
 
 Host: Apple Silicon Mac, colima (BuildKit v0.30.0), native linux/arm64, on an ecs-base
-built from this repo (`--build-arg WARREN_ECS_BASE=<local tag>`, the 2.0.0 Dockerfile).
+built from this repo (`--build-arg WARREN_ECS_BASE=<local tag>`, the 1.5.0 Dockerfile).
 linux/amd64 was not run.
 
 - The build-time checks print `t3 v0.1.6` and `2.1.308 (Claude Code)`.
@@ -181,4 +210,5 @@ linux/amd64 was not run.
 
 Not verified here: linux/amd64 runtime, and a real ECS task (Fargate pull, ECS Exec,
 EFS/EBS volumes, KMS decrypt against the real service). Pairing the desktop app
-through `warren proxy add` wasn't tested.
+through `warren proxy add` wasn't tested, on ECS or on podman/docker, and this image
+hasn't been run as a podman workspace.

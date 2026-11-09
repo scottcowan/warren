@@ -36,6 +36,7 @@ from warren_common.runtime.base import (
     WorkspaceHandle,
     WorkspaceSpec,
 )
+from warren_common.runtime.ports import app_port_bindings, loopback_publish_host, parse_published
 
 log = structlog.get_logger(__name__)
 
@@ -45,9 +46,17 @@ _STATE_SCHEMA_VERSION = 1
 class DockerRuntime:
     """ContainerRuntime backed by the local Docker daemon via docker-py 7.2."""
 
-    def __init__(self, server_id: str, config: RuntimeConfig | None = None) -> None:
+    def __init__(
+        self,
+        server_id: str,
+        config: RuntimeConfig | None = None,
+        *,
+        port_publish_host: str = "127.0.0.1",
+    ) -> None:
         self.server_id = server_id
         self.config = config
+        # Template-declared `ports` are published here (loopback only, see ports.py).
+        self._port_publish_host = loopback_publish_host(port_publish_host)
         self._client: Any = None
         self._preflight_ok = False
 
@@ -166,6 +175,11 @@ class DockerRuntime:
         )
         if spec.root_path:
             run_kwargs["working_dir"] = spec.root_path
+        # Template-declared `ports`: host loopback only, HostPort "" = docker picks a
+        # free one at each start (`published_ports` reads it back). Never 0.0.0.0.
+        ports = {k: (h, None) for k, h in app_port_bindings(spec.ports, self._port_publish_host).items()}
+        if ports:
+            run_kwargs["ports"] = ports
 
         try:
             container = await asyncio.to_thread(
@@ -217,6 +231,16 @@ class DockerRuntime:
             runtime_id=container.id,
             root_path=str(workspace_dir),
         )
+
+    async def published_ports(self, handle: WorkspaceHandle) -> dict[int, tuple[str, int]]:
+        """``{container_port: (host_ip, host_port)}`` for the running container's
+        loopback-published tcp ports (docker assigns them at each start)."""
+        container = await self._get_container(handle)
+        if container is None:
+            return {}
+        await asyncio.to_thread(container.reload)
+        attrs = container.attrs if isinstance(container.attrs, dict) else {}
+        return parse_published((attrs.get("NetworkSettings") or {}).get("Ports"))
 
     async def start(self, handle: WorkspaceHandle) -> None:
         container = await self._get_container(handle)
@@ -291,6 +315,18 @@ class DockerRuntime:
         if raw in ("exited", "dead"):
             return "stopped"
         return "unknown"
+
+    async def exit_code(self, handle: WorkspaceHandle) -> int | None:
+        """AH2/headless runs: State.ExitCode of an exited container (None while running)."""
+        container = await self._get_container(handle)
+        if container is None:
+            return None
+        await asyncio.to_thread(lambda: container.reload())
+        state = (getattr(container, "attrs", None) or {}).get("State") or {}
+        if str(state.get("Status", "")).lower() == "running":
+            return None
+        code = state.get("ExitCode")
+        return int(code) if isinstance(code, int) else None
 
     async def _get_container(self, handle: WorkspaceHandle) -> Any:
         import docker.errors

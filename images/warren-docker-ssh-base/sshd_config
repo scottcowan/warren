@@ -1,0 +1,64 @@
+# warren-docker-ssh-base sshd configuration (/etc/ssh/sshd_config). See docs/workspace-ssh.md.
+#
+# The same hardening as warren-ecs-ssh-base's sshd_config (packages/warren-server/images/
+# warren-ecs-ssh-base/sshd_config); only what the podman runtime fixes differs:
+#   - port 22 on the container's own interfaces: PodmanRuntime publishes container port
+#     22/tcp on the server host's 127.0.0.1 (WARREN_SSH_PUBLISH_HOST) when
+#     WARREN_SSH_ACCESS_ENABLED=true, so the host-side port is loopback-only;
+#   - AuthorizedKeysFile /etc/warren/authorized_keys: where the server writes the key
+#     POST /workspaces/{id}/connect mints (root-owned, 0644, one key, replaced per mint);
+#   - users warren and warren-shell, the names warren-server hands out
+#     (routes/workspaces.py _SSH_LOGIN_USER / _SSH_BREAK_GLASS_USER);
+#   - sshd runs as the container's root (it serves two users). PermitRootLogin stays no.
+#
+# Drop-ins come first so that a derived image can override a setting: for most
+# keywords sshd uses the first value it reads. To allow agent forwarding, add
+# /etc/ssh/sshd_config.d/agent-forwarding.conf containing `AllowAgentForwarding yes`.
+Include /etc/ssh/sshd_config.d/*.conf
+
+Port 22
+AddressFamily inet
+
+# Generated at the container's first start by warren-sshd-start, never baked into the
+# image. The container's filesystem survives stop/start, so the key does too; a
+# re-provisioned container gets a new one.
+HostKey /etc/ssh/warren/ssh_host_ed25519_key
+PidFile /run/sshd.pid
+
+# Key-only: no passwords, no keyboard-interactive, no PAM, no host-based, no GSSAPI.
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+PasswordAuthentication no
+PermitEmptyPasswords no
+KbdInteractiveAuthentication no
+HostbasedAuthentication no
+GSSAPIAuthentication no
+KerberosAuthentication no
+UsePAM no
+AuthorizedKeysFile /etc/warren/authorized_keys
+StrictModes yes
+PermitUserEnvironment no
+MaxAuthTries 3
+LoginGraceTime 30
+
+PermitRootLogin no
+AllowUsers warren warren-shell
+
+# Editors need local (-L / direct-tcpip) forwarding and a pty; nothing else is forwarded.
+AllowTcpForwarding local
+GatewayPorts no
+PermitListen none
+AllowStreamLocalForwarding no
+X11Forwarding no
+AllowAgentForwarding no
+PermitTunnel no
+PermitTTY yes
+
+ClientAliveInterval 30
+ClientAliveCountMax 4
+PrintMotd no
+PrintLastLog no
+Banner none
+LogLevel INFO
+
+Subsystem sftp internal-sftp

@@ -261,6 +261,27 @@ def test_status_reloads_before_read(mock_docker_client, tmp_path):
     assert asyncio.run(rt.status(handle)) == "unknown"
 
 
+def test_exit_code_of_an_exited_container(mock_docker_client, tmp_path):
+    """Headless runs on the docker runtime: the run's exit code comes from State.ExitCode."""
+    import docker.errors
+
+    root = str(tmp_path / "ws")
+    spec = _spec(root)
+    _mkdirs(root, spec)
+    container = MagicMock(id="cid-exit")
+    container.attrs = {"State": {"Status": "running", "ExitCode": 0}}
+    mock_docker_client.containers.run.return_value = container
+    mock_docker_client.containers.get.return_value = container
+    rt = _make_runtime(mock_docker_client)
+    handle = asyncio.run(rt.provision(spec))
+
+    assert asyncio.run(rt.exit_code(handle)) is None
+    container.attrs = {"State": {"Status": "exited", "ExitCode": 3}}
+    assert asyncio.run(rt.exit_code(handle)) == 3
+    mock_docker_client.containers.get.side_effect = docker.errors.NotFound("gone")
+    assert asyncio.run(rt.exit_code(handle)) is None
+
+
 def test_destroy_stops_then_removes(mock_docker_client, tmp_path):
     root = str(tmp_path / "ws")
     spec = _spec(root)
@@ -318,3 +339,62 @@ def test_docker_host_env_wins_on_windows(monkeypatch):
     sentinel = object()
     monkeypatch.setattr(docker, "from_env", lambda: sentinel)
     assert DockerRuntime(server_id="s")._ensure_client() is sentinel
+
+
+# --- template-declared ports: host loopback only, docker picks the host port ---
+
+
+def test_provision_publishes_declared_ports_on_loopback(mock_docker_client, tmp_path):
+    root = str(tmp_path / "ws")
+    spec = _spec(root)
+    spec.ports = {"t3": {"port": 3773, "description": ""}, "code": {"port": 8080}}
+    _mkdirs(root, spec)
+    mock_docker_client.containers.run.return_value = MagicMock(id="cid-1")
+    asyncio.run(_make_runtime(mock_docker_client).provision(spec))
+    kwargs = mock_docker_client.containers.run.call_args.kwargs
+    # HostPort None -> "" in the API: docker assigns a free one at each start.
+    assert kwargs["ports"] == {"3773/tcp": ("127.0.0.1", None), "8080/tcp": ("127.0.0.1", None)}
+
+
+def test_provision_without_declared_ports_publishes_nothing(mock_docker_client, tmp_path):
+    root = str(tmp_path / "ws")
+    spec = _spec(root)
+    _mkdirs(root, spec)
+    mock_docker_client.containers.run.return_value = MagicMock(id="cid-1")
+    asyncio.run(_make_runtime(mock_docker_client).provision(spec))
+    assert "ports" not in mock_docker_client.containers.run.call_args.kwargs
+
+
+@pytest.mark.parametrize("publish_host", ["", "0.0.0.0", "10.0.0.5"])
+def test_declared_ports_never_leave_loopback(mock_docker_client, tmp_path, publish_host):
+    from warren_common.runtime.docker import DockerRuntime
+
+    root = str(tmp_path / "ws")
+    spec = _spec(root)
+    spec.ports = {"t3": {"port": 3773}}
+    _mkdirs(root, spec)
+    mock_docker_client.containers.run.return_value = MagicMock(id="cid-1")
+    rt = DockerRuntime(server_id="test-server", port_publish_host=publish_host)
+    rt._client = mock_docker_client
+    rt._preflight_ok = True
+    asyncio.run(rt.provision(spec))
+    assert mock_docker_client.containers.run.call_args.kwargs["ports"] == {"3773/tcp": ("127.0.0.1", None)}
+
+
+def test_published_ports_reloads_and_reads_loopback_bindings(mock_docker_client):
+    from warren_common.runtime.base import WorkspaceHandle
+
+    container = MagicMock()
+    container.attrs = {
+        "NetworkSettings": {
+            "Ports": {
+                "3773/tcp": [{"HostIp": "127.0.0.1", "HostPort": "49153"}],
+                "8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "49154"}],
+            }
+        }
+    }
+    mock_docker_client.containers.get.return_value = container
+    rt = _make_runtime(mock_docker_client)
+    got = asyncio.run(rt.published_ports(WorkspaceHandle(workspace_id="ws", runtime_id="cid-1", root_path="")))
+    container.reload.assert_called_once()
+    assert got == {3773: ("127.0.0.1", 49153)}

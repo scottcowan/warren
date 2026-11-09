@@ -1,4 +1,4 @@
-"""`warren proxy`: stable loopback addresses for ports inside ECS workspaces.
+"""`warren proxy`: stable loopback addresses for ports inside workspaces.
 
 Each mapping (server, workspace, remote port) owns one local port, chosen once
 and saved in ``~/.warren/proxy.json`` so a client that remembers the address
@@ -14,6 +14,16 @@ exits (task replaced, SSM timeout, network drop) the next connection resolves
 the task again and starts a new one. A session with no connections for
 ``idle_minutes`` is stopped.
 
+Podman/docker workspaces publish each template-declared port on the server
+host's loopback, on a host port the container engine picks; the control plane
+reports it per port name (``host_ports``). For an ``ssh`` remote the session is
+an ``ssh -L <ephemeral>:127.0.0.1:<host-port>`` to the server host, the same kind
+of forward the CLI already uses for that server's control plane; for an ``http``
+remote on this machine's loopback (a local server) the proxy connects straight to
+``127.0.0.1:<host-port>``. A container that comes back with a different host port
+is picked up the same way as a replaced ECS task: the next connection after a
+failure, or the first one after ``revalidate_seconds`` without any, resolves again.
+
 The relay is a plain bidirectional byte copy, so anything that runs over one
 TCP connection (HTTP, WebSockets, gRPC) works unchanged.
 """
@@ -28,9 +38,10 @@ import os
 import re
 import socket
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable, Protocol
+from typing import Any, Awaitable, Callable, Iterable, Literal, Protocol
+from urllib.parse import urlparse
 
 import structlog
 
@@ -104,6 +115,10 @@ class Mapping:
     workspace: str
     remote_port: int
     local_port: int
+    # The template's port name (`ports:` in the template), when the mapping was
+    # added by name or with --from-template. Not part of identity: naming an
+    # existing mapping must not restart its listener.
+    name: str | None = field(default=None, compare=False)
 
     @property
     def key(self) -> tuple[str, str, int]:
@@ -111,6 +126,8 @@ class Mapping:
 
     @property
     def label(self) -> str:
+        if self.name:
+            return f"{self.server}/{self.workspace}/{self.name}"
         return f"{self.server}/{self.workspace}:{self.remote_port}"
 
     @property
@@ -152,6 +169,7 @@ class MappingStore:
                     workspace=str(row["workspace"]),
                     remote_port=int(row["remote_port"]),
                     local_port=int(row["local_port"]),
+                    name=str(row["name"]) if row.get("name") else None,
                 )
             except (KeyError, TypeError, ValueError):
                 log.warning("proxy_mapping_skipped", reason="malformed entry", path=str(self.path))
@@ -162,7 +180,8 @@ class MappingStore:
     def save(self, mappings: Iterable[Mapping]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
-        tmp.write_text(json.dumps({"mappings": [asdict(m) for m in mappings]}, indent=2) + "\n")
+        rows = [{k: v for k, v in asdict(m).items() if k != "name" or v} for m in mappings]
+        tmp.write_text(json.dumps({"mappings": rows}, indent=2) + "\n")
         restrict_to_owner(tmp)
         os.replace(tmp, self.path)
 
@@ -173,6 +192,7 @@ class MappingStore:
         remote_port: int,
         *,
         local_port: int | None = None,
+        name: str | None = None,
         port_base: int = 47100,
         port_free: Callable[[int], bool] = _port_bindable,
     ) -> tuple[Mapping, bool]:
@@ -182,6 +202,12 @@ class MappingStore:
         mapping and its port unchanged, unless ``local_port`` asks for a different
         one. A new port is the first one from ``port_base`` that no other mapping
         uses and that nothing on this machine is listening on right now.
+
+        ``name`` labels the mapping ``<server>/<workspace>/<name>``. A name already
+        mapped on that workspace to a different remote port (the template changed
+        the port) moves to the new remote port and keeps its local port, so the
+        address stays stable; if the new remote port is already mapped too, that's
+        a conflict for the operator to resolve with ``warren proxy rm``.
         """
         if not _valid_port(remote_port):
             raise ProxyError(f"remote port {remote_port} is not a TCP port")
@@ -189,8 +215,32 @@ class MappingStore:
             raise ProxyError(f"local port {local_port} is not a TCP port")
         mappings = self.load()
         existing = next((m for m in mappings if m.key == (server, workspace, remote_port)), None)
+        if name:
+            named = next(
+                (m for m in mappings if (m.server, m.workspace, m.name) == (server, workspace, name) and m is not existing),
+                None,
+            )
+            if named is not None:
+                if existing is not None:
+                    raise ProxyError(
+                        f"{named.label} maps remote port {named.remote_port} but the workspace declares "
+                        f"{name!r} as {remote_port}, which {existing.label} already maps; "
+                        f"remove one with `warren proxy rm`"
+                    )
+                existing = named
         if existing and (local_port is None or local_port == existing.local_port):
-            return existing, False
+            if (existing.name or None) == (name or existing.name) and existing.remote_port == remote_port:
+                return existing, False
+            renamed = Mapping(
+                server=server,
+                workspace=workspace,
+                remote_port=remote_port,
+                local_port=existing.local_port,
+                name=name or existing.name,
+            )
+            self.save([renamed if m is existing else m for m in mappings])
+            return renamed, False
+        name = name or (existing.name if existing else None)
         others = [m for m in mappings if m is not existing]
         used = {m.local_port for m in others}
         if local_port is not None:
@@ -205,14 +255,14 @@ class MappingStore:
             )
             if port is None:
                 raise ProxyError(f"no free local port in {port_base}-{port_base + _PORT_SEARCH_SPAN - 1}")
-        mapping = Mapping(server=server, workspace=workspace, remote_port=remote_port, local_port=port)
+        mapping = Mapping(server=server, workspace=workspace, remote_port=remote_port, local_port=port, name=name)
         self.save([*others, mapping])
         return mapping, existing is None
 
     def remove(self, selector: str, *, server: str | None = None) -> list[Mapping]:
         """Remove mappings matching ``selector``: a local port, ``<workspace>`` (every
-        port of it) or ``<workspace>:<remote-port>``; ``server`` narrows the match.
-        Returns what was removed."""
+        port of it), ``<workspace>:<remote-port>`` or ``<workspace>/<port-name>``;
+        ``server`` narrows the match. Returns what was removed."""
         mappings = self.load()
 
         def matches(m: Mapping) -> bool:
@@ -220,6 +270,9 @@ class MappingStore:
                 return False
             if selector.isdigit():
                 return m.local_port == int(selector)
+            ws_, slash, port_name = selector.rpartition("/")
+            if slash and ws_ and port_name:
+                return m.workspace == ws_ and m.name == port_name
             ws, sep, port = selector.rpartition(":")
             if sep and port.isdigit():
                 return m.workspace == ws and m.remote_port == int(port)
@@ -236,13 +289,33 @@ class MappingStore:
 # ---------------------------------------------------------------------------
 
 
+TargetKind = Literal["ecs", "ssh", "direct"]
+
+
 @dataclass(frozen=True)
 class Target:
-    """Where a mapping's workspace runs right now."""
+    """Where a mapping's workspace port is reachable right now.
+
+    ``ecs``: the workspace's task (``cluster``/``task_arn``), reached over SSM.
+    ``ssh``/``direct``: a podman/docker workspace port published on the server
+    host's loopback at ``host:host_port``, reached through ``ssh -L`` to
+    ``ssh_host`` or, when the server runs on this machine, directly."""
 
     workspace_id: str
-    cluster: str
-    task_arn: str
+    cluster: str = ""
+    task_arn: str = ""
+    kind: TargetKind = "ecs"
+    host: str = ""
+    host_port: int = 0
+    ssh_host: str = ""
+    ssh_key_path: str | None = None
+
+    @property
+    def endpoint(self) -> str:
+        """What a forward is bound to: a different endpoint needs a new forward."""
+        if self.kind == "ecs":
+            return self.task_arn
+        return f"{self.host}:{self.host_port}"
 
 
 class Resolver(Protocol):
@@ -250,7 +323,8 @@ class Resolver(Protocol):
 
 
 class Session(Protocol):
-    """One live port-forward: connections to ``127.0.0.1:local_port`` reach the workspace."""
+    """One live port-forward: connections to ``host:local_port`` (``host`` defaults to
+    127.0.0.1) reach the workspace."""
 
     local_port: int
 
@@ -276,25 +350,111 @@ def match_workspace(workspaces: list[dict], workspace: str) -> dict:
     raise WorkspaceUnavailable(f"workspace {workspace!r} not found")
 
 
-def target_for(ws: dict, *, cluster: str, server: str) -> Target:
-    """The running task for a workspace row from ``GET /workspaces``, or a
-    ``WorkspaceUnavailable`` saying why there isn't one."""
+def _require_running(ws: dict, server: str) -> tuple[str, str]:
+    """``(workspace_id, container_id)`` of a running workspace row, else a
+    ``WorkspaceUnavailable`` saying why it isn't."""
     wid = str(ws.get("workspace_id", ""))
     status = ws.get("status")
-    task_arn = ws.get("container_id")
-    if status == "running" and task_arn:
-        return Target(workspace_id=wid, cluster=cluster, task_arn=str(task_arn))
-    if status == "provisioning" or (status == "running" and not task_arn):
+    runtime_id = ws.get("container_id")
+    if status == "running" and runtime_id:
+        return wid, str(runtime_id)
+    if status == "provisioning" or (status == "running" and not runtime_id):
         raise WorkspaceUnavailable(f"workspace {wid[:8]} is still starting; try again shortly")
     raise WorkspaceUnavailable(
         f"workspace {wid[:8]} is {status}; start it with `warren connect {wid[:8]} --server {server}`"
     )
 
 
+def target_for(ws: dict, *, cluster: str, server: str) -> Target:
+    """The running task for a workspace row from ``GET /workspaces``, or a
+    ``WorkspaceUnavailable`` saying why there isn't one."""
+    wid, task_arn = _require_running(ws, server)
+    return Target(workspace_id=wid, cluster=cluster, task_arn=task_arn)
+
+
+def _is_loopback(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def published_target(ws: dict, *, remote_port: int, remote: Any, server: str) -> Target:
+    """Where a running podman/docker workspace publishes ``remote_port`` on the server
+    host (``host_ports`` in ``GET /workspaces``), as an ``ssh`` target for an ssh
+    remote and a ``direct`` one for a local server. Only template-declared ports are
+    published, and only on loopback; anything else is a ``ProxyError``."""
+    wid, _ = _require_running(ws, server)
+    declared = declared_ports(ws)
+    names = sorted(name for name, port in declared.items() if port == remote_port)
+    if not names:
+        known = ", ".join(f"{n}={p}" for n, p in sorted(declared.items())) or "none"
+        raise ProxyError(
+            f"port {remote_port} isn't one of workspace {wid[:8]}'s template ports (declared: {known}); "
+            "podman/docker workspaces publish only declared ports: add it under `ports:` in the "
+            "template and recreate the workspace"
+        )
+    raw = ws.get("host_ports")
+    entry = raw.get(names[0]) if isinstance(raw, dict) else None
+    host = entry.get("host") if isinstance(entry, dict) else None
+    host_port = entry.get("port") if isinstance(entry, dict) else None
+    if not (isinstance(host_port, int) and not isinstance(host_port, bool) and _valid_port(host_port)):
+        raise WorkspaceUnavailable(
+            f"server {server!r} reports no host port for {names[0]!r} on workspace {wid[:8]} (a server "
+            "predating published ports, or a container created before the template declared it: "
+            "recreate the workspace)"
+        )
+    if not (isinstance(host, str) and _is_loopback(host)):
+        # The server only publishes on loopback; refuse to forward anywhere else.
+        raise ProxyError(f"server {server!r} reports {names[0]!r} on {host!r}, not a loopback address")
+    if remote.runtime_type == "ssh":
+        return Target(
+            workspace_id=wid,
+            kind="ssh",
+            host=host,
+            host_port=host_port,
+            ssh_host=str(remote.ssh_host),
+            ssh_key_path=remote.ssh_key_path,
+        )
+    return Target(workspace_id=wid, kind="direct", host=host, host_port=host_port)
+
+
+def declared_ports(ws: dict) -> dict[str, int]:
+    """The ``ports`` a workspace row from ``GET /workspaces`` declares, as
+    ``{name: port}`` (a server predating named ports sends none)."""
+    out: dict[str, int] = {}
+    raw = ws.get("ports")
+    if not isinstance(raw, dict):
+        return out
+    for name, entry in raw.items():
+        port = entry.get("port") if isinstance(entry, dict) else entry
+        if isinstance(port, int) and not isinstance(port, bool) and _valid_port(port):
+            out[str(name)] = port
+    return out
+
+
+async def fetch_workspaces(cfg: Any, server: str) -> list[dict]:
+    """``GET /workspaces`` on ``server``'s control plane, with operator-facing errors."""
+    from .client import make_remote_client  # noqa: PLC0415
+
+    remote = remote_for(cfg, server)
+    try:
+        async with make_remote_client(remote, timeout=15.0) as c:
+            r = await c.get("/workspaces")
+    except Exception as exc:  # tunnel or HTTP transport failure
+        raise credentials_error(str(exc)) or ProxyError(f"control plane for {server!r} unreachable: {exc}") from exc
+    if r.status_code in (401, 403):
+        raise ProxyError(f"control plane for {server!r} refused the request (HTTP {r.status_code})")
+    if not r.is_success:
+        raise ProxyError(f"control plane for {server!r} answered HTTP {r.status_code}")
+    return r.json()
+
+
 class ControlPlaneResolver:
-    """Resolve a mapping's workspace to its current ECS task through the
-    control plane (``GET /workspaces``), tunnelling to the orchestrator the same
-    way every other remote command does (``make_remote_client``).
+    """Resolve a mapping's workspace to its current ECS task, or its podman/docker
+    port's current host binding, through the control plane (``GET /workspaces``),
+    tunnelling to it the same way every other remote command does
+    (``make_remote_client``).
 
     Runs in a worker thread with its own event loop: opening the orchestrator
     tunnel blocks for up to ~10s, and the proxy's own loop must keep relaying
@@ -307,46 +467,55 @@ class ControlPlaneResolver:
         return await asyncio.to_thread(asyncio.run, self._resolve(mapping))
 
     async def _resolve(self, mapping: Mapping) -> Target:
-        from .client import make_remote_client  # noqa: PLC0415
-
         remote = remote_for(self.cfg, mapping.server)
-        cluster = remote.ecs_cluster or os.environ.get("WARREN_ECS_CLUSTER", "")
-        try:
-            async with make_remote_client(remote, timeout=15.0) as c:
-                r = await c.get("/workspaces")
-        except Exception as exc:  # tunnel or HTTP transport failure
-            raise credentials_error(str(exc)) or ProxyError(
-                f"control plane for {mapping.server!r} unreachable: {exc}"
-            ) from exc
-        if r.status_code in (401, 403):
-            raise ProxyError(f"control plane for {mapping.server!r} refused the request (HTTP {r.status_code})")
-        if not r.is_success:
-            raise ProxyError(f"control plane for {mapping.server!r} answered HTTP {r.status_code}")
-        return target_for(match_workspace(r.json(), mapping.workspace), cluster=cluster, server=mapping.server)
+        workspaces = await fetch_workspaces(self.cfg, mapping.server)
+        ws = match_workspace(workspaces, mapping.workspace)
+        if remote.runtime_type == "ecs":
+            cluster = remote.ecs_cluster or os.environ.get("WARREN_ECS_CLUSTER", "")
+            return target_for(ws, cluster=cluster, server=mapping.server)
+        return published_target(ws, remote_port=mapping.remote_port, remote=remote, server=mapping.server)
+
+
+def is_local_remote(remote: Any) -> bool:
+    """An ``http`` remote whose URL is on this machine's loopback: a server (podman or
+    docker) on this host, whose published workspace ports are this host's loopback too."""
+    if remote.runtime_type != "http" or not remote.url:
+        return False
+    host = (urlparse(str(remote.url)).hostname or "").lower()
+    return host == "localhost" or _is_loopback(host)
+
+
+def proxy_capable(remote: Any) -> bool:
+    return remote.runtime_type in ("ecs", "ssh") or is_local_remote(remote)
 
 
 def remote_for(cfg: Any, server: str) -> Any:
-    """The ecs remote profile ``server``; a ``ProxyError`` for anything else.
-
-    Podman/docker servers (``http``/``ssh`` remotes) are refused: their workspace
-    ports are inside containers on the server host, which the CLI's SSH forward
-    (to the host's loopback control plane) doesn't reach."""
+    """The remote profile ``server`` if `warren proxy` can reach its workspaces, else a
+    ``ProxyError``: ``ecs`` (SSM), ``ssh`` (an SSH forward to the podman/docker host's
+    loopback, where declared ports are published) and an ``http`` remote on this
+    machine's loopback (connect to the published port directly). An ``http`` remote
+    on another host is refused: its workspace ports are on that host's loopback, which
+    only an SSH forward reaches."""
     try:
         remote = cfg.get_remote(server)
     except KeyError as exc:
         raise ProxyError(str(exc.args[0]) if exc.args else str(exc)) from exc
-    if remote.runtime_type != "ecs":
+    if remote.runtime_type == "ecs":
+        if not (remote.ecs_cluster or os.environ.get("WARREN_ECS_CLUSTER")):
+            raise ProxyError(f"remote {server!r} has no ecs_cluster")
+        return remote
+    if not proxy_capable(remote):
         raise ProxyError(
-            f"remote {server!r} is runtime_type {remote.runtime_type!r}: warren proxy only reaches ECS "
-            "workspaces (their ports have no other network path); podman/docker workspace ports are on "
-            "the server host, reach them with your own `ssh -L`"
+            f"remote {server!r} is an http remote on another host ({remote.url}): its workspace ports are "
+            "published on that host's loopback, which warren proxy reaches over SSH; add the server as an "
+            "ssh remote (`warren remote add --ssh-host ...`) and map through that"
         )
-    if not (remote.ecs_cluster or os.environ.get("WARREN_ECS_CLUSTER")):
-        raise ProxyError(f"remote {server!r} has no ecs_cluster")
     return remote
 
 
 class _PopenSession:
+    host = LOOPBACK_HOST
+
     def __init__(self, proc: subprocess.Popen, local_port: int) -> None:
         self.proc = proc
         self.local_port = local_port
@@ -378,6 +547,69 @@ class SsmForwarder:
         return _PopenSession(proc, port)
 
 
+class SshForwarder:
+    """``ssh -L <ephemeral>:<host>:<host-port>`` to the server host, where a podman/docker
+    workspace publishes the port (``dispatch.start_ssh_port_forward``, the same forward
+    the CLI uses for that server's control plane)."""
+
+    async def start(self, target: Target, remote_port: int) -> Session:
+        from . import dispatch  # noqa: PLC0415
+
+        try:
+            proc, port = await asyncio.to_thread(
+                dispatch.start_ssh_port_forward,
+                target.ssh_host,
+                target.host_port,
+                ssh_key_path=target.ssh_key_path,
+                remote_host=target.host,
+            )
+        except RuntimeError as exc:
+            raise ProxyError(str(exc)) from exc
+        return _PopenSession(proc, port)
+
+
+class _DirectSession:
+    """No forward at all: the published port is on this machine's loopback."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self.host = host
+        self.local_port = port
+
+    def alive(self) -> bool:
+        return True
+
+    def stop(self) -> None:
+        pass
+
+
+class DirectForwarder:
+    async def start(self, target: Target, remote_port: int) -> Session:
+        return _DirectSession(target.host, target.host_port)
+
+
+class RuntimeForwarder:
+    """Picks the forward for a target's kind: SSM (ECS), SSH, or none (local server)."""
+
+    def __init__(
+        self,
+        ecs: Forwarder | None = None,
+        ssh: Forwarder | None = None,
+        direct: Forwarder | None = None,
+    ) -> None:
+        self.by_kind: dict[str, Forwarder] = {
+            "ecs": ecs or SsmForwarder(),
+            "ssh": ssh or SshForwarder(),
+            "direct": direct or DirectForwarder(),
+        }
+
+    async def start(self, target: Target, remote_port: int) -> Session:
+        return await self.by_kind[target.kind].start(target, remote_port)
+
+
+def _session_host(session: Session) -> str:
+    return getattr(session, "host", None) or LOOPBACK_HOST
+
+
 # ---------------------------------------------------------------------------
 # listeners and relay
 # ---------------------------------------------------------------------------
@@ -398,11 +630,13 @@ def check_loopback(host: str) -> str:
     return host
 
 
-async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
+async def _pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter, counter: list[int] | None = None) -> None:
     while True:
         data = await src.read(_RELAY_CHUNK)
         if not data:
             break
+        if counter is not None:
+            counter[0] += len(data)
         dst.write(data)
         await dst.drain()
     # Pass the half-close on (HTTP/1.0-style "request done" clients rely on it).
@@ -416,10 +650,15 @@ async def relay(
     a_writer: asyncio.StreamWriter,
     b_reader: asyncio.StreamReader,
     b_writer: asyncio.StreamWriter,
-) -> None:
+) -> int:
     """Copy bytes both ways until both directions finish. A clean EOF is passed on
-    as a half-close; a reset on either side tears down both."""
-    tasks = [asyncio.ensure_future(_pipe(a_reader, b_writer)), asyncio.ensure_future(_pipe(b_reader, a_writer))]
+    as a half-close; a reset on either side tears down both. Returns how many bytes
+    came from ``b`` (the upstream)."""
+    from_b = [0]
+    tasks = [
+        asyncio.ensure_future(_pipe(a_reader, b_writer)),
+        asyncio.ensure_future(_pipe(b_reader, a_writer, from_b)),
+    ]
     try:
         pending = set(tasks)
         while pending:
@@ -436,6 +675,7 @@ async def relay(
         for w in (a_writer, b_writer):
             with contextlib.suppress(Exception):
                 await w.wait_closed()
+    return from_b[0]
 
 
 _HTTP_METHOD_RE = re.compile(rb"^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS) ")
@@ -465,6 +705,10 @@ class ProxySettings:
     idle_minutes: float = 30.0
     keepalive_seconds: float = 240.0
     bind: str = LOOPBACK_HOST
+    # podman/docker targets: a connection arriving when no other is open, this long
+    # after the last resolve, checks the control plane for a moved host port first
+    # (an SSH forward to a stale port stays up and just drops connections).
+    revalidate_seconds: float = 15.0
 
 
 class MappingProxy:
@@ -479,10 +723,18 @@ class MappingProxy:
         self.target: Target | None = None
         self.active = 0
         self.sessions_started = 0
+        self._resolved_at = 0.0
+        self._suspect = False
         self._lock = asyncio.Lock()
         self._server: asyncio.AbstractServer | None = None
         self._idle_task: asyncio.Task | None = None
         self._keepalive_task: asyncio.Task | None = None
+        # Strong references to every connection's task. asyncio holds tasks only
+        # weakly, and once a client half-closes its transport stops reading, so
+        # nothing else reaches the task (the upstream protocol holds its reader
+        # weakly too): a garbage collection mid-relay would destroy it and drop
+        # the connection.
+        self._connections: set[asyncio.Task] = set()
         self._log = log.bind(mapping=mapping.label, local_port=mapping.local_port)
 
     async def listen(self) -> None:
@@ -509,28 +761,59 @@ class MappingProxy:
             self._keepalive_task.cancel()
             self._keepalive_task = None
 
+    def _needs_revalidation(self) -> bool:
+        """A podman/docker target may have moved to a new host port without the forward
+        noticing (an SSH forward stays up and drops connections). Check again before a
+        connection that is the only one open, if the last one looked dead (upstream
+        sent nothing) or the last resolve is older than ``revalidate_seconds``."""
+        if self.target is None or self.target.kind == "ecs" or self.active > 1:
+            return False
+        age = asyncio.get_running_loop().time() - self._resolved_at
+        return self._suspect or age >= self.settings.revalidate_seconds
+
+    async def _resolve(self) -> Target:
+        target = await self.resolver.resolve(self.mapping)
+        self._resolved_at = asyncio.get_running_loop().time()
+        self._suspect = False
+        return target
+
     async def ensure_session(self) -> Session:
-        """The live session, starting one (resolving the task afresh) when there is
-        none or the last one's process has exited. Concurrent callers share it."""
+        """The live session, starting one (resolving the target afresh) when there is
+        none, the last one's process has exited, or a podman/docker target's host port
+        has moved. Concurrent callers share it."""
         async with self._lock:
+            target: Target | None = None
             if self.session is not None and self.session.alive():
-                return self.session
+                if not self._needs_revalidation():
+                    return self.session
+                target = await self._resolve()
+                if self.target is not None and target.endpoint == self.target.endpoint:
+                    return self.session
+                self._stop_session("target_moved")
             if self.session is not None:
                 self._log.warning("proxy_session_exited", task_arn=self.target.task_arn if self.target else None)
                 self._stop_session("exited")
-            target = await self.resolver.resolve(self.mapping)
-            if self.target is not None and target.task_arn != self.target.task_arn:
-                self._log.info("proxy_task_changed", old_task_arn=self.target.task_arn, task_arn=target.task_arn)
+            if target is None:
+                target = await self._resolve()
+            if self.target is not None and target.endpoint != self.target.endpoint:
+                if target.kind == "ecs":
+                    self._log.info("proxy_task_changed", old_task_arn=self.target.task_arn, task_arn=target.task_arn)
+                else:
+                    self._log.info("proxy_host_port_changed", old=self.target.endpoint, new=target.endpoint)
             self.target = target
             self.session = await self.forwarder.start(target, self.mapping.remote_port)
             self.sessions_started += 1
             self._log.info(
                 "proxy_session_started",
                 workspace_id=target.workspace_id,
-                task_arn=target.task_arn,
+                kind=target.kind,
+                task_arn=target.task_arn or None,
+                endpoint=target.endpoint,
                 forward_port=self.session.local_port,
             )
-            if self.settings.keepalive_seconds > 0:
+            # The probe keeps an SSM session busy; an SSH forward or a direct
+            # connection has no idle timeout to beat.
+            if self.settings.keepalive_seconds > 0 and target.kind == "ecs":
                 self._keepalive_task = asyncio.ensure_future(self._keepalive(self.session))
             return self.session
 
@@ -538,7 +821,7 @@ class MappingProxy:
         for attempt in range(2):
             session = await self.ensure_session()
             try:
-                return await asyncio.open_connection(LOOPBACK_HOST, session.local_port)
+                return await asyncio.open_connection(_session_host(session), session.local_port)
             except OSError as exc:
                 # The forward is up as a process but not accepting: treat it as dead
                 # and start over once (the task may have been replaced under it).
@@ -546,9 +829,18 @@ class MappingProxy:
                 async with self._lock:
                     if self.session is session:
                         self._stop_session("refused")
+        if self.target is not None and self.target.kind != "ecs":
+            raise ProxyError(
+                f"nothing accepts connections at the workspace's published port ({self.target.endpoint} on "
+                "the server host); is the workspace running?"
+            )
         raise ProxyError("the SSM port-forward is not accepting connections")
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            self._connections.add(task)
+            task.add_done_callback(self._connections.discard)
         self.active += 1
         if self._idle_task is not None:
             self._idle_task.cancel()
@@ -565,7 +857,10 @@ class MappingProxy:
                 await _reject(reader, writer, "internal error, see the proxy's log")
                 return
             self._log.debug("proxy_connection_open", active=self.active)
-            await relay(reader, writer, up_reader, up_writer)
+            if await relay(reader, writer, up_reader, up_writer) == 0:
+                # Upstream closed without a byte: what a forward to a moved or closed
+                # host port looks like. The next connection checks the target first.
+                self._suspect = True
         finally:
             self.active -= 1
             self._log.debug("proxy_connection_closed", active=self.active)

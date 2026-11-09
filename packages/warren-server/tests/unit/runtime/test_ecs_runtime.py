@@ -236,6 +236,33 @@ def test_agent_workspace_runs_the_supervisor_not_the_harness_as_pid1():
     assert "WARREN_APP_CMD" not in env
     assert json.loads(env["WARREN_AGENT_SPEC"]) == agent
     assert env["WARREN_HARNESSES"] == "opencode"
+    assert env["WARREN_APP_PORT"] == "8765"
+
+
+def test_server_mode_agent_starts_at_boot_on_its_port():
+    """`agent.mode: serve`: the supervisor starts `opencode serve` on agent.port at
+    task start (the harness serves the port itself) and WARREN_APP_PORT names it."""
+    import json
+
+    from warren_common.agent_launch import launch_spec
+    from warren_common.models import AgentConfig
+    from warren_common.runtime.base import WorkspaceSpec
+
+    mock_ecs = _mock_ecs()
+    rt = _make_runtime(mock_ecs, _mock_ssm())
+    agent = launch_spec("opencode", AgentConfig(mode="serve", port=4096))
+    spec = WorkspaceSpec(
+        workspace_id="ws-abcdef12", project="p", intent="bot", image="img", root_path="",
+        owner_id="u", app="bash", harnesses=["opencode"], agent=agent,
+    )
+    asyncio.run(rt.provision(spec))
+    overrides = mock_ecs.run_task.call_args.kwargs["overrides"]
+    env = {e["name"]: e["value"] for e in overrides["containerOverrides"][0]["environment"]}
+    sent = json.loads(env["WARREN_AGENT_SPEC"])
+    assert sent["argv"] == ["opencode", "serve", "--hostname", "127.0.0.1", "--port", "4096"]
+    assert sent["transport"] == "self"
+    assert env["WARREN_APP_PORT"] == "4096"
+    assert "WARREN_APP_CMD" not in env
 
 
 def test_provision_single_turn_harness_app_still_runs_as_pid1():

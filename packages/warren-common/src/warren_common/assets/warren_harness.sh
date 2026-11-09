@@ -76,7 +76,7 @@ _warren_exec() {
         id) set -- --session "$_id" "$@" ;;
       esac
       _b=opencode
-      env OPENCODE_CONFIG_DIR="$WARREN_HARNESS_ROOT/opencode/config" OPENCODE_DB="$WARREN_HARNESS_ROOT/opencode/data/opencode.db" OPENCODE_DISABLE_CLAUDE_CODE=1 OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_LSP_DOWNLOAD=1 WARREN_STATE_DIR="$WARREN_HARNESS_ROOT/.session" "$_b" "$@"
+      env OPENCODE_CONFIG_DIR="$WARREN_HARNESS_ROOT/opencode/config" OPENCODE_DB="$WARREN_HARNESS_ROOT/opencode/data/opencode.db" XDG_DATA_HOME="$WARREN_HARNESS_ROOT/opencode/data" XDG_STATE_HOME="$WARREN_HARNESS_ROOT/opencode/state" OPENCODE_DISABLE_CLAUDE_CODE=1 OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_LSP_DOWNLOAD=1 WARREN_STATE_DIR="$WARREN_HARNESS_ROOT/.session" "$_b" "$@"
       ;;
     pi)
       case "$_m" in

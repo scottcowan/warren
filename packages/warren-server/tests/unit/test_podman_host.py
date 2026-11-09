@@ -139,14 +139,14 @@ async def _preflight(tmp_path: Path, info: dict, **kwargs) -> None:
 async def test_preflight_warns_without_failing(tmp_path: Path, caplog):
     with caplog.at_level(logging.WARNING):
         await _preflight(tmp_path, PODMAN_57_PASTA)
-    assert any("slirp4netns" in r.getMessage() for r in caplog.records)
+    assert any("AppArmor" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio
 async def test_preflight_silent_on_slirp4netns(tmp_path: Path, caplog):
     with caplog.at_level(logging.WARNING):
         await _preflight(tmp_path, PODMAN_57_SLIRP)
-    assert not any("slirp4netns" in r.getMessage() for r in caplog.records)
+    assert not any("AppArmor" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -159,13 +159,13 @@ async def test_preflight_reads_local_profile_only_on_same_host(tmp_path: Path, c
         with caplog.at_level(logging.WARNING):
             await _preflight(tmp_path, PODMAN_57_PASTA, same_host=False)
         read.assert_not_called()
-        assert any("slirp4netns" in r.getMessage() for r in caplog.records)
+        assert any("AppArmor" in r.getMessage() for r in caplog.records)
         caplog.clear()
         # Same host whose pasta profile allows podman's signal: no warning.
         with caplog.at_level(logging.WARNING):
             await _preflight(tmp_path, PODMAN_57_PASTA, same_host=True)
         read.assert_called_once()
-        assert not any("slirp4netns" in r.getMessage() for r in caplog.records)
+        assert not any("AppArmor" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -176,3 +176,29 @@ async def test_preflight_hostname_mismatch_skips_local_profile(tmp_path: Path):
     ):
         await _preflight(tmp_path, PODMAN_57_PASTA, same_host=True)
     read.assert_not_called()
+
+
+# --- pasta and host loopback (published workspace ports) ---
+
+
+@pytest.mark.parametrize("info", [PODMAN_57_PASTA, PODMAN_57_NO_APPARMOR, _info("6.0.1", "pasta", apparmor=False)])
+def test_pasta_host_loopback_warns_for_rootless_pasta(info):
+    w = podman_host.pasta_host_loopback_warning(info)
+    assert w is not None and w["rootless_network_cmd"] == "pasta"
+    assert "169.254.1.2" in w["detail"] and "slirp4netns" in w["fix"]
+
+
+@pytest.mark.parametrize("info", [PODMAN_57_SLIRP, PODMAN_57_ROOTFUL, PODMAN_49_OLD])
+def test_pasta_host_loopback_silent_otherwise(info):
+    assert podman_host.pasta_host_loopback_warning(info) is None
+
+
+@pytest.mark.asyncio
+async def test_preflight_warns_about_pasta_host_loopback(tmp_path: Path, caplog):
+    with caplog.at_level(logging.WARNING):
+        await _preflight(tmp_path, _info("6.0.1", "pasta", apparmor=False))
+    assert any("169.254.1.2" in r.getMessage() for r in caplog.records)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        await _preflight(tmp_path, PODMAN_57_SLIRP)
+    assert not any("169.254.1.2" in r.getMessage() for r in caplog.records)

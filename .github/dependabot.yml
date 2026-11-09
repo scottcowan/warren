@@ -32,12 +32,14 @@ updates:
     directories:
       - "/images/warren-docker-base"
       - "/images/warren-docker-dev-base"
+      - "/images/warren-docker-ssh-base"
       - "/images/warren-agent-base"
       - "/images/warren-base-claude-code"
       - "/packages/warren-server"
       - "/packages/warren-server/images/ecs-base"
       - "/packages/warren-server/images/warren-ecs-agent-base"
       - "/packages/warren-server/images/warren-ecs-dev-base"
+      - "/packages/warren-server/images/warren-ecs-ssh-base"
     schedule:
       interval: "weekly"
     groups:

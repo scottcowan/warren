@@ -1,10 +1,24 @@
 # warren proxy
 
-`warren proxy` gives a port inside an ECS workspace a stable address on your own
-machine, `http://127.0.0.1:<local-port>`, that keeps working when the SSM session
-drops, when the proxy restarts, and when the workspace comes back on a new task.
-It is meant for desktop or browser apps that store a server address, such as
-the T3 Code app talking to a `t3 serve` inside a workspace.
+`warren proxy` gives a port inside a workspace a stable address on your own
+machine, `http://127.0.0.1:<local-port>`, that keeps working when the forward
+drops, when the proxy restarts, and when the workspace comes back on a new ECS
+task or a new container. It is meant for desktop or browser apps that store a
+server address, such as the T3 Code app talking to a `t3 serve` inside a
+workspace.
+
+It works with three kinds of remote:
+
+| Remote (`warren remote add`) | Server runtime | How a connection reaches the port |
+| --- | --- | --- |
+| `ecs` | ECS | an SSM port-forwarding session to the task |
+| `ssh` | podman or docker | `ssh -L` to the server host's loopback, where the port is published |
+| `http` on `127.0.0.1`/`localhost` | podman or docker on this machine | straight to the published port, no SSH |
+
+An `http` remote on another host is refused: its published ports are on that
+host's loopback, which only an SSH forward reaches, so add the server as an `ssh`
+remote instead. On podman/docker only ports the template declares under
+[`ports:`](#named-ports) are published; see [Podman/docker servers](#podmandocker-servers).
 
 `warren tunnel` is still the one-off, foreground way to forward a port. The
 proxy is the long-running version of it.
@@ -12,22 +26,68 @@ proxy is the long-running version of it.
 ## Commands
 
 ```bash
-warren proxy add <workspace> <remote-port> [--local-port N] [--server NAME]
+warren proxy add <workspace> <remote-port | port-name> [--local-port N] [--server NAME]
+warren proxy add <workspace> --from-template [--server NAME]
 warren proxy list [--json]
-warren proxy rm <local-port | workspace | workspace:remote-port> [--server NAME]
+warren proxy rm <local-port | workspace | workspace:remote-port | workspace/port-name> [--server NAME]
 warren proxy run [--idle-minutes M] [--keepalive-seconds S] [--log-level info]
+warren proxy stdio <workspace> <remote-port> [--server NAME]
 ```
 
-- `add` records a mapping and prints its address. It does not contact AWS. The
-  local port is picked once (the first free port from `port_base`, or the one you
-  pass with `--local-port`) and saved, so adding the same mapping again returns
-  the same address. `--server` defaults to your only ECS remote.
+- `add` records a mapping and prints its address. With a port number it does not
+  contact the server. The local port is picked once (the first free port from
+  `port_base`, or the one you pass with `--local-port`) and saved, so adding the
+  same mapping again returns the same address. `--server` defaults to
+  `[defaults] server` if the proxy can reach it, else to your only `ecs`, `ssh` or
+  local `http` remote.
+- `add <workspace> <port-name>` and `add <workspace> --from-template` map ports
+  the workspace's template declares by name (see [Named ports](#named-ports)).
+  They read the names from the control plane (`GET /workspaces`), so they need
+  the same access as `warren list` (AWS for ECS, SSH for an `ssh` remote).
 - `run` serves every mapping in the foreground until it gets SIGINT/SIGTERM. It
   rereads the mapping file every few seconds, so `add`/`rm` take effect without a
   restart. It logs with the CLI's structlog setup: JSON lines when stderr is not a
   terminal, which suits launchd and journald.
+- `stdio` forwards one connection: it resolves the task, starts a forward and pipes
+  stdin/stdout through it until either side closes. It is an ssh `ProxyCommand`; see
+  `warren ssh-config` and [workspace-ssh.md](workspace-ssh.md).
 - Mappings live in `~/.warren/proxy.json` (owner-only), next to the CLI's
   `config.toml`.
+
+### Named ports
+
+A template can name the ports its workspace serves:
+
+```yaml
+templates:
+  t3:
+    ports:
+      t3: 3773                                  # shorthand for {port: 3773}
+      code: {port: 8080, description: code-server}
+```
+
+Names are lowercase letters, digits and `-`; ports are 1-65535 and no two names
+may share one. Nested templates merge `ports` key by key, the child winning, like
+`env`. On ECS, declaring a port exposes nothing by itself: it only tells the CLI
+what to map. On podman/docker, each declared port is also published on the
+server host's loopback (see [Podman/docker servers](#podmandocker-servers)). The
+server returns the declared ports in each workspace's `ports` field, and on
+podman/docker their host bindings in `host_ports`.
+
+```bash
+warren proxy add <workspace> --from-template   # one mapping per declared port
+warren proxy add <workspace> t3                # just one, by name
+warren proxy list
+# http://127.0.0.1:47100   -> prod/<workspace>/code (port 8080)
+# http://127.0.0.1:47101   -> prod/<workspace>/t3 (port 3773)
+```
+
+Running `--from-template` again is safe: ports already mapped keep their local
+address and nothing new is printed as `added`. If the template later moves a name
+to a different port, the next `--from-template` points the same local address at
+the new port. If that new port is already mapped under another entry, `add` stops
+and asks you to `warren proxy rm` one of them. `--local-port` can't be combined
+with `--from-template`, since it maps a single port.
 
 ### Settings
 
@@ -44,7 +104,7 @@ port_base = 47100        # first port `warren proxy add` tries
 
 1. **Loopback only.** Each mapping listens on `127.0.0.1:<local-port>`. `--bind`
    accepts only loopback addresses (`127.0.0.1`, `::1`, `localhost`) and refuses
-   anything else, because the forward carries your own AWS access into the
+   anything else, because the forward carries your own AWS or SSH access into the
    workspace. The listener has no authentication of its own, so any local process
    can use it. Don't run the proxy on a shared machine (see
    [threat-model.md](threat-model.md), residual risk 12).
@@ -94,11 +154,60 @@ port_base = 47100        # first port `warren proxy add` tries
 
 ### Podman/docker servers
 
-`warren proxy` refuses `http` and `ssh` remotes, at `add` and at connection time.
-Their workspace ports are inside containers on the server host. The CLI's SSH
-forward only reaches that host's loopback control plane, and the containers'
-ports usually aren't published at all. Use your own `ssh -L` to the server host if
-the port is published there.
+**Server side.** When a podman or docker workspace is created, each port its
+template declares under `ports:` is published on the server host's loopback, on a
+host port the container engine picks (`-p 127.0.0.1::<port>`). The address is the
+host part of `WARREN_SSH_PUBLISH_HOST` when that is a loopback address, else
+`127.0.0.1`: setting `WARREN_SSH_PUBLISH_HOST` to a LAN address or `""` exposes the
+SSH port, never template ports, and nothing is ever published on `0.0.0.0`. The
+server reads the bindings back after every container create or start (docker
+picks new host ports on each start) and returns them next to `ports`:
+
+```json
+"ports":      {"t3": {"port": 3773, "description": ""}},
+"host_ports": {"t3": {"host": "127.0.0.1", "port": 41007}}
+```
+
+Ports that aren't declared aren't published, so `warren proxy add <ws> 5173` on a
+podman remote only works once `5173` is in the template's `ports` and the
+workspace was created (or recreated) with it. A workspace created before its
+template declared a port, or by a server older than this feature, has no
+`host_ports`; recreate it.
+
+The traffic arrives on the container's network interface, not on its loopback,
+so the app inside must listen on `0.0.0.0` (or the container's address), not
+`127.0.0.1`. That address is only reachable through the workspace's own isolated
+bridge network and the loopback-published host port.
+
+**CLI side.** For an `ssh` remote the proxy's session is
+`ssh -N -L <ephemeral>:127.0.0.1:<host-port> <ssh_host>`, the same forward (and
+the same `ssh_host`/`ssh_key_path`) the CLI uses for that server's control plane.
+For an `http` remote on this machine's loopback it connects straight to
+`127.0.0.1:<host-port>`. Lazy start, sharing, idle close and the loopback-only
+listener work as for ECS. A container that comes back with a different host port
+is followed the same way as a replaced task: a direct connection to the old port
+is refused, so the next connection resolves again; an SSH forward to the old port
+stays up and drops connections, so a connection that is the only one open checks
+the control plane first if the previous one closed without the workspace sending
+a byte, or if the last check is more than 15 seconds old
+(`ProxySettings.revalidate_seconds`). Log event: `proxy_host_port_changed`. The
+keepalive probe is only used for SSM sessions.
+
+**Isolation.** A published port is reachable from the server host's loopback,
+which other workspaces can't reach under rootless podman with slirp4netns (its
+default `allow_host_loopback=false`), so other workspaces can't reach it.
+`tests/integration/test_network_isolation.py` checks this in CI (slirp4netns on
+ubuntu-latest) through the bridge gateway, `host.containers.internal`,
+`10.0.2.2`, `169.254.1.2`, the host's own IP and the owning container's IP.
+**With pasta** this doesn't hold everywhere: on podman 6.0.1 with default
+options, `169.254.1.2` reached host loopback, and so published SSH and template
+ports, from other workspaces. The server logs `podman_pasta_host_loopback` at
+startup when podman runs rootless pasta; use slirp4netns
+(`default_rootless_network_cmd = "slirp4netns"` under `[network]` in
+`containers.conf`) on hosts that run untrusted workspaces side by side. On
+Docker Desktop and colima, `host.docker.internal` reaches the desktop host's
+loopback, and with it these ports. See [threat-model.md](threat-model.md),
+residual risk 6.
 
 ## Keepalive
 
@@ -129,9 +238,11 @@ SSM:
 ## Running it in the background
 
 The proxy has no installer. Run it under your own service manager; the examples
-below are templates. Find `warren` with `command -v warren`. The service needs
-`aws` and `session-manager-plugin` on its `PATH`, and the AWS profile it should
-use.
+below are templates. Find `warren` with `command -v warren`. For ECS remotes the
+service needs `aws` and `session-manager-plugin` on its `PATH`, and the AWS
+profile it should use. For `ssh` remotes it needs `ssh` and non-interactive key
+authentication (an agent the service can reach, or `ssh_key_path` on the remote
+without a passphrase): the forward runs with `BatchMode=yes`.
 
 ### macOS launchd
 
@@ -194,6 +305,9 @@ journalctl --user -u warren-proxy -f
 
 ## IAM
 
+This section is about ECS remotes; an `ssh` remote needs only your SSH access to
+the server host, the same as `warren connect`.
+
 The proxy runs AWS calls with **your own AWS credentials**, exactly as `warren
 tunnel` and `warren connect` do. warren-server never sees them, and the proxy
 adds no new server-side authorization path. Your principal needs:
@@ -221,13 +335,28 @@ workspace in the cluster.
 
 ## Using it with T3 Code
 
-With a workspace running `t3 serve` on, say, port 3773:
+With a workspace running `t3 serve` on, say, port 3773, declare the port in the
+template:
+
+```yaml
+templates:
+  t3:
+    ports: {t3: 3773}
+```
+
+Then connect with one command:
 
 ```bash
-warren proxy add <workspace> 3773      # prints http://127.0.0.1:47100
-warren proxy run                       # or keep it running under launchd/systemd
+warren proxy add <workspace> --from-template   # prints <server>/<workspace>/t3 added: http://127.0.0.1:47100
+warren proxy run                               # or keep it running under launchd/systemd
 ```
+
+`warren proxy add <workspace> 3773` still works for a template without `ports`.
 
 Then pair the T3 desktop app with `http://127.0.0.1:47100`. Don't use T3 Connect
 for company code: it relays traffic through T3's cloud. The workspace image and
 how to start `t3 serve` are described in [examples/ecs-t3code](../examples/ecs-t3code/README.md).
+
+The same commands work against an `ssh` (or local) podman/docker remote. There,
+start `t3 serve` with `--host 0.0.0.0`: the published port enters through the
+container's interface, not its loopback.

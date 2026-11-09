@@ -14,7 +14,7 @@ esac
 
 _keep() {
   case "$1" in
-    claude/projects|claude/history.jsonl|claude/todos|codex/sessions|codex/history.jsonl|codex/log|cursor-agent/chats|cursor-agent/projects|cursor-agent/data|opencode/data|pi/sessions) return 0 ;;
+    claude/projects|claude/history.jsonl|claude/todos|codex/sessions|codex/history.jsonl|codex/log|cursor-agent/chats|cursor-agent/projects|cursor-agent/data|opencode/data|opencode/state|pi/sessions) return 0 ;;
   esac
   return 1
 }
@@ -24,7 +24,7 @@ _dirs() {
     claude) echo 'projects todos' ;;
     codex) echo 'sessions log' ;;
     cursor-agent) echo 'data chats projects' ;;
-    opencode) echo 'config data' ;;
+    opencode) echo 'config data state' ;;
     pi) echo sessions ;;
   esac
 }
@@ -46,6 +46,108 @@ _write() {
   printf '%s' "$2" > "$_t" && chmod 600 "$_t" && mv -f -- "$_t" "$1"
 }
 
+# Model access from the workspace env, as warren_common.harness.opencode_config /
+# codex_config do it (a test keeps them equal). Values outside the allowed characters
+# are dropped, never escaped.
+_truthy() {
+  case "$1" in ''|0|[Ff][Aa][Ll][Ss][Ee]|[Nn][Oo]) return 1 ;; esac
+  return 0
+}
+
+# <value> <max length> <allowed characters>
+_ok() {
+  case "$1" in ''|*[!$3]*) return 1 ;; esac
+  [ "${#1}" -le "$2" ] || return 1
+  printf '%s' "$1"
+}
+
+_url() {
+  case "$1" in
+    http://*) _ok "${1#http://}" 512 'A-Za-z0-9._~:/%+-' >/dev/null || return 1 ;;
+    https://*) _ok "${1#https://}" 512 'A-Za-z0-9._~:/%+-' >/dev/null || return 1 ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$1"
+}
+
+_opencode_config() {
+  _c='{"$schema": "https://opencode.ai/config.json", "autoupdate": false'
+  _gw=$(_url "${ANTHROPIC_BEDROCK_BASE_URL:-}") || _gw=
+  if _truthy "${CLAUDE_CODE_USE_BEDROCK:-}" || [ -n "$_gw" ]; then
+    _c="$_c, \"enabled_providers\": [\"amazon-bedrock\"]"
+    _m=$(_ok "${ANTHROPIC_MODEL:-}" 200 'A-Za-z0-9._:/-') && _c="$_c, \"model\": \"amazon-bedrock/$_m\""
+    _m=$(_ok "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}" 200 'A-Za-z0-9._:/-') && _c="$_c, \"small_model\": \"amazon-bedrock/$_m\""
+    _o=
+    _r=$(_ok "${AWS_REGION:-}" 32 'a-z0-9-') && _o="\"region\": \"$_r\""
+    if [ -n "$_gw" ]; then
+      _o="${_o:+$_o, }\"endpoint\": \"$_gw\""
+      _truthy "${CLAUDE_CODE_SKIP_BEDROCK_AUTH:-}" && _o="$_o, \"apiKey\": \"{env:ANTHROPIC_AUTH_TOKEN}\""
+    fi
+    [ -z "$_o" ] || _c="$_c, \"provider\": {\"amazon-bedrock\": {\"options\": {$_o}}}"
+  fi
+  printf '%s}' "$_c"
+}
+
+# <hooks.json path>
+_codex_config() {
+  if _truthy "${CLAUDE_CODE_USE_BEDROCK:-}" && [ -z "${ANTHROPIC_BEDROCK_BASE_URL:-}" ]; then
+    printf 'model_provider = "amazon-bedrock"\n'
+    printf '%s' 'approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[features]
+hooks = true
+'
+    _r=$(_ok "${AWS_REGION:-}" 32 'a-z0-9-') && printf '\n[model_providers.amazon-bedrock.aws]\nregion = "%s"\n' "$_r"
+  else
+    printf '%s' 'approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[features]
+hooks = true
+'
+  fi
+  case "$1" in
+    /*) ;;
+    *) return 0 ;;
+  esac
+  case "$1" in
+    *[\"\\]*|*'
+'*) return 0 ;;
+  esac
+  printf '%s' '
+[hooks.state."'"$1"':session_start:0:0"]
+trusted_hash = "sha256:5e0076b506692c0d159abde1b3da2d49b062b47de605a0df3b5eee32eaae28b1"
+
+[hooks.state."'"$1"':user_prompt_submit:0:0"]
+trusted_hash = "sha256:2906d8057388208ca2564eeea68dbda74da5259c25c056da1c59c3ab18ed5bf3"
+
+[hooks.state."'"$1"':pre_tool_use:0:0"]
+trusted_hash = "sha256:341c8e03c3ffa17570203b1d57bd7a0343e567554eca7b2204f47345b190adab"
+
+[hooks.state."'"$1"':post_tool_use:0:0"]
+trusted_hash = "sha256:38aecf9054d2562758a554fc28d404300d555a542ad31231aa5b06ab6f1c4a43"
+
+[hooks.state."'"$1"':permission_request:0:0"]
+trusted_hash = "sha256:4bc7388d5aab65c16dc21318cdf99cdc703a8d1a80a59ea60e9ead6e5b5ef861"
+
+[hooks.state."'"$1"':subagent_start:0:0"]
+trusted_hash = "sha256:2147d9da8df908e83d01794ecbe1a553e8ce8ae2306f4c82e3f4041fea8691df"
+
+[hooks.state."'"$1"':subagent_stop:0:0"]
+trusted_hash = "sha256:9200a39a90bebf7722a560864ffb214221e542384213f647166db35e02c45cc9"
+
+[hooks.state."'"$1"':post_compact:0:0"]
+trusted_hash = "sha256:029c341b8fcf0948646f393e8a76dede8f5d10479c8019d275d775eb649a78c1"
+
+[hooks.state."'"$1"':stop:0:0"]
+trusted_hash = "sha256:a64bf10e376a5cf1911295fd05eafcc459c4ebb803f292a4c025fc19dbf54ad5"
+
+[hooks.state."'"$1"':session_end:0:0"]
+trusted_hash = "sha256:72efff3ab4e3154992976708ddd4e18a0b9d1d3b78f7785b06a3c5512b1d7557"
+'
+}
+
 _generate() {
   case "$2" in
     claude)
@@ -56,19 +158,16 @@ _generate() {
       _write "$1/settings.json" '{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" claude SessionStart || :"}]}], "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" claude UserPromptSubmit || :"}]}], "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" claude PreToolUse || :"}]}], "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" claude PostToolUse || :"}]}], "PostToolUseFailure": [{"matcher": "*", "hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" claude PostToolUseFailure || :"}]}], "PermissionRequest": [{"matcher": "*", "hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" claude PermissionRequest || :"}]}], "SubagentStart": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" claude SubagentStart || :"}]}], "SubagentStop": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" claude SubagentStop || :"}]}], "PostCompact": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" claude PostCompact || :"}]}], "Stop": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" claude Stop || :"}]}], "StopFailure": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" claude StopFailure || :"}]}], "SessionEnd": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" claude SessionEnd || :"}]}]}}'
       ;;
     codex)
-      _write "$1/config.toml" 'approval_policy = "never"
-sandbox_mode = "danger-full-access"
-
-[features]
-codex_hooks = true
-'
-      _write "$1/hooks.json" '{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" codex SessionStart || :"}]}], "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" codex UserPromptSubmit || :"}]}], "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" codex PreToolUse || :"}]}], "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" codex PostToolUse || :"}]}], "Stop": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" codex Stop || :"}]}]}}'
+      _c="$(_codex_config "$1/hooks.json"; printf x)"
+      _write "$1/config.toml" "${_c%x}"
+      _write "$1/hooks.json" '{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" codex SessionStart || :"}]}], "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" codex UserPromptSubmit || :"}]}], "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" codex PreToolUse || :"}]}], "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" codex PostToolUse || :"}]}], "PermissionRequest": [{"matcher": "*", "hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" codex PermissionRequest || :"}]}], "SubagentStart": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" codex SubagentStart || :"}]}], "SubagentStop": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" codex SubagentStop || :"}]}], "PostCompact": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" codex PostCompact || :"}]}], "Stop": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" codex Stop || :"}]}], "SessionEnd": [{"hooks": [{"type": "command", "command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" codex SessionEnd || :"}]}]}}'
       ;;
     cursor-agent)
       _write "$1/hooks.json" '{"version": 1, "hooks": {"sessionStart": [{"command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" cursor-agent sessionStart || :"}], "beforeSubmitPrompt": [{"command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" cursor-agent beforeSubmitPrompt || :"}], "stop": [{"command": "[ -z \"${WARREN_STATE_HOOK:-}\" ] || sh \"$WARREN_STATE_HOOK\" cursor-agent stop || :"}]}}'
       ;;
     opencode)
-      _write "$1/config/opencode.json" '{"$schema": "https://opencode.ai/config.json", "autoupdate": false}'
+      _c="$(_opencode_config; printf x)"
+      _write "$1/config/opencode.json" "${_c%x}"
       _write "$1/config/plugins/warren-state.js" '// warren state hook (AG5), generated by warren. Inert unless WARREN_STATE_HOOK is set.
 import { spawnSync } from "node:child_process";
 

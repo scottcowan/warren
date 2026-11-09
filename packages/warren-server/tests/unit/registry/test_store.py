@@ -1,4 +1,6 @@
-"""WorkspaceStore CRUD unit tests against a tempfile SQLite DB (Pitfall #13)."""
+"""WorkspaceStore CRUD unit tests. Tests taking `workspace_store` run against every
+WARREN_STATE_BACKEND (tests/unit/conftest.py: SQLite, and DynamoDB under moto); the
+`sqlite_path` ones cover SQLite-only behaviour (open_db migrations, file modes)."""
 
 from __future__ import annotations
 
@@ -14,8 +16,8 @@ from warren.registry.store import WorkspaceStore, open_db
 
 
 @pytest.mark.asyncio
-async def test_insert_and_get_roundtrip(sqlite_path: str):
-    store = await WorkspaceStore.open(sqlite_path)
+async def test_insert_and_get_roundtrip(workspace_store):
+    store = workspace_store
     await store.insert(
         workspace_id="ws-1",
         project="p",
@@ -34,14 +36,14 @@ async def test_insert_and_get_roundtrip(sqlite_path: str):
 
 
 @pytest.mark.asyncio
-async def test_get_missing_returns_none(sqlite_path: str):
-    store = await WorkspaceStore.open(sqlite_path)
+async def test_get_missing_returns_none(workspace_store):
+    store = workspace_store
     assert await store.get("nope") is None
 
 
 @pytest.mark.asyncio
-async def test_update_status(sqlite_path: str):
-    store = await WorkspaceStore.open(sqlite_path)
+async def test_update_status(workspace_store):
+    store = workspace_store
     await store.insert(
         workspace_id="ws-u",
         project="p",
@@ -57,8 +59,8 @@ async def test_update_status(sqlite_path: str):
 
 
 @pytest.mark.asyncio
-async def test_list_non_terminal_filters_by_status(sqlite_path: str):
-    store = await WorkspaceStore.open(sqlite_path)
+async def test_list_non_terminal_filters_by_status(workspace_store):
+    store = workspace_store
     for wid, status in [
         ("ws-run", "running"),
         ("ws-prov", "provisioning"),
@@ -82,8 +84,8 @@ async def test_list_non_terminal_filters_by_status(sqlite_path: str):
 
 
 @pytest.mark.asyncio
-async def test_insert_with_ssh_port_and_owner_id_roundtrips(sqlite_path: str):
-    store = await WorkspaceStore.open(sqlite_path)
+async def test_insert_with_ssh_port_and_owner_id_roundtrips(workspace_store):
+    store = workspace_store
     await store.insert(
         workspace_id="ws-ssh",
         project="p",
@@ -102,8 +104,8 @@ async def test_insert_with_ssh_port_and_owner_id_roundtrips(sqlite_path: str):
 
 
 @pytest.mark.asyncio
-async def test_insert_without_ssh_port_or_owner_id_defaults_to_none(sqlite_path: str):
-    store = await WorkspaceStore.open(sqlite_path)
+async def test_insert_without_ssh_port_or_owner_id_defaults_to_none(workspace_store):
+    store = workspace_store
     await store.insert(
         workspace_id="ws-none",
         project="p",
@@ -120,8 +122,8 @@ async def test_insert_without_ssh_port_or_owner_id_defaults_to_none(sqlite_path:
 
 
 @pytest.mark.asyncio
-async def test_insert_with_idle_ttl_seconds_roundtrips(sqlite_path: str):
-    store = await WorkspaceStore.open(sqlite_path)
+async def test_insert_with_idle_ttl_seconds_roundtrips(workspace_store):
+    store = workspace_store
     await store.insert(
         workspace_id="ws-ttl",
         project="p",
@@ -138,8 +140,8 @@ async def test_insert_with_idle_ttl_seconds_roundtrips(sqlite_path: str):
 
 
 @pytest.mark.asyncio
-async def test_insert_without_idle_ttl_seconds_defaults_to_none(sqlite_path: str):
-    store = await WorkspaceStore.open(sqlite_path)
+async def test_insert_without_idle_ttl_seconds_defaults_to_none(workspace_store):
+    store = workspace_store
     await store.insert(
         workspace_id="ws-ttl-none",
         project="p",
@@ -201,8 +203,8 @@ async def test_open_db_migrates_pre_idle_ttl_seconds_schema(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_update_ssh_port(sqlite_path: str):
-    store = await WorkspaceStore.open(sqlite_path)
+async def test_update_ssh_port(workspace_store):
+    store = workspace_store
     await store.insert(
         workspace_id="ws-port",
         project="p",
@@ -222,10 +224,8 @@ async def test_update_ssh_port(sqlite_path: str):
 
 
 @pytest.mark.asyncio
-async def test_list_all_and_list_non_terminal_roundtrip_ssh_port_and_owner_id(
-    sqlite_path: str,
-):
-    store = await WorkspaceStore.open(sqlite_path)
+async def test_list_all_and_list_non_terminal_roundtrip_ssh_port_and_owner_id(workspace_store):
+    store = workspace_store
     await store.insert(
         workspace_id="ws-list",
         project="p",
@@ -411,13 +411,13 @@ def _insert_kwargs(i: int, owner: str) -> dict:
     )
 
 
-async def test_insert_caps_are_atomic_under_concurrency(sqlite_path: str):
+async def test_insert_caps_are_atomic_under_concurrency(workspace_store):
     """Finding 11: list-then-insert let concurrent creates overshoot max_workspaces."""
     import asyncio
 
     from warren.registry.store import CapacityExhausted
 
-    store = await WorkspaceStore.open(sqlite_path)
+    store = workspace_store
     results = await asyncio.gather(
         *(store.insert(**_insert_kwargs(i, "alice"), max_total=6, max_per_owner=3) for i in range(12)),
         *(store.insert(**_insert_kwargs(i, "bob"), max_total=6, max_per_owner=6) for i in range(12)),
@@ -431,10 +431,10 @@ async def test_insert_caps_are_atomic_under_concurrency(sqlite_path: str):
     await store.close()
 
 
-async def test_insert_cap_scope_and_terminal_rows(sqlite_path: str):
+async def test_insert_cap_scope_and_terminal_rows(workspace_store):
     from warren.registry.store import CapacityExhausted
 
-    store = await WorkspaceStore.open(sqlite_path)
+    store = workspace_store
     await store.insert(**_insert_kwargs(0, "alice"), max_total=2, max_per_owner=1)
     with pytest.raises(CapacityExhausted) as owner_exc:
         await store.insert(**_insert_kwargs(1, "alice"), max_total=2, max_per_owner=1)

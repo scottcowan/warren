@@ -83,3 +83,14 @@ output "warren_ecs_secrets_kms_key_arn" {
   description = "KMS key for EBS-mode secrets delivery — set as WARREN_ECS_SECRETS_KMS_KEY_ID. Empty when EBS storage isn't enabled."
   value       = local.secrets_kms_key_arn
 }
+
+# Optional AWS state backends; empty when not enabled.
+output "warren_dynamodb_table_name" {
+  description = "DynamoDB state table (WARREN_DYNAMODB_TABLE). Empty unless enable_dynamodb_state."
+  value       = var.enable_dynamodb_state ? aws_dynamodb_table.warren_state[0].name : ""
+}
+
+output "warren_secretsmanager_prefix" {
+  description = "Secrets Manager name prefix (WARREN_SECRETSMANAGER_PREFIX). Empty unless enable_secretsmanager_secrets."
+  value       = var.enable_secretsmanager_secrets ? local.secretsmanager_prefix : ""
+}

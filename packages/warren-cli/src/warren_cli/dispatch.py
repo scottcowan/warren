@@ -336,9 +336,12 @@ def _local_harness_root(workspace_id: str) -> Path:
     return workspace_state_dir(workspace_id) / "harness"
 
 
-def _prepare_local_harness_dirs(harnesses: Any, harness_root: str, *, bedrock: bool = False) -> None:
+def _prepare_local_harness_dirs(
+    harnesses: Any, harness_root: str, *, bedrock: bool = False, env: dict | None = None
+) -> None:
     """Seed the per-workspace harness dirs and copy credentials in (AG3). In
-    bedrock mode no model login is handed over, and old copies are removed."""
+    bedrock mode no model login is handed over, and old copies are removed.
+    `env` (the template's) drives generated model-provider config (opencode, codex)."""
     from warren_common.harness_config import (  # noqa: PLC0415
         copy_in_credentials,
         prepare_harness_dirs,
@@ -346,7 +349,7 @@ def _prepare_local_harness_dirs(harnesses: Any, harness_root: str, *, bedrock: b
     )
 
     home = Path.home()
-    prepare_harness_dirs(harnesses, harness_root, home=home)
+    prepare_harness_dirs(harnesses, harness_root, home=home, env=env)
     if bedrock:
         remove_credentials(harnesses, harness_root)
     else:
@@ -625,7 +628,7 @@ def provision_local(
         rt = runtime if runtime is not None else get_runtime(cfg)
         handle = await rt.provision(spec)
         if local_harness_dirs:
-            _prepare_local_harness_dirs(harnesses, harness_root, bedrock=bedrock)
+            _prepare_local_harness_dirs(harnesses, harness_root, bedrock=bedrock, env=env)
 
         state: dict[str, Any] = {
             "workspace_id": workspace_id,
@@ -877,7 +880,9 @@ def _connect_via_execvp(state: dict, *, harness: str | None = None, new: bool = 
     _refresh_local_git_credentials(state)
     bedrock = _state_bedrock(state)
     if runtime_type in _LOCAL_SANDBOXES and state.get("harness_root"):
-        _prepare_local_harness_dirs(harnesses, state["harness_root"], bedrock=bedrock)
+        _prepare_local_harness_dirs(
+            harnesses, state["harness_root"], bedrock=bedrock, env=state.get("env_snapshot") or {}
+        )
     for warning in cloud_handoff_warnings(harnesses):
         typer.echo(warning, err=True)
     write_turn_sessions(state)
@@ -1456,8 +1461,13 @@ def _start_pipe_drainers(proc: subprocess.Popen) -> "collections.deque[str]":
     return tail
 
 
+def _forward_host(host: str) -> str:
+    """``host`` as ssh's ``-L`` wants it: an IPv6 literal in brackets."""
+    return f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+
 def start_ssh_port_forward(
-    ssh_host: str, remote_port: int, *, ssh_key_path: str | None = None
+    ssh_host: str, remote_port: int, *, ssh_key_path: str | None = None, remote_host: str = "localhost"
 ) -> tuple[subprocess.Popen, int]:
     """Start a background SSH local port-forward to a podman/docker-mode
     server's control plane -- the plain-SSH equivalent of
@@ -1466,6 +1476,11 @@ def start_ssh_port_forward(
     ``127.0.0.1:8420`` on the server's own host, so ``warren remote add
     --ssh-host`` (``runtime_type="ssh"``) is the only way to reach it
     remotely without the caller hand-running ``ssh -L`` themselves first.
+
+    ``remote_host`` is the address on the far side the forward connects to
+    (``-L local:remote_host:remote_port``): ``localhost`` for the control plane,
+    the published loopback address (``127.0.0.1``) for a workspace port
+    (``warren proxy``).
 
     Returns ``(process, local_port)``; the caller must terminate the
     returned process once done, same contract as the ECS tunnel. Raises
@@ -1494,7 +1509,7 @@ def start_ssh_port_forward(
             "-N",
             "-o", "BatchMode=yes",  # never hang on an interactive password prompt if key auth fails
             "-o", "ExitOnForwardFailure=yes",  # fail fast if the forward itself can't bind, e.g. this race
-            "-L", f"{local_port}:localhost:{remote_port}",
+            "-L", f"{local_port}:{_forward_host(remote_host)}:{remote_port}",
         ]
         if ssh_key_path:
             argv += ["-i", str(Path(ssh_key_path).expanduser())]

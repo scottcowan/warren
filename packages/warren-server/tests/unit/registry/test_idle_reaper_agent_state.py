@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -225,6 +226,43 @@ async def test_registry_reads_hook_state_then_osc_without_following_links(tmp_pa
     (base / ".session" / "state.json").symlink_to(tmp_path / "elsewhere.json")
     assert await Registry.agent_state(reg, ws) is None
     assert await Registry.agent_state(SimpleNamespace(_agent_state_dir=lambda ws: None), ws) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root reads any file")
+async def test_unreadable_state_is_read_through_the_runtime(tmp_path):
+    """keep-id userns: a harness running as container root writes state.json as a subuid,
+    0600, which the server user can't open. That read goes through the runtime instead."""
+    base = tmp_path / "harness" / "ws-1"
+    (base / ".session").mkdir(parents=True)
+    state = base / ".session" / "state.json"
+    state.write_text("{}")
+    state.chmod(0)
+    reads: list[tuple[str, str]] = []
+
+    async def read_file(handle, path, max_bytes):
+        reads.append((handle.runtime_id, path))
+        if path.endswith("/.session/state.json"):
+            return json.dumps({"state": "working", "ts": 5, "harness": "claude"}).encode()
+        return None
+
+    reg = SimpleNamespace(
+        _agent_state_dir=lambda ws: base,
+        _harness_state_dir=lambda wid: base,
+        runtime=SimpleNamespace(read_file=read_file),
+    )
+    try:
+        got = await Registry.agent_state(reg, _ws())
+    finally:
+        state.chmod(0o600)
+    assert (got.state, got.harness, got.source) == ("working", "claude", "hook")
+    assert reads == [("ctr-1", "/var/lib/warren/harness/.session/state.json")]
+    # Without a runtime that reads container files it stays unverifiable, as before.
+    state.chmod(0)
+    try:
+        assert await Registry.agent_state(SimpleNamespace(_agent_state_dir=lambda ws: base), _ws()) is None
+    finally:
+        state.chmod(0o600)
 
 
 def _ecs_registry(mount: str):
