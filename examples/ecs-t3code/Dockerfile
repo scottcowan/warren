@@ -18,10 +18,9 @@ ARG BASE_REGISTRY=public.ecr.aws/docker/library
 # debian:bookworm-slim, multi-arch index digest, as of 2026-10-31: the base
 # warren-ecs-base 1.5.0 uses. Only the download stage runs on it.
 ARG DEBIAN_IMAGE=${BASE_REGISTRY}/debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
-# warren-ecs-base 1.5.0, by tag until it's published; pin it by digest (tag@sha256:...)
-# for your own builds. To build against a locally built ecs-base, pass
+# warren-ecs-base 1.5.0, pinned by digest. To build against a locally built ecs-base, pass
 # --build-arg WARREN_ECS_BASE=<local tag> (README.md, "Build").
-ARG WARREN_ECS_BASE=ghcr.io/scottcowan/warren-ecs-base:1.5.0
+ARG WARREN_ECS_BASE=ghcr.io/scottcowan/warren-ecs-base:1.5.0@sha256:090ae2f6cde680cbc48a7b5df5a54f77143897301e320a3e373b6e9b0126165e
 
 # Downloads: Claude Code and t3, each checked against a published checksum, for the
 # target architecture. Nothing here reaches the final image except the two installs.
