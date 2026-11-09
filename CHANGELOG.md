@@ -2,6 +2,41 @@
 
 Image releases, newest first. Written by scripts/release.py.
 
+## warren-server 1.7.0 (2026-11-09)
+
+- feat: release train: proxy fix, keep-id, template ports, podman proxy, git write tokens, notifications, headless runs, SSH images, harness modes, DynamoDB/Secrets Manager backend, dependabot (#81) (e0e9d94)
+- fix(server): warn when rootless podman 5.x runs pasta under AppArmor; podman-host runbook binds 0.0.0.0 in-container (#65) (3bff93b)
+- feat(ecs-base)!: Debian bookworm-slim as warren-ecs-base 2.0.0 (and dev-base) (#64) (36b1a1f)
+
+## warren-docker-base 1.1.0 (2026-11-09)
+
+- feat: release train: proxy fix, keep-id, template ports, podman proxy, git write tokens, notifications, headless runs, SSH images, harness modes, DynamoDB/Secrets Manager backend, dependabot (#81) (e0e9d94)
+
+## warren-docker-dev-base 1.1.0 (2026-11-09)
+
+- feat: release train: proxy fix, keep-id, template ports, podman proxy, git write tokens, notifications, headless runs, SSH images, harness modes, DynamoDB/Secrets Manager backend, dependabot (#81) (e0e9d94)
+- chore: bump pinned harness/host-key versions (AI6) (#43) (f46fbe8)
+
+## warren-docker-ssh-base 0.1.0 (2026-11-09)
+
+- feat: release train: proxy fix, keep-id, template ports, podman proxy, git write tokens, notifications, headless runs, SSH images, harness modes, DynamoDB/Secrets Manager backend, dependabot (#81) (e0e9d94)
+
+## warren-ecs-base 1.5.0 (2026-11-09)
+
+- feat: release train: proxy fix, keep-id, template ports, podman proxy, git write tokens, notifications, headless runs, SSH images, harness modes, DynamoDB/Secrets Manager backend, dependabot (#81) (e0e9d94)
+- feat(ecs-base)!: Debian bookworm-slim as warren-ecs-base 2.0.0 (and dev-base) (#64) (36b1a1f)
+- fix(ecs-base): make /etc/warren traversable so the workspace user gets the banner and harness hooks (#61) (88703fd)
+
+## warren-ecs-dev-base 1.3.0 (2026-11-09)
+
+- feat: release train: proxy fix, keep-id, template ports, podman proxy, git write tokens, notifications, headless runs, SSH images, harness modes, DynamoDB/Secrets Manager backend, dependabot (#81) (e0e9d94)
+- feat(ecs-base)!: Debian bookworm-slim as warren-ecs-base 2.0.0 (and dev-base) (#64) (36b1a1f)
+- chore: bump pinned harness/host-key versions (AI6) (#43) (f46fbe8)
+
+## warren-ecs-ssh-base 0.1.0 (2026-11-09)
+
+- feat: release train: proxy fix, keep-id, template ports, podman proxy, git write tokens, notifications, headless runs, SSH images, harness modes, DynamoDB/Secrets Manager backend, dependabot (#81) (e0e9d94)
+
 ## warren-server 1.6.0 (2026-10-30)
 
 - build(deps): bump pytest-asyncio from 1.4.0 to 1.4.1 in the python group (#52) (b0b67f7)
