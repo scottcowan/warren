@@ -128,6 +128,7 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
                 settings.podman_socket,
                 same_host=settings.host_data_dir is None,
                 userns=settings.podman_userns,
+                allow_pasta=settings.podman_allow_pasta,
             )
 
     # WARREN_STATE_BACKEND / WARREN_SECRETS_BACKEND (warren/state/): SQLite by default.

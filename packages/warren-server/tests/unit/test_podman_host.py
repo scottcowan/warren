@@ -11,6 +11,7 @@ import pytest
 
 from warren import podman_host
 from warren.podman_host import pasta_apparmor_warning, profile_allows_podman_signal
+from warren.errors import PreflightError
 from warren.preflight import run_preflight
 
 
@@ -73,16 +74,17 @@ def test_no_warning(info):
         _drop(PODMAN_57_PASTA, "version"),
         _drop(PODMAN_57_PASTA, "host", "security"),
         _drop(PODMAN_57_PASTA, "host", "security", "apparmorEnabled"),
-        _drop(PODMAN_57_PASTA, "host", "rootlessNetworkCmd"),
+        _drop(PODMAN_57_PASTA, "host", "security", "rootless"),
+        PODMAN_49_OLD,
     ],
-    ids=["empty", "empty-host", "no-version", "no-security", "no-apparmor-field", "no-netcmd"],
+    ids=["empty", "empty-host", "no-version", "no-security", "no-apparmor-field", "no-rootless-field", "4x-no-netcmd"],
 )
 def test_missing_fields_do_not_warn(info):
     assert pasta_apparmor_warning(info) is None
 
 
-def test_missing_rootless_field_still_warns():
-    assert pasta_apparmor_warning(_drop(PODMAN_57_PASTA, "host", "security", "rootless")) is not None
+def test_missing_netcmd_on_podman5_is_pasta_by_default():
+    assert pasta_apparmor_warning(_drop(PODMAN_57_PASTA, "host", "rootlessNetworkCmd")) is not None
 
 
 def test_pascal_case_fields():
@@ -138,7 +140,7 @@ async def _preflight(tmp_path: Path, info: dict, **kwargs) -> None:
 @pytest.mark.asyncio
 async def test_preflight_warns_without_failing(tmp_path: Path, caplog):
     with caplog.at_level(logging.WARNING):
-        await _preflight(tmp_path, PODMAN_57_PASTA)
+        await _preflight(tmp_path, PODMAN_57_PASTA, allow_pasta=True)
     assert any("AppArmor" in r.getMessage() for r in caplog.records)
 
 
@@ -157,13 +159,13 @@ async def test_preflight_reads_local_profile_only_on_same_host(tmp_path: Path, c
     ):
         # Remote socket (or containerized server): never reads local files, so warns.
         with caplog.at_level(logging.WARNING):
-            await _preflight(tmp_path, PODMAN_57_PASTA, same_host=False)
+            await _preflight(tmp_path, PODMAN_57_PASTA, same_host=False, allow_pasta=True)
         read.assert_not_called()
         assert any("AppArmor" in r.getMessage() for r in caplog.records)
         caplog.clear()
         # Same host whose pasta profile allows podman's signal: no warning.
         with caplog.at_level(logging.WARNING):
-            await _preflight(tmp_path, PODMAN_57_PASTA, same_host=True)
+            await _preflight(tmp_path, PODMAN_57_PASTA, same_host=True, allow_pasta=True)
         read.assert_called_once()
         assert not any("AppArmor" in r.getMessage() for r in caplog.records)
 
@@ -174,7 +176,7 @@ async def test_preflight_hostname_mismatch_skips_local_profile(tmp_path: Path):
         patch("warren.preflight.read_local_pasta_profile") as read,
         patch("warren.preflight._socket_mod.gethostname", return_value="laptop"),
     ):
-        await _preflight(tmp_path, PODMAN_57_PASTA, same_host=True)
+        await _preflight(tmp_path, PODMAN_57_PASTA, same_host=True, allow_pasta=True)
     read.assert_not_called()
 
 
@@ -196,9 +198,64 @@ def test_pasta_host_loopback_silent_otherwise(info):
 @pytest.mark.asyncio
 async def test_preflight_warns_about_pasta_host_loopback(tmp_path: Path, caplog):
     with caplog.at_level(logging.WARNING):
-        await _preflight(tmp_path, _info("6.0.1", "pasta", apparmor=False))
+        await _preflight(tmp_path, _info("6.0.1", "pasta", apparmor=False), allow_pasta=True)
     assert any("169.254.1.2" in r.getMessage() for r in caplog.records)
     caplog.clear()
     with caplog.at_level(logging.WARNING):
         await _preflight(tmp_path, PODMAN_57_SLIRP)
     assert not any("169.254.1.2" in r.getMessage() for r in caplog.records)
+
+
+# --- pasta refusal -----------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_preflight_refuses_rootless_pasta_on_podman5(tmp_path: Path):
+    with pytest.raises(PreflightError) as exc:
+        await _preflight(tmp_path, PODMAN_57_PASTA)
+    msg = str(exc.value)
+    assert "pasta" in msg and "169.254.1.2" in msg
+    assert 'default_rootless_network_cmd = "slirp4netns"' in msg
+    assert "~/.config/containers/containers.conf" in msg
+    assert "slirp4netns must be installed" in msg
+    assert "WARREN_PODMAN_ALLOW_PASTA=1" in msg
+
+
+@pytest.mark.asyncio
+async def test_preflight_pasta_allowed_with_override_logs_warning_once(tmp_path: Path, caplog):
+    with caplog.at_level(logging.WARNING):
+        await _preflight(tmp_path, PODMAN_57_PASTA, allow_pasta=True)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert sum("runs rootless networking through pasta" in m for m in msgs) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "info",
+    [
+        PODMAN_57_SLIRP,
+        PODMAN_57_ROOTFUL,
+        PODMAN_49_OLD,
+        _info("4.9.3", None, apparmor=False),
+        _drop(PODMAN_57_PASTA, "host", "security", "rootless"),
+    ],
+    ids=["slirp", "rootful", "4x-missing", "4x-missing-noaa", "rootless-unreported"],
+)
+async def test_preflight_no_refusal(tmp_path: Path, info):
+    await _preflight(tmp_path, info)
+
+
+@pytest.mark.asyncio
+async def test_preflight_refuses_when_field_missing_on_podman5(tmp_path: Path):
+    # podman 5.0+ defaults to pasta, so an unreported helper is pasta.
+    with pytest.raises(PreflightError):
+        await _preflight(tmp_path, _info("5.7.0", None))
+    await _preflight(tmp_path, _info("5.7.0", None), allow_pasta=True)
+
+
+def test_rootless_uses_pasta_pascal_case():
+    info = {
+        "Host": {"Security": {"Rootless": True}, "RootlessNetworkCmd": "pasta"},
+        "Version": {"Version": "5.7.0"},
+    }
+    assert podman_host.rootless_uses_pasta(info)
