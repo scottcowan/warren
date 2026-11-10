@@ -2,6 +2,33 @@
 
 Image releases, newest first. Written by scripts/release.py.
 
+## warren-server 1.9.0 (2026-11-10)
+
+- fix(cli): state migration atomicity, ssh key collisions, ECS id validation (#98) (2487b07)
+- Bound GET /workspaces (limit/cursor) and the /events stream (#97) (974dcbc)
+- fix(server): re-verify EBS/seed ownership tags before every delete or restore; runs 404 for other owners (#94) (c9b5ef5)
+- fix(server): round 2 security fixes (secret-name denylist, stable server_id) (#96) (f021505)
+- fix: pasta detection fails closed; sshd drop-in Include last (#93) (393a9cb)
+- feat(proxy): http mapping kind with hardened gateway; tcp hardening (#91) (8c841b4)
+- fix(notify): pin owner webhook destination to the validated IP; anchor name/id regexes with fullmatch (#90) (6c59b57)
+
+## warren-docker-base 1.2.1 (2026-11-10)
+
+- fix(notify): pin owner webhook destination to the validated IP; anchor name/id regexes with fullmatch (#90) (6c59b57)
+
+## warren-docker-ssh-base 0.2.1 (2026-11-10)
+
+- fix: pasta detection fails closed; sshd drop-in Include last (#93) (393a9cb)
+
+## warren-ecs-base 1.5.1 (2026-11-10)
+
+- fix(server): round 2 security fixes (secret-name denylist, stable server_id) (#96) (f021505)
+- fix(notify): pin owner webhook destination to the validated IP; anchor name/id regexes with fullmatch (#90) (6c59b57)
+
+## warren-ecs-ssh-base 0.1.1 (2026-11-10)
+
+- fix: pasta detection fails closed; sshd drop-in Include last (#93) (393a9cb)
+
 ## warren-server 1.8.0 (2026-11-10)
 
 - feat(docker-base): run the workload as warren (uid 1000) after a root phase (#87) (80bb9d0)
