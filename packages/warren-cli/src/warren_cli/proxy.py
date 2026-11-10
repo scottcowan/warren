@@ -127,6 +127,11 @@ class Mapping:
     # "tcp": a plain byte relay (ssh, T3, ACP). "http": the HTTP-aware gateway in
     # front of a web UI (proxy_http.py). Part of identity: changing it restarts the listener.
     kind: str = "tcp"
+    # "tcp": listen on 127.0.0.1:local_port. "unix": listen on a 0600 Unix socket at
+    # socket_path (None = the default path, see proxy_unix.default_socket_path);
+    # local_port is 0 then. Both are part of identity.
+    listen: str = "tcp"
+    socket_path: str | None = None
 
     @property
     def key(self) -> tuple[str, str, int]:
@@ -140,10 +145,13 @@ class Mapping:
 
     @property
     def address(self) -> str:
+        if self.listen == "unix":
+            return f"unix:{self.socket_path or '<default socket>'}"
         return f"http://{LOOPBACK_HOST}:{self.local_port}"
 
 
 KINDS = ("tcp", "http")
+LISTENS = ("tcp", "unix")
 _WORKSPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
 _PORT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _SERVER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -208,15 +216,23 @@ class MappingStore:
                     server=str(row["server"]),
                     workspace=str(row["workspace"]),
                     remote_port=int(row["remote_port"]),
-                    local_port=int(row["local_port"]),
+                    local_port=int(row.get("local_port") or 0),
                     name=str(row["name"]) if row.get("name") else None,
                     kind=str(row.get("kind") or "tcp"),
+                    listen=str(row.get("listen") or "tcp"),
+                    socket_path=str(row["socket_path"]) if row.get("socket_path") else None,
                 )
                 if m.kind not in KINDS:
                     raise ValueError(f"unknown kind {m.kind!r}")
+                if m.listen not in LISTENS:
+                    raise ValueError(f"unknown listen {m.listen!r}")
                 validate_identifiers(m.server, m.workspace, m.name)
-                if not (_valid_port(m.remote_port) and _valid_port(m.local_port)):
+                if not _valid_port(m.remote_port):
                     raise ValueError("port out of range")
+                if m.listen == "tcp" and (not _valid_port(m.local_port) or m.socket_path):
+                    raise ValueError("tcp mapping needs a local port and no socket path")
+                if m.socket_path is not None and not (os.path.isabs(m.socket_path) and "\0" not in m.socket_path):
+                    raise ValueError("socket path must be absolute")
             except (KeyError, TypeError, ValueError, ProxyError):
                 log.warning("proxy_mapping_skipped", reason="malformed entry", path=str(self.path))
                 continue
@@ -232,7 +248,12 @@ class MappingStore:
         with contextlib.suppress(OSError):
             restrict_to_owner(parent, directory=True)
         rows = [
-            {k: v for k, v in asdict(m).items() if (k != "name" or v) and (k != "kind" or v != "tcp")}
+            {k: v for k, v in asdict(m).items() if (k != "name" or v)
+                and (k != "kind" or v != "tcp")
+                and (k != "listen" or v != "tcp")
+                and (k != "socket_path" or v)
+                and (k != "local_port" or m.listen == "tcp")
+            }
             for m in mappings
         ]
         # mkstemp: O_EXCL, 0600, unpredictable name, so nothing planted can be followed.
@@ -314,6 +335,8 @@ class MappingStore:
                 local_port=existing.local_port,
                 name=name or existing.name,
                 kind=new_kind,
+                listen=existing.listen,
+                socket_path=existing.socket_path,
             )
             self.save([renamed if m is existing else m for m in mappings])
             return renamed, False
