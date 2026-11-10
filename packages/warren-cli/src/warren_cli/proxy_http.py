@@ -334,7 +334,13 @@ class HttpGateway:
         provider: UpstreamAuthProvider | None = None,
         limits: GatewayLimits | None = None,
         clock: Callable[[], float] = time.monotonic,
+        trusted_peer: bool = False,
     ) -> None:
+        # trusted_peer: the listener is a 0600 unix socket whose peer uid the caller
+        # has already checked, so file permissions are the authentication: no Host/Origin
+        # check (there is no browser origin), no session cookie, no start link. The
+        # strict parser, method/upgrade rules, body limits and connection caps all stay.
+        self.trusted_peer = trusted_peer
         self.bind = bind
         self.port = port
         self.limits = limits or GatewayLimits()
@@ -404,7 +410,7 @@ class HttpGateway:
     ) -> bool:
         """Handle one request; True to keep the client connection open."""
         host = req.header("host")
-        if host not in self.authorities:
+        if not self.trusted_peer and host not in self.authorities:
             await self._respond(writer, 421, "unexpected Host")
             return False
         if req.method == "OPTIONS":
@@ -413,12 +419,12 @@ class HttpGateway:
         if req.method not in METHODS:
             await self._respond(writer, 405, "method not allowed")
             return False
-        if req.path == START_PATH:
+        if req.path == START_PATH and not self.trusted_peer:
             return await self._exchange(req, writer)
         if req.path == RESERVED_PREFIX or req.path.startswith(RESERVED_PREFIX + "/"):
             await self._respond(writer, 404, "not found")
             return False
-        if not self.auth.valid(self._cookie(req)):
+        if not self.trusted_peer and not self.auth.valid(self._cookie(req)):
             await self._respond(writer, 401, "no valid session: open the link `warren proxy run` printed")
             return False
         upgrade = req.header("upgrade")
@@ -434,7 +440,7 @@ class HttpGateway:
         elif "upgrade" in req.connection_tokens:
             await self._respond(writer, 400, "Connection: upgrade without Upgrade")
             return False
-        if not self._same_origin_ok(req, upgrade is not None):
+        if not self.trusted_peer and not self._same_origin_ok(req, upgrade is not None):
             await self._respond(writer, 403, "cross-origin request refused")
             return False
         if req.body == "length" and req.length > self.limits.max_request_body:

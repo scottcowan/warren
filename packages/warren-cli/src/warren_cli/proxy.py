@@ -37,6 +37,7 @@ import json
 import os
 import re
 import socket
+import stat
 import subprocess
 import tempfile
 from dataclasses import asdict, dataclass, field
@@ -48,7 +49,7 @@ import structlog
 
 from warren_common.fileperms import restrict_to_owner
 
-from . import proxy_http
+from . import proxy_http, proxy_unix
 
 from . import proxy_http
 
@@ -854,6 +855,8 @@ class MappingProxy:
         # the connection.
         self._connections: set[asyncio.Task] = set()
         self.gateway: proxy_http.HttpGateway | None = None
+        self.socket_path: str | None = None  # set while a unix listener is bound
+        self._socket_id: tuple[int, int] | None = None  # (st_dev, st_ino) of the socket we made
         # The workspace id this mapping first resolved to; a later resolve to another id
         # halts the mapping (see _check_identity).
         self._pinned_workspace: str | None = None
@@ -861,6 +864,9 @@ class MappingProxy:
         self._log = log.bind(mapping=mapping.label, local_port=mapping.local_port)
 
     async def listen(self) -> None:
+        if self.mapping.listen == "unix":
+            await self._listen_unix()
+            return
         host = check_loopback(self.settings.bind)
         if self.mapping.kind == "http":
             self.gateway = proxy_http.HttpGateway(
@@ -872,15 +878,55 @@ class MappingProxy:
         self._server = await asyncio.start_server(self._handle, host, self.mapping.local_port)
         self._log.info("proxy_listening", address=f"{host}:{self.mapping.local_port}")
 
+    async def _listen_unix(self) -> None:
+        m = self.mapping
+        if m.socket_path:
+            path = Path(m.socket_path)
+        else:
+            run_dir = proxy_unix.ensure_run_dir()
+            path = proxy_unix.default_socket_path(m.server, m.workspace, m.name or str(m.remote_port), run_dir=run_dir)
+        sock = proxy_unix.bind_unix(path)
+        if m.kind == "http":
+            self.gateway = proxy_http.HttpGateway(
+                bind="unix",
+                port=0,
+                provider=self.settings.upstream_auth,
+                limits=self.settings.http_limits,
+                trusted_peer=True,
+            )
+        try:
+            self._server = await asyncio.start_unix_server(self._handle, sock=sock)
+        except BaseException:
+            sock.close()
+            self._unlink_socket(str(path), None)
+            raise
+        st = os.lstat(path)
+        self.socket_path, self._socket_id = str(path), (st.st_dev, st.st_ino)
+        self._log.info("proxy_listening", address=f"unix:{path}")
+
+    @staticmethod
+    def _unlink_socket(path: str, ident: tuple[int, int] | None) -> None:
+        """Remove ``path`` if it is still the socket we made (never a replacement)."""
+        try:
+            st = os.lstat(path)
+            if stat.S_ISSOCK(st.st_mode) and (ident is None or (st.st_dev, st.st_ino) == ident):
+                os.unlink(path)
+        except OSError:
+            pass
+
     def start_link(self) -> str | None:
-        """A fresh one-time exchange URL for an http mapping (None for tcp)."""
-        return self.gateway.start_link() if self.gateway is not None else None
+        """A fresh one-time exchange URL for a TCP-listening http mapping (None for tcp
+        kind and for unix sockets, where file permissions authenticate)."""
+        return self.gateway.start_link() if self.gateway is not None and not self.gateway.trusted_peer else None
 
     async def close(self) -> None:
         if self._server is not None:
             self._server.close()
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self._server.wait_closed(), timeout=2)
+        if self.socket_path is not None:
+            self._unlink_socket(self.socket_path, self._socket_id)
+            self.socket_path = self._socket_id = None
         for task in (self._idle_task, self._keepalive_task):
             if task is not None:
                 task.cancel()
@@ -994,11 +1040,20 @@ class MappingProxy:
             )
         raise ProxyError("the SSM port-forward is not accepting connections")
 
+    @staticmethod
+    def _peer_ok(writer: asyncio.StreamWriter) -> bool:
+        sock = writer.get_extra_info("socket")
+        return sock is not None and proxy_unix.peer_allowed(sock)
+
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
         if task is not None:
             self._connections.add(task)
             task.add_done_callback(self._connections.discard)
+        if self.mapping.listen == "unix" and not self._peer_ok(writer):
+            self._log.warning("proxy_peer_rejected", reason="peer uid is not this user")
+            writer.close()
+            return
         self.active += 1
         if self._idle_task is not None:
             self._idle_task.cancel()
@@ -1095,7 +1150,7 @@ class ProxyDaemon:
             try:
                 await proxy.listen()
             except OSError as exc:
-                log.error("proxy_listen_failed", mapping=mapping.label, local_port=mapping.local_port, error=str(exc))
+                log.error("proxy_listen_failed", mapping=mapping.label, address=mapping.address, error=str(exc))
                 self.failed[mapping] = str(exc)
                 continue
             self.failed.pop(mapping, None)

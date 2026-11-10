@@ -21,8 +21,9 @@ MAX_SOCKET_PATH = 100
 _LOCAL_PEERCRED = 0x001  # macOS/BSD: getsockopt(SOL_LOCAL=0, LOCAL_PEERCRED) -> struct xucred
 
 
-class UnixSocketError(Exception):
-    """A socket path or directory that cannot be used safely."""
+class UnixSocketError(OSError):
+    """A socket path or directory that cannot be used safely (an OSError so the
+    daemon records it like any other listen failure)."""
 
 
 def supported() -> bool:
