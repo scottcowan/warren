@@ -283,13 +283,15 @@ class DynamoTable:
         matches are collected, so a page costs what it reads, not the partition."""
         values: dict[str, Any] = {":k": pk, ":f": value}
         cond = "#k = :k"
+        names = {"#k": "gsi1pk", "#f": attr}
         if before is not None:
             cond += " AND #s < :s"
+            names["#s"] = "gsi1sk"
             values[":s"] = before
         kwargs: dict[str, Any] = {
             "TableName": self.name, "IndexName": index, "KeyConditionExpression": cond,
             "FilterExpression": "#f = :f",
-            "ExpressionAttributeNames": {"#k": "gsi1pk", "#s": "gsi1sk", "#f": attr},
+            "ExpressionAttributeNames": names,
             "ExpressionAttributeValues": values, "ScanIndexForward": False,
         }
         items: list[dict] = []
