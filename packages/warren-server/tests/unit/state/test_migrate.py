@@ -192,3 +192,28 @@ def test_cli_flag_runs_the_migration(monkeypatch, populated):
         cli.main()
     assert exc.value.code == 0
     assert seen == {"apply": False, "sqlite_path": str(populated.path)}
+
+
+async def test_multi_item_rows_are_written_atomically(populated, dynamo_table, sm_client, monkeypatch):
+    """A failure part-way through a multi-item row leaves none of it, so the rerun copies it all."""
+    from warren.state.dynamodb import DynamoTable
+
+    settings = _settings(dynamo_table.name)
+    kwargs = dict(sqlite_path=populated.path, dynamodb_client=dynamo_table.client, secretsmanager_client=sm_client,
+                  echo=lambda _line: None)
+    real = DynamoTable.transact
+    calls = {"n": 0}
+
+    async def flaky(self, ops):
+        if len(ops) > 1 and calls["n"] == 0:
+            calls["n"] += 1
+            raise RuntimeError("injected failure")
+        await real(self, ops)
+
+    monkeypatch.setattr(DynamoTable, "transact", flaky)
+    with pytest.raises(RuntimeError):
+        await migrate_state(settings, apply=True, **kwargs)
+    await migrate_state(settings, apply=True, **kwargs)
+    stores = dynamo_stores(dynamo_table, settings)
+    _user, token_id = await stores["auth"].get_active_user_and_token_id_by_hashed_token("hash-admin")
+    assert token_id == populated.token.token_id

@@ -34,6 +34,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -67,7 +68,8 @@ def check_name(kind: str, value: str) -> str:
 def host_key_alias(server: str, workspace_id: str) -> str:
     """The known_hosts name for a workspace's sshd: stable for the workspace's life,
     whatever task or local forward port it is reached through."""
-    return f"warren-{check_name('server', server)}-{check_name('workspace id', workspace_id)}"
+    # "+" is outside _NAME_RE, so (server, workspace) pairs can't collide ("a-b"+"c" vs "a"+"b-c").
+    return f"warren-{check_name('server', server)}+{check_name('workspace id', workspace_id)}"
 
 
 def warren_command() -> str:
@@ -236,21 +238,37 @@ def render_podman_ssh_config(
 
 def key_path(server: str, workspace_id: str) -> Path:
     """Where `warren ssh-config` keeps a podman/docker workspace's minted key."""
-    return Path.home() / ".warren" / "ssh" / f"{check_name('server', server)}-{check_name('workspace id', workspace_id)}"
+    return Path.home() / ".warren" / "ssh" / f"{check_name('server', server)}+{check_name('workspace id', workspace_id)}"
+
+
+def _legacy_key_path(path: Path) -> Path | None:
+    """The pre-"+" name of ``path`` (``server-workspace``, ambiguous), if it has one."""
+    server, sep, workspace = path.name.partition("+")
+    return path.with_name(f"{server}-{workspace}") if sep else None
 
 
 def save_private_key(path: Path, private_key: str) -> None:
     """Write ``private_key`` owner-only (0600 in a 0700 directory), replacing any old one."""
     path.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
-    tmp = path.with_name(path.name + ".tmp")
-    with contextlib.suppress(FileNotFoundError):
-        tmp.unlink()
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(private_key if private_key.endswith("\n") else private_key + "\n")
-    restrict_to_owner(tmp)
-    os.replace(tmp, path)
+    # mkstemp: unique, O_EXCL, 0600 -- no fixed name another process could pre-create.
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(private_key if private_key.endswith("\n") else private_key + "\n")
+        restrict_to_owner(tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    # The ambiguous old name may belong to a different server/workspace pair; its key is
+    # no longer referenced by any config we print, so drop it.
+    legacy = _legacy_key_path(path)
+    if legacy is not None and legacy.is_file() and not legacy.is_symlink():
+        with contextlib.suppress(OSError):
+            legacy.unlink()
 
 
 async def _control_plane(remote: Any, server: str, method: str, path: str) -> Any:
