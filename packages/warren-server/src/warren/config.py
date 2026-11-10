@@ -92,6 +92,11 @@ class WarrenSettings(BaseSettings):
     # podman's default mapping, host user = container root (the behaviour before this
     # setting existed). Other podman modes ("keep-id", "auto", "nomap") pass through.
     podman_userns: str = DEFAULT_PODMAN_USERNS
+    # Rootless podman with the pasta network helper lets a workspace reach the host's
+    # loopback via 169.254.1.2 (other workspaces' published ports, any host-local service).
+    # The server refuses to start in that setup unless this is true. slirp4netns keeps host
+    # loopback closed. Podman only; docker and ECS never run the check.
+    podman_allow_pasta: bool = False
     max_workspaces: int = 10
     # Issue #11: max_workspaces is a server-wide cap and doesn't stop one owner from
     # exhausting it for everyone. Checked against non-terminal workspaces with

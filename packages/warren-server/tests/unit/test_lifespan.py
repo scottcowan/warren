@@ -499,3 +499,51 @@ def test_main_configures_logging_before_serving(monkeypatch):
     main_module.main()
 
     assert calls == ["configure_logging", "uvicorn.run"]
+
+
+@pytest.mark.asyncio
+async def test_lifespan_aborts_when_pasta_preflight_refuses(env_defaults):
+    """A refused podman preflight (rootless pasta without the override) aborts startup."""
+    from warren.errors import PreflightError
+
+    refuse = AsyncMock(side_effect=PreflightError("Refusing to start: rootless podman uses pasta"))
+    with (
+        patch("warren.app.run_preflight", refuse),
+        patch("warren.app.PodmanRuntime"),
+        patch("warren.app.WorkspaceRegistry") as reg_cls,
+    ):
+        from warren.app import app, lifespan
+
+        with pytest.raises(PreflightError, match="pasta"):
+            async with lifespan(app):
+                pytest.fail("startup must not complete")
+        reg_cls.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_lifespan_passes_allow_pasta_to_preflight(env_defaults, monkeypatch):
+    monkeypatch.setenv("WARREN_PODMAN_ALLOW_PASTA", "1")
+    with (
+        patch("warren.app.run_preflight", AsyncMock()) as preflight,
+        patch("warren.app.WorkspaceRegistry", return_value=MagicMock(reconcile_from_disk=AsyncMock())),
+        patch("warren.app.PodmanRuntime"),
+    ):
+        from warren.app import app, lifespan
+
+        async with lifespan(app):
+            assert preflight.await_args.kwargs["allow_pasta"] is True
+
+
+@pytest.mark.asyncio
+async def test_lifespan_ecs_never_runs_podman_preflight(env_defaults, monkeypatch):
+    monkeypatch.setenv("WARREN_RUNTIME_TYPE", "ecs")
+    with (
+        patch("warren.app.run_preflight", AsyncMock()) as podman_preflight,
+        patch("warren.runtime.ecs.ECSRuntime.preflight", AsyncMock()),
+        patch("warren.app.WorkspaceRegistry", return_value=MagicMock(reconcile_from_disk=AsyncMock())),
+    ):
+        from warren.app import app, lifespan
+
+        async with lifespan(app):
+            pass
+    podman_preflight.assert_not_awaited()

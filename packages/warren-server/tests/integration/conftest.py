@@ -192,6 +192,18 @@ def itest_docker_ssh_base_image() -> Iterator[str]:
         client.close()
 
 
+def _machine_uses_pasta(socket_path: str) -> bool:
+    from podman import PodmanClient  # noqa: PLC0415
+
+    from warren.podman_host import rootless_uses_pasta  # noqa: PLC0415
+
+    try:
+        with PodmanClient(base_url=f"unix://{socket_path}") as client:
+            return rootless_uses_pasta(client.info())
+    except Exception:
+        return False
+
+
 @pytest.fixture
 def itest_env(
     monkeypatch: pytest.MonkeyPatch,
@@ -217,6 +229,11 @@ def itest_env(
     monkeypatch.setenv("WARREN_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("WARREN_PODMAN_SOCKET", socket_path)  # bare path — Pitfall 5
     monkeypatch.setenv("WARREN_SERVER_ID", itest_server_id)
+    # CI runs rootless podman with slirp4netns, which the server accepts. A pasta machine
+    # (e.g. the Mac's podman machine) would be refused at lifespan startup, so allow it
+    # there only; the isolation tests still fail on pasta, as they should.
+    if _machine_uses_pasta(socket_path):
+        monkeypatch.setenv("WARREN_PODMAN_ALLOW_PASTA", "1")
 
     try:
         yield {

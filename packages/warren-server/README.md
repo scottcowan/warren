@@ -107,21 +107,43 @@ default stays `127.0.0.1` unless you pass it. A server driving the host's podman
 needs the host's podman socket mounted and `WARREN_PODMAN_SOCKET`/`WARREN_HOST_DATA_DIR`
 set; see `config.py`.
 
-### Ubuntu 26.04: rootless podman and pasta
+### Rootless podman needs slirp4netns (`WARREN_PODMAN_ALLOW_PASTA`)
 
-On Ubuntu 26.04, rootless Podman can't remove containers with its default `pasta` network
-helper: the shipped AppArmor `pasta` profile refuses SIGTERM from the `podman` profile
-(`apparmor="DENIED" operation="signal" profile="pasta" signal=term peer="podman"`, then
-"rootless netns: kill network process: permission denied"). Use slirp4netns instead,
-which also keeps host loopback closed to containers by default, as the
-[threat model](../../docs/threat-model.md) assumes:
+The server refuses to start on rootless podman when `podman info` reports the `pasta`
+network helper (podman's default since 5.0; podman 4.x defaults to slirp4netns). On pasta
+a workspace container can reach the host's loopback via `169.254.1.2`, so one workspace can
+connect to the ports warren publishes on host loopback (other workspaces' SSH and app
+ports) and to any other service listening there. slirp4netns keeps host loopback closed by
+default, as the [threat model](../../docs/threat-model.md) assumes. Rootful podman, docker
+and ECS are unaffected, and the check uses whatever `podman info` reports from the
+configured socket, local or forwarded from another host.
+
+Fix: install slirp4netns and select it for the user running the server:
 
 ```bash
 mkdir -p ~/.config/containers
 printf '[network]\ndefault_rootless_network_cmd = "slirp4netns"\n' >> ~/.config/containers/containers.conf
 ```
 
-At startup the server logs `podman_pasta_apparmor` (a warning; startup continues) when
+Override: set `WARREN_PODMAN_ALLOW_PASTA=1` to start anyway. The server then logs
+`podman_pasta_host_loopback` once at startup. Only do this where every workspace is trusted
+and the host runs nothing sensitive on loopback.
+
+### Ubuntu 26.04: rootless podman and pasta
+
+On Ubuntu 26.04, rootless Podman can't remove containers with its default `pasta` network
+helper: the shipped AppArmor `pasta` profile refuses SIGTERM from the `podman` profile
+(`apparmor="DENIED" operation="signal" profile="pasta" signal=term peer="podman"`, then
+"rootless netns: kill network process: permission denied"). slirp4netns avoids this, and
+it is now required on rootless podman unless you set `WARREN_PODMAN_ALLOW_PASTA=1`
+(see above; the override keeps the container-removal problem, so it is only a stopgap here):
+
+```bash
+mkdir -p ~/.config/containers
+printf '[network]\ndefault_rootless_network_cmd = "slirp4netns"\n' >> ~/.config/containers/containers.conf
+```
+
+With the override set, the server logs `podman_pasta_apparmor` (a warning; startup continues) when
 `podman info` reports podman 5.x, `rootlessNetworkCmd: pasta` and AppArmor enabled. When
 the server runs directly on the podman host (not containerized, and podman reports the
 same hostname) it also reads the local pasta profile and stays quiet if that profile lets
@@ -251,6 +273,9 @@ All settings are `WARREN_*` environment variables, loaded by `src/warren/config.
 - `WARREN_BOOTSTRAP_TOKEN` — mints the first admin on an empty database
 - `WARREN_RUNTIME_TYPE` — `podman` (default) / `docker` / `ecs`
 - `WARREN_PODMAN_SOCKET` — path to the rootless Podman socket
+- `WARREN_PODMAN_ALLOW_PASTA` — start on rootless podman even though its network helper is
+  pasta (host loopback reachable from workspaces); default off, see
+  [above](#rootless-podman-needs-slirp4netns-warren_podman_allow_pasta).
 - `WARREN_PODMAN_USERNS` — podman workspaces' user namespace, default
   `keep-id:uid=1000,gid=1000`; `host` turns it off (see
   [above](#rootless-podman-user-namespace-warren_podman_userns))

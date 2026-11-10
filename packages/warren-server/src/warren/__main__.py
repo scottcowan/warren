@@ -32,7 +32,7 @@ async def _dry_run() -> None:
     settings = WarrenSettings()
 
     if not os.environ.get("WARREN_DRY_RUN_SKIP_PREFLIGHT"):
-        await run_preflight(settings.podman_socket)
+        await run_preflight(settings.podman_socket, allow_pasta=settings.podman_allow_pasta)
 
     db = await open_db(db_path(settings))
     try:

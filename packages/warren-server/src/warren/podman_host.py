@@ -59,6 +59,26 @@ def _major(version: Any) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def rootless_uses_pasta(info: dict[str, Any]) -> bool:
+    """True when `info` says podman is rootless and its rootless network helper is pasta.
+
+    A reported `host.rootlessNetworkCmd` decides. When podman doesn't report it, the
+    answer follows podman's own default: pasta from 5.0, slirp4netns before (so a
+    missing field on 4.x is not pasta). Rootless must be reported true; rootful podman
+    and an unreported value are never treated as pasta.
+    """
+    host = _get(info, "host", "Host") or {}
+    security = _get(host, "security", "Security") or {}
+    if _get(security, "rootless", "Rootless") is not True:
+        return False
+    net_cmd = _get(host, "rootlessNetworkCmd", "RootlessNetworkCmd")
+    if isinstance(net_cmd, str) and net_cmd.strip():
+        return net_cmd.strip().lower() == "pasta"
+    version = _get(_get(info, "version", "Version") or {}, "Version", "version")
+    major = _major(version)
+    return major is not None and major >= 5
+
+
 def profile_allows_podman_signal(profile: str) -> bool:
     if _SIGNAL_ALLOW_ALL.search(profile):
         return True
@@ -89,15 +109,13 @@ def pasta_apparmor_warning(info: dict[str, Any], pasta_profile: str | None = Non
     security = _get(host, "security", "Security") or {}
     if _get(security, "apparmorEnabled", "AppArmorEnabled", "apparmor_enabled") is not True:
         return None
-    if _get(security, "rootless", "Rootless") is False:
+    if not rootless_uses_pasta(info):
         return None
     version = _get(_get(info, "version", "Version") or {}, "Version", "version")
     major = _major(version)
     if major is None or major < 5:
         return None
-    net_cmd = _get(host, "rootlessNetworkCmd", "RootlessNetworkCmd")
-    if not isinstance(net_cmd, str) or net_cmd.strip().lower() != "pasta":
-        return None
+    net_cmd = _get(host, "rootlessNetworkCmd", "RootlessNetworkCmd") or "pasta"
     if pasta_profile is not None and profile_allows_podman_signal(pasta_profile):
         return None
     dist = _get(host, "distribution", "Distribution") or {}
@@ -127,13 +145,10 @@ def pasta_host_loopback_warning(info: dict[str, Any]) -> dict[str, Any] | None:
     template ports. Seen with podman 6.0.1's default pasta options; slirp4netns
     (`allow_host_loopback=false`, its default) keeps host loopback closed, which is what
     CI's isolation tests run with. Advice, not a gate: missing fields mean no warning."""
+    if not rootless_uses_pasta(info):
+        return None
     host = _get(info, "host", "Host") or {}
-    security = _get(host, "security", "Security") or {}
-    if _get(security, "rootless", "Rootless") is False:
-        return None
-    net_cmd = _get(host, "rootlessNetworkCmd", "RootlessNetworkCmd")
-    if not isinstance(net_cmd, str) or net_cmd.strip().lower() != "pasta":
-        return None
+    net_cmd = _get(host, "rootlessNetworkCmd", "RootlessNetworkCmd") or "pasta"
     version = _get(_get(info, "version", "Version") or {}, "Version", "version")
     return {
         "podman_version": str(version),
@@ -144,3 +159,22 @@ def pasta_host_loopback_warning(info: dict[str, Any]) -> dict[str, Any] | None:
         ),
         "fix": FIX,
     }
+
+
+ALLOW_PASTA_ENV = "WARREN_PODMAN_ALLOW_PASTA"
+
+
+def pasta_refusal_message(info: dict[str, Any]) -> str:
+    """Startup error text for rootless pasta without the override."""
+    host = _get(info, "host", "Host") or {}
+    version = _get(_get(info, "version", "Version") or {}, "Version", "version")
+    return (
+        f"Refusing to start: rootless podman {version or '(unknown version)'} uses pasta for "
+        f"networking (rootlessNetworkCmd: {_get(host, 'rootlessNetworkCmd', 'RootlessNetworkCmd') or 'unreported, the podman 5+ default'}), "
+        "which lets a workspace container reach the host's loopback via 169.254.1.2, including "
+        "other workspaces' published SSH and app ports. "
+        f"Fix: set {FIX} for the user running the server (slirp4netns must be installed). "
+        f"Override: set {ALLOW_PASTA_ENV}=1 to start anyway, accepting that any workspace can "
+        "reach every service listening on host loopback. "
+        f"Docs: {README_URL}"
+    )

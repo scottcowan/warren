@@ -156,8 +156,8 @@ ECS:
   `t3 serve --host 0.0.0.0 --port 3773 --no-browser`. It is still only reachable
   from the server host's loopback: the workspace's bridge network is isolated from
   other workspaces, and the host port is bound to `127.0.0.1`. Under rootless
-  podman, run slirp4netns rather than pasta if other workspaces on the host aren't
-  trusted (residual risk 6 in [threat-model.md](../../docs/threat-model.md)).
+  podman, the server requires slirp4netns rather than pasta unless
+  `WARREN_PODMAN_ALLOW_PASTA=1` (residual risk 6 in [threat-model.md](../../docs/threat-model.md)).
 - **Start it in a session.** This image's entrypoint (from ecs-base) runs
   `WARREN_APP_CMD`, which only the ECS runtime sets; on podman/docker it idles, so
   start `t3 serve` from `warren connect`, or use a podman workspace image that runs
