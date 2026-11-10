@@ -1332,6 +1332,27 @@ def ecs_session_command(shell: str, *, harness: str | None = None, new: bool = F
     return f"/bin/sh -c '{script}'"
 
 
+_ECS_ID_RE = re.compile(r"[A-Za-z0-9_-]+")
+_ECS_TASK_ARN_RE = re.compile(
+    r"arn:aws[a-z-]*:ecs:[a-z0-9-]+:\d{12}:task/(?P<cluster>[A-Za-z0-9_-]+)/(?P<task>[A-Za-z0-9]+)"
+)
+
+
+def _check_ecs_ids(cluster: str, task_arn: str, runtime_id: str | None = None) -> str:
+    """Validate server-supplied ECS ids before they reach an argv or an SSM target
+    string, and check the task belongs to the cluster. Returns the short task id."""
+    if not _ECS_ID_RE.fullmatch(cluster or ""):
+        raise RuntimeError(f"refusing unexpected ECS cluster {cluster!r}")
+    m = _ECS_TASK_ARN_RE.fullmatch(task_arn or "")
+    if m is None:
+        raise RuntimeError(f"refusing unexpected ECS task ARN {task_arn!r}")
+    if m.group("cluster") != cluster:
+        raise RuntimeError(f"ECS task {task_arn!r} is not in cluster {cluster!r}")
+    if runtime_id is not None and not _ECS_ID_RE.fullmatch(runtime_id):
+        raise RuntimeError(f"refusing unexpected ECS runtime id {runtime_id!r}")
+    return m.group("task")
+
+
 def _resolve_ecs_container_runtime_id(cluster: str, task_arn: str, container_name: str = "workspace") -> str:
     """Look up a task's container ``runtimeId`` via ``aws ecs describe-tasks``.
 
@@ -1341,6 +1362,9 @@ def _resolve_ecs_container_runtime_id(cluster: str, task_arn: str, container_nam
     port forwarding (there's no `aws ecs` equivalent of `execute-command` for
     port forwarding) needs it explicitly.
     """
+    _check_ecs_ids(cluster, task_arn)
+    if not _ECS_ID_RE.fullmatch(container_name):
+        raise RuntimeError(f"refusing unexpected container name {container_name!r}")
     result = subprocess.run(
         [
             "aws", "ecs", "describe-tasks",
@@ -1358,6 +1382,7 @@ def _resolve_ecs_container_runtime_id(cluster: str, task_arn: str, container_nam
         detail = result.stderr.strip() or "no runtimeId returned"
         msg = f"could not resolve ECS container runtimeId for task {task_arn!r}: {detail}"
         raise RuntimeError(msg)
+    _check_ecs_ids(cluster, task_arn, runtime_id)
     return runtime_id
 
 
@@ -1646,7 +1671,7 @@ def _require_ssm_tools() -> None:
 
 def ecs_ssm_target(cluster: str, task_arn: str, runtime_id: str) -> str:
     """The SSM target for a container in an ECS Exec-enabled task."""
-    task_id = task_arn.rstrip("/").rsplit("/", 1)[-1]
+    task_id = _check_ecs_ids(cluster, task_arn, runtime_id)
     return f"ecs:{cluster}_{task_id}_{runtime_id}"
 
 

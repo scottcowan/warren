@@ -31,8 +31,8 @@ runner = CliRunner()
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="fake `aws` is a POSIX shebang script")
 
 _WS = "abc12345-aaaa-bbbb-cccc-ddddeeeeffff"
-_TASK1 = "arn:aws:ecs:us-east-1:1:task/prod-cluster/task1111"
-_TASK2 = "arn:aws:ecs:us-east-1:1:task/prod-cluster/task2222"
+_TASK1 = "arn:aws:ecs:us-east-1:123456789012:task/prod-cluster/task1111"
+_TASK2 = "arn:aws:ecs:us-east-1:123456789012:task/prod-cluster/task2222"
 
 _CONFIG = (
     '[defaults]\nserver = "prodecs"\n'
@@ -1073,7 +1073,7 @@ async def test_ssm_forwarder_reports_expired_sso(fake_aws, monkeypatch):
     monkeypatch.setenv("FAKE_AWS_EXPIRED", "1")
     monkeypatch.setenv("AWS_PROFILE", "warren-dev")
     with pytest.raises(proxy.AwsCredentialsExpired, match=r"run `aws sso login --profile warren-dev`"):
-        await proxy.SsmForwarder().start(proxy.Target(workspace_id=_WS, cluster="c", task_arn=_TASK1), 3773)
+        await proxy.SsmForwarder().start(proxy.Target(workspace_id=_WS, cluster="prod-cluster", task_arn=_TASK1), 3773)
 
 
 # ---------------------------------------------------------------------------
