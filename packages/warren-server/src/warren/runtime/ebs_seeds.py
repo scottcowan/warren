@@ -553,12 +553,12 @@ class BareSeeds:
             return "failed", "the seed-refresh task left no volume to snapshot"
         volume_id = volume["VolumeId"]
         if exit_code not in (0, EXIT_PARTIAL):
-            await self._ebs._delete_volume(volume_id)
+            await self._ebs._delete_volume(volume_id, storage=STORAGE_SEED, owner_id=owner_id)
             return "failed", f"the seed-refresh task exited {exit_code}"
         snapshot_id = await self._ebs.create_tagged_snapshot(
             volume_id, self.seed_tags(owner_id), f"warren bare seed {self.pseudo_id(owner_id)}"
         )
-        await self._ebs._delete_volume(volume_id)
+        await self._ebs._delete_volume(volume_id, storage=STORAGE_SEED, owner_id=owner_id)
         if snapshot_id is None:
             return "failed", "the seed-refresh volume disappeared before its snapshot"
         # SHAs from before the task ran: the mirrors are at least that new. A partial
@@ -805,12 +805,12 @@ class BareSeeds:
         }
         if state != "completed":
             if snap is not None and ours:
-                await self._ebs._delete_snapshot(pending_id)
+                await self._ebs._delete_snapshot(pending_id, storage=STORAGE_SEED, owner_id=owner_id)
             await self.store.update_seed(owner_id, **clear, last_error="the new seed snapshot failed")
             return "failed"
         old, previous = seed.get("snapshot_id"), seed.get("previous_snapshot_id")
         if previous and previous not in (pending_id, old):
-            await self._ebs._delete_snapshot(previous)
+            await self._ebs._delete_snapshot(previous, storage=STORAGE_SEED, owner_id=owner_id)
         now_iso = _iso(self._now())
         keys = _keys(seed.get("pending_repo_keys"))
         await self.store.update_seed(
@@ -837,7 +837,7 @@ class BareSeeds:
     async def _delete_seed(self, owner_id: str, seed: dict) -> None:
         for name in ("snapshot_id", "pending_snapshot_id", "previous_snapshot_id"):
             if seed.get(name):
-                await self._ebs._delete_snapshot(seed[name])
+                await self._ebs._delete_snapshot(seed[name], storage=STORAGE_SEED, owner_id=owner_id)
         await self.store.delete_seed(owner_id)
         log.info("ebs_seed_deleted", owner_id=owner_id)
 
@@ -880,7 +880,7 @@ class BareSeeds:
                 if seed.get("previous_snapshot_id") and (
                     superseded is None or now - superseded >= SUPERSEDED_GRACE_SECONDS
                 ):
-                    await self._ebs._delete_snapshot(seed["previous_snapshot_id"])
+                    await self._ebs._delete_snapshot(seed["previous_snapshot_id"], storage=STORAGE_SEED, owner_id=owner_id)
                     await self.store.update_seed(owner_id, previous_snapshot_id=None, superseded_at=None)
                     stats["snapshots_deleted"] += 1
             if not rows:
@@ -911,7 +911,7 @@ class BareSeeds:
                 continue
             if running(_tags(vol).get(TAG_OWNER_ID, "")):
                 continue
-            if await self._ebs._delete_volume(vol["VolumeId"]):
+            if await self._ebs._delete_volume(vol["VolumeId"], storage=STORAGE_SEED, owner_id=_tags(vol).get(TAG_OWNER_ID)):
                 stats["volumes_deleted"] += 1
         for snap in await self._ebs.snapshots(storage=STORAGE_SEED):
             owner_id = _tags(snap).get(TAG_OWNER_ID, "")
@@ -923,5 +923,5 @@ class BareSeeds:
                 continue
             if running(owner_id):
                 continue
-            await self._ebs._delete_snapshot(snap["SnapshotId"])
+            await self._ebs._delete_snapshot(snap["SnapshotId"], storage=STORAGE_SEED, owner_id=owner_id)
             stats["snapshots_deleted"] += 1
