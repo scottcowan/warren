@@ -36,7 +36,7 @@ def _check_not_nested() -> None:
             f"   Exit this workspace first (Ctrl-D or `exit`), then re-run.\n"
         )
         raise typer.Exit(1)
-from .client import make_remote_client
+from .client import fetch_all_workspaces, make_remote_client
 from .commands import workspaces as workspaces_local
 from .commands.doctor import doctor as _doctor
 from .commands.proxy import proxy_app
@@ -1413,9 +1413,7 @@ def workspaces_connect(
         if not workspace_id:
             async def _list_remote():
                 async with make_remote_client(remote, timeout=5.0) as c:
-                    r = await c.get("/workspaces")
-                    r.raise_for_status()
-                    return r.json()
+                    return await fetch_all_workspaces(c)
             try:
                 workspaces = asyncio.run(_list_remote())
             except Exception:
@@ -1453,9 +1451,7 @@ def workspaces_connect(
         # was a real gap (caught live).
         async def _resolve_workspace() -> dict:
             async with make_remote_client(remote, timeout=5.0) as c:
-                r = await c.get("/workspaces")
-                r.raise_for_status()
-                workspaces = r.json()
+                workspaces = await fetch_all_workspaces(c)
             if not workspaces:
                 return {"workspace_id": workspace_id}
             return _match_remote_workspace(workspaces, workspace_id)
@@ -1574,9 +1570,7 @@ def workspaces_tunnel(
 
     async def _get_workspace() -> dict:
         async with make_remote_client(remote, timeout=5.0) as c:
-            r = await c.get("/workspaces")
-            r.raise_for_status()
-            workspaces = r.json()
+            workspaces = await fetch_all_workspaces(c)
         if not workspaces:
             return {}
         return _match_remote_workspace(workspaces, workspace_id)

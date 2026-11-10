@@ -129,3 +129,23 @@ async def test_make_remote_client_ssh_tunnels_via_dispatch_and_tears_down():
 
     start_mock.assert_called_once_with("node2", 8420, ssh_key_path="~/.ssh/id_homelab")
     fake_proc.terminate.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_fetch_all_workspaces_follows_next_cursor():
+    from warren_cli.client import fetch_all_workspaces
+
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.url.params))
+        if "cursor" not in request.url.params:
+            return httpx.Response(
+                200, json=[{"workspace_id": "a"}, {"workspace_id": "b"}], headers={"X-Next-Cursor": "c1"}
+            )
+        return httpx.Response(200, json=[{"workspace_id": "c"}])
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://t") as c:
+        rows = await fetch_all_workspaces(c, page_size=2)
+    assert [r["workspace_id"] for r in rows] == ["a", "b", "c"]
+    assert seen == [{"limit": "2"}, {"limit": "2", "cursor": "c1"}]
