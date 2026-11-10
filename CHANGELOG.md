@@ -2,6 +2,21 @@
 
 Image releases, newest first. Written by scripts/release.py.
 
+## warren-server 1.8.0 (2026-11-10)
+
+- feat(docker-base): run the workload as warren (uid 1000) after a root phase (#87) (80bb9d0)
+- fix(server): refuse to start on rootless podman with pasta unless WARREN_PODMAN_ALLOW_PASTA (#86) (0714baa)
+- build(deps): bump the python group across 1 directory with 2 updates (#83) (55de2bc)
+
+## warren-docker-base 1.2.0 (2026-11-10)
+
+- feat(docker-base): run the workload as warren (uid 1000) after a root phase (#87) (80bb9d0)
+
+## warren-docker-ssh-base 0.2.0 (2026-11-10)
+
+- feat(docker-base): run the workload as warren (uid 1000) after a root phase (#87) (80bb9d0)
+- chore: pin docker-ssh-base, ecs-agent-base stub and T3 example to the published images (#84) (edbdeb9)
+
 ## warren-server 1.7.0 (2026-11-09)
 
 - feat: release train: proxy fix, keep-id, template ports, podman proxy, git write tokens, notifications, headless runs, SSH images, harness modes, DynamoDB/Secrets Manager backend, dependabot (#81) (e0e9d94)

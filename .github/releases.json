@@ -2,7 +2,7 @@
   "baseline": "ddf75e3ddb2b87719c8f4fc45d8191324b85c85b",
   "components": {
     "warren-server": {
-      "version": "1.7.0",
+      "version": "1.8.0",
       "dockerfile": "packages/warren-server/Dockerfile",
       "context": ".",
       "paths": [
@@ -21,7 +21,7 @@
       ]
     },
     "warren-docker-base": {
-      "version": "1.1.0",
+      "version": "1.2.0",
       "dockerfile": "images/warren-docker-base/Dockerfile",
       "context": ".",
       "paths": [
@@ -42,7 +42,7 @@
       ]
     },
     "warren-docker-ssh-base": {
-      "version": "0.1.0",
+      "version": "0.2.0",
       "dockerfile": "images/warren-docker-ssh-base/Dockerfile",
       "context": "images/warren-docker-ssh-base",
       "paths": [
