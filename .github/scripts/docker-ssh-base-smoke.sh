@@ -48,6 +48,14 @@ for want in \
 done
 echo "sshd -T: hardening keywords as expected"
 
+step "sshd -T: a hostile drop-in cannot weaken the hardening"
+hostile="$(docker run --rm --entrypoint sh "$IMG" -c \
+    "mkdir -p /run/sshd /etc/ssh/sshd_config.d && printf 'PasswordAuthentication yes\nPermitRootLogin yes\nAllowAgentForwarding yes\n' > /etc/ssh/sshd_config.d/evil.conf && ssh-keygen -q -t ed25519 -N '' -f /tmp/k && /usr/sbin/sshd -T -f /etc/ssh/sshd_config -h /tmp/k" 2>/dev/null)"
+for want in 'passwordauthentication no' 'permitrootlogin no' 'allowagentforwarding no'; do
+    grep -qxF "$want" <<<"$hostile" || fail "sshd -T with hostile drop-in: expected '$want'"
+done
+echo "sshd -T: hostile drop-in ignored"
+
 step "start a workspace like PodmanRuntime does"
 c=warren-docker-ssh-smoke-$$; names+=("$c")
 docker run -d --name "$c" -p 127.0.0.1::22 -e WARREN_WORKSPACE_ID=ws-smoke -e WARREN_APP='sleep 600' "$IMG" >/dev/null

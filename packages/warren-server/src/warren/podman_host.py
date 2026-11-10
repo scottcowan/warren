@@ -76,7 +76,10 @@ def rootless_uses_pasta(info: dict[str, Any]) -> bool:
         return net_cmd.strip().lower() == "pasta"
     version = _get(_get(info, "version", "Version") or {}, "Version", "version")
     major = _major(version)
-    return major is not None and major >= 5
+    if major is None:
+        # Fail closed: neither the helper nor the version is known, so pasta can't be ruled out.
+        return True
+    return major >= 5
 
 
 def profile_allows_podman_signal(profile: str) -> bool:
@@ -168,6 +171,14 @@ def pasta_refusal_message(info: dict[str, Any]) -> str:
     """Startup error text for rootless pasta without the override."""
     host = _get(info, "host", "Host") or {}
     version = _get(_get(info, "version", "Version") or {}, "Version", "version")
+    if not _get(host, "rootlessNetworkCmd", "RootlessNetworkCmd") and _major(version) is None:
+        return (
+            "Refusing to start: rootless podman did not report its network helper "
+            "(rootlessNetworkCmd) or a parseable version, so warren could not determine the helper; "
+            "if it is pasta, workspace containers can reach host loopback via 169.254.1.2. "
+            f"Fix: set {FIX} (slirp4netns must be installed). "
+            f"Override: set {ALLOW_PASTA_ENV}=1 to start anyway. Docs: {README_URL}"
+        )
     return (
         f"Refusing to start: rootless podman {version or '(unknown version)'} uses pasta for "
         f"networking (rootlessNetworkCmd: {_get(host, 'rootlessNetworkCmd', 'RootlessNetworkCmd') or 'unreported, the podman 5+ default'}), "

@@ -259,3 +259,16 @@ def test_rootless_uses_pasta_pascal_case():
         "Version": {"Version": "5.7.0"},
     }
     assert podman_host.rootless_uses_pasta(info)
+
+
+def test_rootless_unknown_helper_and_version_fails_closed():
+    info = {"host": {"security": {"rootless": True}}}
+    assert podman_host.rootless_uses_pasta(info)
+    assert "could not determine the helper" in podman_host.pasta_refusal_message(info)
+    info["version"] = {"Version": "garbage"}
+    assert podman_host.rootless_uses_pasta(info)
+
+
+def test_rootless_old_podman_without_field_still_passes():
+    info = {"host": {"security": {"rootless": True}}, "version": {"Version": "4.9.3"}}
+    assert not podman_host.rootless_uses_pasta(info)

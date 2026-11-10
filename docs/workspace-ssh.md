@@ -59,7 +59,7 @@ editor ─ ssh ─ ProxyJump <server host> ── server host's 127.0.0.1:<publi
 
 | Path | What |
 |---|---|
-| `/etc/ssh/sshd_config` | the hardened config (root-owned, 0644); `/etc/ssh/sshd_config.d/` is empty and read first, for derived images |
+| `/etc/ssh/sshd_config` | the hardened config (root-owned, 0644); `/etc/ssh/sshd_config.d/` is empty and included LAST, so drop-ins cannot override the hardening |
 | `/usr/local/bin/warren-sshd` | generates the host key, writes `authorized_keys`, runs `sshd -D -e` as uid 1000 with a clean environment |
 | `/usr/local/bin/entrypoint.sh` | small wrapper: after ecs-base's entrypoint has loaded the secrets and dropped to uid 1000, starts `warren-sshd` in the background and hands over |
 | `/usr/local/lib/warren/ecs-entrypoint.sh` | ecs-base's entrypoint, unchanged, moved here |
@@ -134,11 +134,11 @@ own key), build on either image:
 
 ```dockerfile
 FROM ghcr.io/scottcowan/warren-ecs-ssh-base:<version>   # or warren-docker-ssh-base
-RUN printf 'AllowAgentForwarding yes\n' > /etc/ssh/sshd_config.d/agent-forwarding.conf
+RUN sed -i "s/^AllowAgentForwarding no/AllowAgentForwarding yes/" /etc/ssh/sshd_config
 ```
 
-and add `ForwardAgent yes` to your Host block. The drop-in directory is read before the
-main config, and sshd takes the first value it reads.
+and add `ForwardAgent yes` to your Host block. The drop-in directory is included after the
+main config and sshd takes the first value it reads, so drop-ins cannot loosen it; edit the file.
 
 ## Getting your public key in (ECS)
 
