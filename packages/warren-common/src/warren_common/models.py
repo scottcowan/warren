@@ -258,6 +258,9 @@ class PortSpec(BaseModel):
 
     port: int = Field(ge=1, le=65535)
     description: str = ""
+    # "http" ports are mapped with the HTTP gateway (`warren proxy`): Host/Origin
+    # checks and a session cookie. "tcp" (default) is a plain byte relay.
+    protocol: Literal["tcp", "http"] = "tcp"
 
     @model_validator(mode="before")
     @classmethod

@@ -212,13 +212,26 @@ credentials endpoint `169.254.170.2` from the agent. So:
 11. **Images built FROM a bumped base by digest** (`warren-agent-base`,
     `warren-ecs-agent-base`, `warren-docker-ssh-base`, and `warren-ecs-ssh-base` once its dev-base pin is a digest) lag a harness bump until the base is republished and the digest
     updated.
-12. **`warren proxy` listeners have no authentication of their own.** They bind loopback
-    only, and refuse anything else, but any process or other user on the operator's
-    machine that can connect to `127.0.0.1:<port>` reaches that workspace port over the
-    operator's SSM session or SSH forward. On a podman/docker server host, any local
-    process or user can likewise reach a workspace's published template ports on
-    `127.0.0.1`. Whatever the app on that port enforces (for example T3 Code's
-    pairing) is the only remaining check. Don't run the proxy on a shared host.
+12. **`warren proxy` listeners.** Mappings of kind `tcp` (the default) are still a loopback byte
+    relay with no authentication of their own: any process or user on the operator's machine that
+    can connect to `127.0.0.1:<port>` reaches that workspace port over the operator's SSM session
+    or SSH forward, and a DNS-rebinding page can reach a web app on it. On a podman/docker server
+    host, any local process or user can likewise reach a workspace's published template ports on
+    `127.0.0.1`. Whatever the service enforces (for example T3 Code's pairing) is the only check;
+    don't run the proxy on a shared host. Mitigated for `kind: http` mappings (template
+    `protocol: http`): exact loopback `Host` check (DNS rebinding), a one-time start link exchanged
+    for an `HttpOnly`, `SameSite=Strict` session cookie held server-side with an idle expiry (other
+    local processes and pages), same-origin enforcement with no CORS (cross-site requests and
+    WebSockets), strict request parsing (smuggling) and size, time and connection limits. Residual
+    for `http`: a process running as the operator can read the terminal or the browser's cookies;
+    cookies are shared across ports of `127.0.0.1`; no TLS on loopback. `tcp` mappings now also
+    refuse ports held by another process (and `proxy run` fails if a port cannot be bound), write
+    `proxy.json` owner-only without following symlinks, and halt if their workspace id changes.
+    `--unix` mappings listen on a 0600 socket in a 0700 directory instead of a TCP port, with a
+    peer-uid check per connection, so other local users and DNS-rebinding pages cannot reach them;
+    residual: any process running as the operator can still connect (file permissions are the only
+    authentication, so an `http` mapping on a socket issues no start link or cookie), and
+    sockets are not available on Windows.
 13. **`git_write` tokens are live inside the workspace.** Until revoked on stop or
     superseded (at most an hour), the agent can push to and open PRs on every repo the
     token covers, and can send the token anywhere (open egress). Only branch protection

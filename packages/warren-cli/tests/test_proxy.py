@@ -202,11 +202,11 @@ def test_store_skips_ports_in_use_and_honours_an_explicit_one(tmp_path):
     store = proxy.MappingStore(tmp_path / "proxy.json")
     m, _ = store.add("prodecs", "ws1", 1, port_base=47100, port_free=lambda p: p != 47100)
     assert m.local_port == 47101
-    pinned, _ = store.add("prodecs", "ws2", 2, local_port=50000)
+    pinned, _ = store.add("prodecs", "ws2", 2, local_port=50000, port_free=lambda p: True)
     assert pinned.local_port == 50000
     with pytest.raises(proxy.ProxyError, match="already used by prodecs/ws2:2"):
-        store.add("prodecs", "ws3", 3, local_port=50000)
-    moved, _ = store.add("prodecs", "ws1", 1, local_port=50001)
+        store.add("prodecs", "ws3", 3, local_port=50000, port_free=lambda p: True)
+    moved, _ = store.add("prodecs", "ws1", 1, local_port=50001, port_free=lambda p: True)
     assert moved.local_port == 50001 and len(store.load()) == 2
 
 
