@@ -103,6 +103,11 @@ class FakeEC2:
 
     def describe_volumes(self, **kw):
         self.calls.append(("describe_volumes", kw))
+        if "VolumeIds" in kw:
+            vid = kw["VolumeIds"][0]
+            if vid not in self.volumes:
+                raise _ClientError("InvalidVolume.NotFound")
+            return {"Volumes": [dict(self.volumes[vid])]}
         out = []
         for vid, vol in self.volumes.items():
             if self._match(vol, kw.get("Filters", [])):
@@ -766,3 +771,75 @@ async def test_snapshot_store_and_attempt_envelopes_persist(tmp_path):
         assert (await attempts.get(WS))["secrets_blobs"] == '{"workspace":"v1:..."}'
     finally:
         await db.close()
+
+
+def _retag(resource: dict, key: str, value: str) -> None:
+    for tag in resource["Tags"]:
+        if tag["Key"] == key:
+            tag["Value"] = value
+
+
+async def test_delete_volume_re_describes_and_refuses_a_volume_retagged_after_the_listing():
+    ec2 = FakeEC2()
+    vol = ec2.add_volume()
+    rt, _, _ = _runtime(ec2)
+    listed = (await rt.ebs.volumes(WS))[0]  # owned at listing time...
+    _retag(
+        ec2.volumes[vol], "warren.server_instance", "someone-else"
+    )  # ...not by delete time
+    assert await rt.ebs._delete_volume(listed["VolumeId"], WS) is True
+    assert vol in ec2.volumes
+    assert "delete_volume" not in ec2.names()
+
+
+async def test_delete_snapshot_refuses_a_foreign_or_other_workspace_snapshot():
+    ec2 = FakeEC2()
+    foreign = ec2.add_snapshot(server="someone-else")
+    other_ws = ec2.add_snapshot(workspace_id="ws-other-0001")
+    mine = ec2.add_snapshot()
+    rt, _, _ = _runtime(ec2)
+    for sid in (foreign, other_ws):
+        await rt.ebs._delete_snapshot(sid, WS)
+    assert foreign in ec2.snapshots and other_ws in ec2.snapshots
+    await rt.ebs._delete_snapshot(mine, WS)
+    assert mine not in ec2.snapshots
+
+
+async def test_purge_never_deletes_a_recorded_snapshot_that_is_not_ours():
+    ec2 = FakeEC2()
+    foreign = ec2.add_snapshot(server="someone-else")
+    rt, _, _ = _runtime(ec2)
+    await rt.ebs.snapshot_store.put(WS, foreign)
+    await rt.ebs.purge(WS)
+    assert foreign in ec2.snapshots
+
+
+async def test_restore_never_uses_a_recorded_snapshot_that_is_not_ours():
+    ec2 = FakeEC2()
+    foreign = ec2.add_snapshot(server="someone-else")
+    rt, _, _ = _runtime(ec2)
+    await rt.ebs.snapshot_store.put(WS, foreign)
+    with pytest.raises(WorkspaceVolumeLost):
+        await rt.ebs.restore_point(WS)
+
+
+async def test_sweep_does_not_delete_a_volume_retagged_while_waiting_for_the_lock():
+    ec2 = FakeEC2()
+    vol = ec2.add_volume()
+    rt, _, _ = _runtime(ec2)
+
+    class _Lock:
+        async def __aenter__(self):
+            _retag(ec2.volumes[vol], "warren.server_instance", "someone-else")
+
+        async def __aexit__(self, *a):
+            return False
+
+    async def lock_for(_ws):
+        return _Lock()
+
+    async def gone(_ws):
+        return False
+
+    await rt.ebs.sweep(gone, lock_for, min_age_seconds=0)
+    assert vol in ec2.volumes
