@@ -37,6 +37,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from warren.secrets.names import denied_message, is_deliverable
 from warren_common.errors import ProvisionError
 
 BLOB_ENV = "WARREN_SECRETS_BLOB"
@@ -82,6 +83,8 @@ def seal(
     for name in secrets:
         if not _ENV_NAME_RE.fullmatch(name):
             raise ValueError(f"secret name {name!r} is not an environment variable name")
+        if not is_deliverable(name):
+            raise ValueError(denied_message(name))
     plaintext = json.dumps(dict(secrets), sort_keys=True, separators=(",", ":")).encode()
     nonce = nonce if nonce is not None else os.urandom(12)
     ct = AESGCM(data_key).encrypt(nonce, plaintext, aad(workspace_id, container))

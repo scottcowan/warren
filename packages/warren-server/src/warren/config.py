@@ -387,6 +387,26 @@ class WarrenSettings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _check_stable_server_id(self) -> "WarrenSettings":
+        # EBS volumes/snapshots and bare seeds are tagged `warren.server_instance=<server_id>`
+        # and swept by that tag. The hostname default changes on redeploy (orphaning
+        # them) and can collide between servers (they would sweep each other's).
+        uses_tagged = self.ecs_ebs_bare_seeds or (
+            self.runtime_type == "ecs" and (self.ecs_workspace_storage == "ebs" or bool(self.ecs_ebs_infra_role_arn))
+        )
+        if uses_tagged and (
+            "server_id" not in self.model_fields_set
+            or not self.server_id.strip()
+            or self.server_id == socket.gethostname()
+        ):
+            raise ValueError(
+                "EBS workspace storage and bare seeds need a stable, unique WARREN_SERVER_ID "
+                "(not the hostname default): set WARREN_SERVER_ID to a fixed value for this "
+                "deployment and never reuse it for another server"
+            )
+        return self
+
     # Issue #11: `expires_at` existed in the tokens schema and in the query that resolves
     # a token to a user, but nothing ever wrote a value into it, so every minted token was
     # effectively permanent. This is the TTL applied at every token-creation site (bootstrap,
