@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -10,6 +11,7 @@ import re
 import uuid
 import weakref
 from collections.abc import AsyncIterator
+from datetime import datetime
 from typing import Literal, NoReturn
 
 import structlog
@@ -940,9 +942,38 @@ async def _resolve_image(body: ProvisionRequest, request: Request) -> str:
         ) from exc
 
 
+LIST_DEFAULT_LIMIT = 100
+LIST_MAX_LIMIT = 500
+
+
+def _encode_cursor(ws) -> str:
+    raw = f"{ws.created_at.isoformat()}|{ws.workspace_id}".encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> tuple[str, str]:
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)).decode()
+        created_at, _, wid = raw.partition("|")
+        if not created_at or not wid:
+            raise ValueError("malformed")
+        datetime.fromisoformat(created_at)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="invalid cursor") from exc
+    return created_at, wid
+
+
 @router.get("/workspaces", response_model=list[WorkspaceView])
-async def list_workspaces(request: Request) -> list[WorkspaceView]:
-    """Return workspace rows owned by the caller (including stopped and failed).
+async def list_workspaces(
+    request: Request,
+    response: Response,
+    limit: int = Query(default=LIST_DEFAULT_LIMIT, ge=1, le=LIST_MAX_LIMIT),
+    cursor: str | None = Query(default=None, max_length=256),
+) -> list[WorkspaceView]:
+    """Return one page of workspace rows owned by the caller (including stopped and failed).
+
+    Newest first; at most `limit` rows (default 100, max 500). When more remain, the
+    `X-Next-Cursor` response header carries the opaque `cursor` for the next page.
 
     Owner-only, same strict posture as connect/git-pull below (D-11) — no admin
     bypass. `is_admin` today gates only `require_admin`'s separate
@@ -952,8 +983,12 @@ async def list_workspaces(request: Request) -> list[WorkspaceView]:
     deliberate, separately-designed capability, not a quiet exception here.
     """
     user = current_user(request)
-    all_ws = await request.app.state.registry.store.list_all()
-    return [WorkspaceView.from_workspace(ws) for ws in all_ws if ws.owner_id == user.user_id]
+    after = _decode_cursor(cursor) if cursor else None
+    rows = await request.app.state.registry.store.list_for_owner(user.user_id, limit=limit + 1, after=after)
+    page = rows[:limit]
+    if len(rows) > limit:
+        response.headers["X-Next-Cursor"] = _encode_cursor(page[-1])
+    return [WorkspaceView.from_workspace(ws) for ws in page]
 
 
 @router.get("/workspaces/{workspace_id}/status")
@@ -1303,6 +1338,11 @@ async def branch_workspace(workspace_id: str, body: BranchRequest, request: Requ
     )
 
 
+# Per-connection ceilings for the NDJSON event stream (resume with ?since=).
+EVENTS_MAX_SECONDS = 3600.0
+EVENTS_MAX_LINES = 10_000
+
+
 @router.get("/workspaces/{workspace_id}/events")
 async def stream_workspace_events(
     workspace_id: str, request: Request, since: int | None = Query(default=None, ge=-1)
@@ -1335,10 +1375,27 @@ async def stream_workspace_events(
         buf = event_store.get_or_create(workspace_id)
 
     async def _generate():
-        async for line in buf.stream(since=since):
-            yield line + "\n"
-            if await request.is_disconnected():
-                break
+        # Bounded: one connection ends after EVENTS_MAX_SECONDS or EVENTS_MAX_LINES; a
+        # client resumes with ?since=<last seq> (the server never holds a stream open
+        # forever for an idle or abandoned client).
+        deadline = asyncio.get_running_loop().time() + EVENTS_MAX_SECONDS
+        stream = buf.stream(since=since).__aiter__()
+        sent = 0
+        try:
+            while sent < EVENTS_MAX_LINES:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    line = await asyncio.wait_for(stream.__anext__(), remaining)
+                except (StopAsyncIteration, asyncio.TimeoutError, TimeoutError):
+                    break
+                yield line + "\n"
+                sent += 1
+                if await request.is_disconnected():
+                    break
+        finally:
+            await stream.aclose()
 
     return StreamingResponse(_generate(), media_type="application/x-ndjson")
 

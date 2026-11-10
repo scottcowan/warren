@@ -491,6 +491,35 @@ class WorkspaceStore:
             rows = await cur.fetchall()
         return [_row_to_workspace(r) for r in rows]
 
+    async def list_for_owner(
+        self, owner_id: str, *, limit: int, after: tuple[str, str] | None = None
+    ) -> list[Workspace]:
+        """One page of an owner's rows, newest first (created_at DESC, workspace_id DESC).
+
+        `after` is the (created_at, workspace_id) sort key of the last row of the previous
+        page. Returns at most `limit` rows; the caller asks for limit + 1 to learn whether
+        there is a next page.
+        """
+        where = "owner_id = ?"
+        params: list = [owner_id]
+        if after is not None:
+            where += " AND (created_at < ? OR (created_at = ? AND workspace_id < ?))"
+            params += [after[0], after[0], after[1]]
+        params.append(limit)
+        async with self._db.execute(
+            f"""
+            SELECT workspace_id, project, intent, image, root_path,
+                   container_id, status, server_instance, labels_json,
+                   created_at, updated_at, ssh_port, owner_id, idle_ttl_seconds,
+                   spec_json, host_ports_json
+            FROM workspaces WHERE {where}
+            ORDER BY created_at DESC, workspace_id DESC LIMIT ?
+            """,  # noqa: S608 -- `where` is built from fixed fragments; values are bound
+            params,
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_workspace(r) for r in rows]
+
 
 class LaunchAttemptStore:
     """AI3: persisted ECS launch identity per workspace (ecs_launch_attempts)."""

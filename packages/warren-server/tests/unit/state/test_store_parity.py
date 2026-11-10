@@ -308,3 +308,23 @@ async def test_host_ports_roundtrip(workspace_store):
     assert (await workspace_store.get("ws-hp")).host_ports_json is None
     await workspace_store.update_host_ports("missing", ports)  # no-op, as the SQLite UPDATE
     assert await workspace_store.get("missing") is None
+
+
+async def test_list_for_owner_pages_newest_first_across_statuses(workspace_store):
+    statuses = ["running", "stopped", "failed", "provisioning", "running", "stopped", "running"]
+    for i, st in enumerate(statuses):
+        await workspace_store.insert(**_ws(f"mine-{i}", owner="u1", status=st))
+        await workspace_store.insert(**_ws(f"theirs-{i}", owner="u2", status=st))
+        await asyncio.sleep(0.005)
+    seen: list[str] = []
+    after = None
+    while True:
+        page = await workspace_store.list_for_owner("u1", limit=3, after=after)
+        assert len(page) <= 3
+        seen += [w.workspace_id for w in page]
+        if len(page) < 3:
+            break
+        last = page[-1]
+        after = (last.created_at.isoformat() if hasattr(last.created_at, "isoformat") else last.created_at, last.workspace_id)
+    assert seen == [f"mine-{i}" for i in reversed(range(7))]
+    assert await workspace_store.list_for_owner("nobody", limit=5) == []

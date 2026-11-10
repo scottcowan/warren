@@ -282,7 +282,7 @@ def test_provision_capacity_exhausted(env_defaults, auth_headers):
 
 def test_list_all_workspaces(env_defaults, auth_headers):
     fake_registry = _make_fake_registry()
-    fake_registry.store.list_all = AsyncMock(return_value=[])
+    fake_registry.store.list_for_owner = AsyncMock(return_value=[])
     with _lifespan_patches(fake_registry):
         with TestClient(app, headers=auth_headers) as client:
             app.state.registry = fake_registry
@@ -371,7 +371,7 @@ def test_list_workspaces_filters_to_owner(env_defaults, auth_headers):
             mine = mine.model_copy(update={"workspace_id": "mine"})
             theirs = _fake_workspace(owner_id="some-other-user-id")
             theirs = theirs.model_copy(update={"workspace_id": "theirs"})
-            fake_registry.store.list_all = AsyncMock(return_value=[mine, theirs])
+            fake_registry.store.list_for_owner = AsyncMock(return_value=[mine])
             resp = client.get("/workspaces")
     assert resp.status_code == 200
     ids = [w["workspace_id"] for w in resp.json()]
@@ -760,7 +760,7 @@ def test_provision_persists_named_ports_and_get_workspaces_returns_them(env_defa
             app.state.registry = owner_registry
             ws = _fake_workspace(status="running", owner_id=_bootstrap_user_id(client))
             ws.spec_json = spec_json
-            owner_registry.store.list_all = AsyncMock(return_value=[ws])
+            owner_registry.store.list_for_owner = AsyncMock(return_value=[ws])
             listed = client.get("/workspaces")
     assert listed.status_code == 200
     row = listed.json()[0]
@@ -1378,7 +1378,7 @@ def test_list_workspaces_returns_only_app_from_spec_json(env_defaults, auth_head
             mine = _fake_workspace(owner_id=_bootstrap_user_id(client)).model_copy(
                 update={"spec_json": _SENSITIVE_SPEC_JSON, "root_path": "/w/root"}
             )
-            fake_registry.store.list_all = AsyncMock(return_value=[mine])
+            fake_registry.store.list_for_owner = AsyncMock(return_value=[mine])
             resp = client.get("/workspaces")
     assert resp.status_code == 200
     [body] = resp.json()
@@ -1444,9 +1444,49 @@ def test_get_workspaces_returns_host_ports_next_to_ports(env_defaults, auth_head
             ws.host_ports_json = json.dumps(
                 {"t3": {"host": "127.0.0.1", "port": 41001}, "other": {"host": "127.0.0.1", "port": 41009}}
             )
-            owner_registry.store.list_all = AsyncMock(return_value=[ws])
+            owner_registry.store.list_for_owner = AsyncMock(return_value=[ws])
             listed = client.get("/workspaces")
     assert listed.status_code == 200
     row = listed.json()[0]
     assert row["ports"] == _DECLARED_PORTS
     assert row["host_ports"] == {"t3": {"host": "127.0.0.1", "port": 41001}}
+
+
+def test_list_workspaces_pages_with_next_cursor_header(env_defaults, auth_headers):
+    rows = [
+        _fake_workspace(owner_id="u").model_copy(update={"workspace_id": f"ws-{i}"}) for i in range(5)
+    ]
+    calls: list[dict] = []
+
+    async def fake_list_for_owner(owner_id, *, limit, after=None):
+        calls.append({"limit": limit, "after": after})
+        start = 0 if after is None else next(i for i, r in enumerate(rows) if r.workspace_id == after[1]) + 1
+        return rows[start : start + limit]
+
+    fake_registry = _make_fake_registry()
+    fake_registry.store.list_for_owner = fake_list_for_owner
+    with _lifespan_patches(fake_registry):
+        with TestClient(app, headers=auth_headers) as client:
+            app.state.registry = fake_registry
+            first = client.get("/workspaces", params={"limit": 2})
+            cursor = first.headers["X-Next-Cursor"]
+            second = client.get("/workspaces", params={"limit": 2, "cursor": cursor})
+            last = client.get("/workspaces", params={"limit": 2, "cursor": second.headers["X-Next-Cursor"]})
+            default = client.get("/workspaces")
+    assert [w["workspace_id"] for w in first.json()] == ["ws-0", "ws-1"]
+    assert [w["workspace_id"] for w in second.json()] == ["ws-2", "ws-3"]
+    assert [w["workspace_id"] for w in last.json()] == ["ws-4"] and "X-Next-Cursor" not in last.headers
+    assert "X-Next-Cursor" not in default.headers and len(default.json()) == 5
+    assert calls[0]["limit"] == 3 and calls[-1]["limit"] == 101  # asks for one extra to detect more
+
+
+def test_list_workspaces_rejects_bad_limit_and_cursor(env_defaults, auth_headers):
+    fake_registry = _make_fake_registry()
+    fake_registry.store.list_for_owner = AsyncMock(return_value=[])
+    with _lifespan_patches(fake_registry):
+        with TestClient(app, headers=auth_headers) as client:
+            app.state.registry = fake_registry
+            assert client.get("/workspaces", params={"limit": 501}).status_code == 422
+            assert client.get("/workspaces", params={"limit": 0}).status_code == 422
+            assert client.get("/workspaces", params={"cursor": "!!!"}).status_code == 400
+    fake_registry.store.list_for_owner.assert_not_called()
