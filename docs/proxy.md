@@ -162,6 +162,45 @@ cookie. TLS is not used on loopback. The upstream app's own authorization still 
 upstream, replacing any same-named client header. The default adds none. Injecting the operator's
 identity for the control plane is intentionally not implemented yet.
 
+### Unix sockets
+
+`--unix` serves a mapping on a Unix socket instead of a loopback TCP port. No local port is
+allocated, so nothing else on the machine can connect to a TCP port that happens to be open.
+
+```bash
+warren proxy add <workspace> 8080 --unix --kind http          # ~/.warren/run/<server>-<workspace>-<name>.sock
+warren proxy add <workspace> t3 --unix --socket /run/user/1000/t3.sock
+warren proxy add <workspace> --from-template --unix           # default path for each port
+```
+
+The socket is created 0600 in a 0700 directory owned by you (`~/.warren/run` by default; a custom
+`--socket` must be an absolute path), is never bound through a symlink or over a file that is not a
+stale socket of yours, and the proxy also checks each connection's peer uid against yours (macOS
+and Linux). `warren proxy rm` removes the socket if it is a socket you own and leaves anything
+else alone. File permissions are the authentication, so an `http` mapping on a socket has no start
+link, session cookie, Host check or Origin check (a socket is not reachable from a web page); strict request parsing and the size, time and connection limits still apply.
+`warren proxy list` shows `unix:<path>`.
+
+```bash
+curl --unix-socket ~/.warren/run/prod-ws1-code.sock http://localhost/
+```
+
+```python
+import httpx
+client = httpx.Client(transport=httpx.HTTPTransport(uds="/home/me/.warren/run/prod-ws1-code.sock"))
+client.get("http://localhost/")
+```
+
+```
+# ~/.ssh/config: ssh over the socket of a mapping to the workspace's sshd (port 2222)
+Host ws1
+    ProxyCommand nc -U /home/me/.warren/run/prod-ws1-ssh.sock
+```
+
+Browsers cannot connect to a Unix socket, so use a TCP `http` mapping for a web UI. The T3 Code
+desktop app likewise needs a TCP address; keep T3 on a TCP mapping. Unix sockets are not
+supported on Windows: `--unix` fails there with a clear error.
+
 ### Settings
 
 `[proxy]` in `~/.warren/config.toml`; the `run` flags override these values.

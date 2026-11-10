@@ -226,6 +226,11 @@ credentials endpoint `169.254.170.2` from the agent. So:
     cookies are shared across ports of `127.0.0.1`; no TLS on loopback. `tcp` mappings now also
     refuse ports held by another process (and `proxy run` fails if a port cannot be bound), write
     `proxy.json` owner-only without following symlinks, and halt if their workspace id changes.
+    `--unix` mappings listen on a 0600 socket in a 0700 directory instead of a TCP port, with a
+    peer-uid check per connection, so other local users and DNS-rebinding pages cannot reach them;
+    residual: any process running as the operator can still connect (file permissions are the only
+    authentication, so an `http` mapping on a socket issues no start link or cookie), and
+    sockets are not available on Windows.
 13. **`git_write` tokens are live inside the workspace.** Until revoked on stop or
     superseded (at most an hour), the agent can push to and open PRs on every repo the
     token covers, and can send the token anywhere (open egress). Only branch protection
