@@ -33,7 +33,7 @@ def template_env_for(
     return {
         k: v
         for k, v in (template_env or {}).items()
-        if _ENV_NAME_RE.match(k) and not is_reserved_env_name(k) and k not in excluded
+        if _ENV_NAME_RE.fullmatch(k) and not is_reserved_env_name(k) and k not in excluded
     }
 
 
@@ -276,7 +276,7 @@ def check_ports(ports: dict[str, PortSpec]) -> dict[str, PortSpec]:
     """Port names are `[a-z0-9-]+`; no two names share a port number."""
     seen: dict[int, str] = {}
     for name, spec in ports.items():
-        if not isinstance(name, str) or not _PORT_NAME_RE.match(name):
+        if not isinstance(name, str) or not _PORT_NAME_RE.fullmatch(name):
             raise ValueError(f"port name {name!r} must match [a-z0-9-]+")
         if spec.port in seen:
             raise ValueError(f"ports {seen[spec.port]!r} and {name!r} both declare port {spec.port}")
@@ -404,7 +404,7 @@ class ProjectConfig(BaseModel):
     @classmethod
     def _env_names_valid(cls, v: dict[str, str]) -> dict[str, str]:
         for name in v:
-            if not _ENV_NAME_RE.match(name):
+            if not _ENV_NAME_RE.fullmatch(name):
                 raise ValueError(f"env name {name!r} is not a valid environment variable name")
             if is_reserved_env_name(name):
                 raise ValueError(f"env name {name!r} is reserved by warren")

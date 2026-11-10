@@ -86,7 +86,7 @@ async def get_project(name: str, request: Request) -> dict:
     lock on PUT and for the CLI's promote/diff flow), plus the effective
     merge. 404 if neither half exists.
     """
-    if not _SAFE_NAME_RE.match(name):
+    if not _SAFE_NAME_RE.fullmatch(name):
         raise HTTPException(status_code=400, detail="invalid project name: must match ^[a-z0-9_-]+$")
 
     user = current_user(request)
@@ -219,7 +219,7 @@ async def put_project(
     protection). Returns 204 on success. Returns 422 if the written YAML
     fails ProjectLoader validation.
     """
-    if not _SAFE_NAME_RE.match(name):
+    if not _SAFE_NAME_RE.fullmatch(name):
         raise HTTPException(status_code=400, detail="invalid project name: must match ^[a-z0-9_-]+$")
 
     user = current_user(request)
@@ -263,7 +263,7 @@ async def delete_project(name: str, request: Request) -> Response:
     this name — including when only a server-wide one exists, which this
     endpoint can never see or touch. Returns 204 on success.
     """
-    if not _SAFE_NAME_RE.match(name):
+    if not _SAFE_NAME_RE.fullmatch(name):
         raise HTTPException(status_code=400, detail="invalid project name: must match ^[a-z0-9_-]+$")
 
     user = current_user(request)

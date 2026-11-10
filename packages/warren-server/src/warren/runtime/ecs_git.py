@@ -103,12 +103,12 @@ def workspace_branch(workspace_id: str, intent: str, mount: str) -> str:
 
 
 def _validate_mount(mount: str) -> None:
-    if not _SAFE_MOUNT.match(mount) or any(p in (".", "..") for p in mount.split("/")):
+    if not _SAFE_MOUNT.fullmatch(mount) or any(p in (".", "..") for p in mount.split("/")):
         raise GitError(f"unsafe folder mount: {mount!r}")
 
 
 def _validate_ref(ref: str) -> None:
-    if not _SAFE_REF.match(ref) or ".." in ref or ref.endswith((".lock", "/", ".")):
+    if not _SAFE_REF.fullmatch(ref) or ".." in ref or ref.endswith((".lock", "/", ".")):
         raise GitError(f"unsafe git ref: {ref!r}")
 
 

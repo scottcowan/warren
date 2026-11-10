@@ -72,7 +72,7 @@ _DEAD_STATES = frozenset({"deleting", "deleted", "error"})
 
 def _validate_workspace_id(workspace_id: str) -> None:
     """Raise ProvisionError if workspace_id fails the allow-regex (T-09-02)."""
-    if not _WORKSPACE_ID_RE.match(workspace_id):
+    if not _WORKSPACE_ID_RE.fullmatch(workspace_id):
         raise ProvisionError(
             f"workspace_id {workspace_id!r} is invalid — must match "
             r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$"
@@ -91,7 +91,7 @@ def purge_workspace_directory(local_mount_path: str, workspace_id: str) -> None:
     into deleting outside workspaces/<id>. Shared by EFSMount.delete() and the
     reaper (AD2).
     """
-    if not _WORKSPACE_ID_RE.match(workspace_id):
+    if not _WORKSPACE_ID_RE.fullmatch(workspace_id):
         log.warning("efs_purge_bad_workspace_id", workspace_id=workspace_id)
         return
     target = Path(local_mount_path) / "workspaces" / workspace_id

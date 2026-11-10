@@ -103,10 +103,10 @@ def derive_owner_id(arn: str, trusted_assumed_role_patterns: list[str] | None = 
     parameter names (which allow only letters, numbers, `.`, `-`, `_`, `/`),
     unlike a raw ARN which contains `:`.
     """
-    if _IAM_USER_ARN_RE.match(arn):
+    if _IAM_USER_ARN_RE.fullmatch(arn):
         return hashlib.sha256(arn.encode()).hexdigest()[:32]
 
-    if _ASSUMED_ROLE_ARN_RE.match(arn):
+    if _ASSUMED_ROLE_ARN_RE.fullmatch(arn):
         for pattern in trusted_assumed_role_patterns or []:
             if re.fullmatch(pattern, arn):
                 return hashlib.sha256(arn.encode()).hexdigest()[:32]
@@ -132,7 +132,7 @@ def _validate_sts_url(url: str) -> None:
     parsed = urlparse(url)
     if parsed.scheme != "https":
         raise AwsIdentityError("signed request URL must use https")
-    if not parsed.hostname or not _STS_HOST_RE.match(parsed.hostname):
+    if not parsed.hostname or not _STS_HOST_RE.fullmatch(parsed.hostname):
         raise AwsIdentityError(f"signed request URL host is not an AWS STS endpoint: {parsed.hostname!r}")
 
 
@@ -191,7 +191,7 @@ def _validate_action_is_get_caller_identity(body: str) -> None:
 
 
 def _validate_freshness(amz_date: str) -> None:
-    if not _AMZ_DATE_RE.match(amz_date):
+    if not _AMZ_DATE_RE.fullmatch(amz_date):
         raise AwsIdentityError(f"signed request has a malformed X-Amz-Date: {amz_date!r}")
     signed_at = datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
     now = datetime.now(timezone.utc)

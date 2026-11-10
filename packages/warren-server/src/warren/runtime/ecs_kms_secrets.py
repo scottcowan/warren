@@ -59,11 +59,11 @@ def aad(workspace_id: str, container: str) -> bytes:
 
 
 def _check(workspace_id: str, container: str, region: str) -> None:
-    if not _WORKSPACE_ID_RE.match(workspace_id):
+    if not _WORKSPACE_ID_RE.fullmatch(workspace_id):
         raise ProvisionError(f"invalid workspace id {workspace_id!r}")
     if container not in CONTAINERS:
         raise ProvisionError(f"unknown secrets container {container!r}")
-    if not _REGION_RE.match(region):
+    if not _REGION_RE.fullmatch(region):
         raise ProvisionError(f"invalid AWS region {region!r} for secrets delivery")
 
 
@@ -80,7 +80,7 @@ def seal(
     """Encrypt `secrets` under `data_key` into the envelope string. Pure; no AWS."""
     _check(workspace_id, container, region)
     for name in secrets:
-        if not _ENV_NAME_RE.match(name):
+        if not _ENV_NAME_RE.fullmatch(name):
             raise ValueError(f"secret name {name!r} is not an environment variable name")
     plaintext = json.dumps(dict(secrets), sort_keys=True, separators=(",", ":")).encode()
     nonce = nonce if nonce is not None else os.urandom(12)

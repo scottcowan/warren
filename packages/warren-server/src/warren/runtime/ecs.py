@@ -446,7 +446,7 @@ class ECSRuntime:
         role = getattr(self._settings, "ecs_ebs_infra_role_arn", "") or ""
         if not role:
             return "set WARREN_ECS_EBS_INFRA_ROLE_ARN (the ECS infrastructure role for volumes)"
-        if not _ROLE_ARN_RE.match(role):
+        if not _ROLE_ARN_RE.fullmatch(role):
             return f"WARREN_ECS_EBS_INFRA_ROLE_ARN {role!r} is not an IAM role ARN"
         if not getattr(self._settings, "ecs_secrets_kms_key_id", ""):
             return "set WARREN_ECS_SECRETS_KMS_KEY_ID (secrets are delivered as KMS ciphertext)"

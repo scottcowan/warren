@@ -46,9 +46,9 @@ def run_result_env(folders: Iterable[Any], hold_seconds: int = DEFAULT_HOLD_SECO
         if getattr(f, "type", "") not in ("git-worktree", "git-clone") or not getattr(f, "url", None):
             continue
         mount, branch = f.mount, f.branch or ""
-        if not _SAFE.match(mount) or ".." in mount.split("/"):
+        if not _SAFE.fullmatch(mount) or ".." in mount.split("/"):
             continue
-        repos.append(f"{mount}={branch}" if branch and _SAFE.match(branch) else mount)
+        repos.append(f"{mount}={branch}" if branch and _SAFE.fullmatch(branch) else mount)
     return {
         "WARREN_RUN_RESULT": "1",
         "WARREN_RUN_RESULT_HOLD_SECONDS": str(max(0, int(hold_seconds))),

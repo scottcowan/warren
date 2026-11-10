@@ -47,6 +47,7 @@ def build_notifier(settings: Any, secrets: Any) -> Notifier:
         max_retries=settings.notify_max_retries,
         timeout_seconds=settings.notify_timeout_seconds,
         dedupe_seconds=settings.notify_dedupe_seconds,
+        allowed_ports=settings.notify_allowed_ports_set,
     )
 
 

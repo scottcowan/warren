@@ -55,7 +55,7 @@ def parse_podman_userns(value: str) -> dict[str, str] | None:
         )
     if not sep:
         return {"nsmode": mode}
-    if not _OPTIONS.match(options):
+    if not _OPTIONS.fullmatch(options):
         raise ValueError(f"malformed podman userns options in {value!r}")
     return {"nsmode": mode, "value": options}
 

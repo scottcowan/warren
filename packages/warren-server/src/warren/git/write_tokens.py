@@ -93,16 +93,16 @@ def encode_tokens(tokens: Mapping[str, str]) -> str:
     """The `WARREN_GIT_TOKENS` payload: one `<owner> <token>` line per owner."""
     lines = []
     for owner, token in sorted(tokens.items()):
-        if not _OWNER_RE.match(owner):
+        if not _OWNER_RE.fullmatch(owner):
             raise GitWriteError(f"invalid github owner {owner!r}")
-        if not _TOKEN_RE.match(token):
+        if not _TOKEN_RE.fullmatch(token):
             raise GitWriteError(f"token for {owner} has an unexpected shape")
         lines.append(f"{owner} {token}")
     return "\n".join(lines) + "\n"
 
 
 def grants_for(folders: Iterable[Any]) -> dict[str, GitHubGrant]:
-    return {o: g for o, g in git_write_grants(folders).items() if _OWNER_RE.match(o)}
+    return {o: g for o, g in git_write_grants(folders).items() if _OWNER_RE.fullmatch(o)}
 
 
 def runtime_problem(runtime: Any) -> str:
