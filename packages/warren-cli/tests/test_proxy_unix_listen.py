@@ -155,7 +155,10 @@ async def test_connections_from_another_uid_are_dropped(kind, sock_path, monkeyp
             await w.drain()
         except ConnectionError:
             pass
-        assert await asyncio.wait_for(r.read(), 5) == b""
+        try:
+            assert await asyncio.wait_for(r.read(), 5) == b""
+        except ConnectionResetError:
+            pass  # Linux may report the server's close as a reset
         assert up.connections == 0 and mp.active == 0
         w.close()
     finally:

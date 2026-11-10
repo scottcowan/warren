@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import json
 
-from warren_cli import proxy
+import pytest
+
+from warren_cli import proxy, proxy_unix
+
+needs_unix = pytest.mark.skipif(not proxy_unix.supported(), reason="unix sockets unsupported")
 
 
 def test_mapping_defaults_to_tcp_and_omits_listen_fields_when_saved(tmp_path):
@@ -51,16 +55,18 @@ def test_renaming_keeps_listen_fields(tmp_path):
     assert not created and (m.listen, m.socket_path, m.name) == ("unix", "/tmp/x.sock", "web")
 
 
+@needs_unix
 def test_add_unix_allocates_no_local_port_and_keeps_tcp_ports_free(tmp_path):
     store = proxy.MappingStore(tmp_path / "proxy.json")
     u, created = store.add("srv", "ws1", 3773, listen="unix", port_free=lambda p: False)
     assert created and (u.listen, u.local_port, u.socket_path) == ("unix", 0, None)
-    t, _ = store.add("srv", "ws1", 2222)
+    t, _ = store.add("srv", "ws1", 2222, port_free=lambda p: True)
     assert t.local_port == 47100 and t.listen == "tcp"
     again, created = store.add("srv", "ws1", 3773, listen="unix")
     assert not created and again == u
 
 
+@needs_unix
 def test_add_unix_validates(tmp_path):
     import pytest
 
@@ -78,14 +84,16 @@ def test_add_unix_validates(tmp_path):
         store.add("srv", "ws1", 2, listen="unix", socket_path="/tmp/a.sock")
 
 
+@needs_unix
 def test_remove_by_port_skips_unix_and_unix_can_become_tcp(tmp_path):
     store = proxy.MappingStore(tmp_path / "proxy.json")
     store.add("srv", "ws1", 3773, listen="unix")
     assert store.remove("0") == []
-    m, created = store.add("srv", "ws1", 3773, listen="tcp")
+    m, created = store.add("srv", "ws1", 3773, listen="tcp", port_free=lambda p: True)
     assert not created and m.listen == "tcp" and m.local_port == 47100 and m.socket_path is None
 
 
+@needs_unix
 def test_unlink_owned_socket_only_removes_our_sockets(tmp_path):
     import socket
 
@@ -109,6 +117,7 @@ def test_unlink_owned_socket_only_removes_our_sockets(tmp_path):
     assert proxy_unix.unlink_owned_socket(str(d / "missing")) is False
 
 
+@needs_unix
 def test_cli_add_unix_prints_socket_path_and_curl_example(tmp_path):
     import json as _json
 
@@ -148,6 +157,7 @@ def test_cli_add_unix_refused_on_windows(tmp_path, monkeypatch):
     assert r.exit_code == 2 and "not supported" in r.output
 
 
+@needs_unix
 def test_cli_rm_unlinks_only_a_real_socket(tmp_path):
     import socket
     import tempfile

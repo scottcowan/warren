@@ -596,8 +596,8 @@ async def test_daemon_records_bind_failures_and_announces_http_links(tmp_path):
 
     store = proxy.MappingStore(tmp_path / "proxy.json")
     free = {"port_free": lambda p: True}
-    a, _ = store.add("s", "ws1", 1, kind="http", **free)
-    b, _ = store.add("s", "ws2", 2, **free)
+    a, _ = store.add("s", "ws1", 1, kind="http", local_port=dispatch._free_local_port(), **free)
+    b, _ = store.add("s", "ws2", 2, local_port=dispatch._free_local_port(), **free)
     with socket.socket() as squat:
         squat.bind(("127.0.0.1", b.local_port))
         squat.listen()
