@@ -191,3 +191,37 @@ async def test_events_route_since_replays_from_real_buffer(env_defaults, auth_he
     lines = response.text.splitlines()
     assert '"events_evicted"' in lines[0]
     assert lines[1:] == [f'{{"i":{i}}}' for i in range(200, 1200)]
+
+
+class _EndlessBuffer:
+    """Yields lines forever without pause."""
+
+    async def stream(self, **kwargs):
+        i = 0
+        while True:
+            yield f'{{"n":{i}}}'
+            i += 1
+
+
+class _SilentBuffer:
+    """Yields one line, then waits forever (an idle workspace)."""
+
+    async def stream(self, **kwargs):
+        yield '{"n":0}'
+        import asyncio
+
+        await asyncio.Event().wait()
+
+
+def test_events_stream_ends_after_max_lines(env_defaults, auth_headers, monkeypatch):
+    monkeypatch.setattr("warren.routes.workspaces.EVENTS_MAX_LINES", 5)
+    response = _get_events(auth_headers, _store_for(_EndlessBuffer()))
+    assert response.status_code == 200
+    assert len(response.text.splitlines()) == 5
+
+
+def test_events_stream_ends_after_max_seconds(env_defaults, auth_headers, monkeypatch):
+    monkeypatch.setattr("warren.routes.workspaces.EVENTS_MAX_SECONDS", 0.3)
+    response = _get_events(auth_headers, _store_for(_SilentBuffer()))
+    assert response.status_code == 200
+    assert response.text.splitlines() == ['{"n":0}']

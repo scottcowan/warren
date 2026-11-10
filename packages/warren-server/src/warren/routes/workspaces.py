@@ -1297,6 +1297,11 @@ async def branch_workspace(workspace_id: str, body: BranchRequest, request: Requ
     )
 
 
+# Per-connection ceilings for the NDJSON event stream (resume with ?since=).
+EVENTS_MAX_SECONDS = 3600.0
+EVENTS_MAX_LINES = 10_000
+
+
 @router.get("/workspaces/{workspace_id}/events")
 async def stream_workspace_events(
     workspace_id: str, request: Request, since: int | None = Query(default=None, ge=-1)
@@ -1329,10 +1334,27 @@ async def stream_workspace_events(
         buf = event_store.get_or_create(workspace_id)
 
     async def _generate():
-        async for line in buf.stream(since=since):
-            yield line + "\n"
-            if await request.is_disconnected():
-                break
+        # Bounded: one connection ends after EVENTS_MAX_SECONDS or EVENTS_MAX_LINES; a
+        # client resumes with ?since=<last seq> (the server never holds a stream open
+        # forever for an idle or abandoned client).
+        deadline = asyncio.get_running_loop().time() + EVENTS_MAX_SECONDS
+        stream = buf.stream(since=since).__aiter__()
+        sent = 0
+        try:
+            while sent < EVENTS_MAX_LINES:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    line = await asyncio.wait_for(stream.__anext__(), remaining)
+                except (StopAsyncIteration, asyncio.TimeoutError, TimeoutError):
+                    break
+                yield line + "\n"
+                sent += 1
+                if await request.is_disconnected():
+                    break
+        finally:
+            await stream.aclose()
 
     return StreamingResponse(_generate(), media_type="application/x-ndjson")
 
