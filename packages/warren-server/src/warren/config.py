@@ -430,6 +430,21 @@ class WarrenSettings(BaseSettings):
     notify_timeout_seconds: float = Field(default=5.0, gt=0)
     notify_max_retries: int = Field(default=3, ge=0, le=10)
     notify_queue_size: int = Field(default=100, ge=1, le=10_000)
+    # Ports an owner-registered webhook URL may use (comma-separated). The operator's
+    # server-wide URL is trusted and not restricted. Default: 443 only.
+    notify_allowed_ports: str = "443"
+
+    @field_validator("notify_allowed_ports")
+    @classmethod
+    def _validate_notify_allowed_ports(cls, v: str) -> str:
+        items = [i.strip() for i in v.split(",") if i.strip()]
+        if not items or not all(i.isascii() and i.isdigit() and 1 <= int(i) <= 65535 for i in items):
+            raise ValueError("WARREN_NOTIFY_ALLOWED_PORTS must be comma-separated ports (1-65535)")
+        return ",".join(items)
+
+    @property
+    def notify_allowed_ports_set(self) -> frozenset[int]:
+        return frozenset(int(i) for i in self.notify_allowed_ports.split(",") if i.strip())
 
     @field_validator("notify_webhook_url")
     @classmethod

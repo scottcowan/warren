@@ -65,7 +65,7 @@ def _validate_secret_write(name: str, value: str) -> None:
             status_code=400,
             detail={"error": "reserved_secret_name", "detail": f"names starting {RESERVED_PREFIX!r} are reserved"},
         )
-    if not _SAFE_NAME_RE.match(name):
+    if not _SAFE_NAME_RE.fullmatch(name):
         raise HTTPException(
             status_code=400,
             detail={

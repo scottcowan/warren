@@ -52,7 +52,7 @@ _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEX
 
 
 def is_env_name(name: str) -> bool:
-    return bool(_ENV_NAME.match(name))
+    return bool(_ENV_NAME.fullmatch(name))
 
 
 def encode(secrets: Mapping[str, str]) -> bytes:
@@ -89,7 +89,7 @@ def _open_dir(name: str, dir_fd: int | None, *, create: bool, mode: int) -> int:
 
 @contextlib.contextmanager
 def _workspace_dir(local_mount: str, workspace_id: str, *, create: bool) -> Iterator[int]:
-    if not _WORKSPACE_ID.match(workspace_id):
+    if not _WORKSPACE_ID.fullmatch(workspace_id):
         raise ProvisionError(f"invalid workspace id {workspace_id!r}")
     fds: list[int] = []
     try:

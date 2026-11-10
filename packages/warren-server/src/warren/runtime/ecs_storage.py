@@ -46,7 +46,7 @@ class OwnerStorage(BaseModel):
     @field_validator("efs_id")
     @classmethod
     def _efs_id(cls, v: str) -> str:
-        if not _EFS_ID_RE.match(v):
+        if not _EFS_ID_RE.fullmatch(v):
             raise ValueError(f"efs_id {v!r} is not an EFS filesystem id (fs-...)")
         return v
 
@@ -56,7 +56,7 @@ class OwnerStorage(BaseModel):
         if not v:
             raise ValueError("security_group_ids must not be empty")
         for sg in v:
-            if not _SG_ID_RE.match(sg):
+            if not _SG_ID_RE.fullmatch(sg):
                 raise ValueError(f"security group id {sg!r} is not sg-...")
         if len(set(v)) != len(v):
             raise ValueError("security_group_ids has duplicates")
@@ -80,7 +80,7 @@ def parse_owner_storage(value: Any) -> dict[str, OwnerStorage]:
         raise ValueError("WARREN_ECS_OWNER_STORAGE must be a JSON object of user -> storage")
     out: dict[str, OwnerStorage] = {}
     for key, entry in value.items():
-        if not isinstance(key, str) or not KEY_RE.match(key):
+        if not isinstance(key, str) or not KEY_RE.fullmatch(key):
             raise ValueError(f"WARREN_ECS_OWNER_STORAGE key {key!r} is not an AWS principal name")
         out[key] = entry if isinstance(entry, OwnerStorage) else OwnerStorage.model_validate(entry)
     for field, label in (("efs_id", "filesystem"), ("local_mount_path", "mount path")):

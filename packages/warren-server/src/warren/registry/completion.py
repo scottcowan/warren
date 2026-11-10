@@ -43,11 +43,11 @@ class RepoTarget:
 
 
 def _safe_component(name: str) -> bool:
-    return bool(_SAFE_COMPONENT.match(name)) and name not in (".", "..")
+    return bool(_SAFE_COMPONENT.fullmatch(name)) and name not in (".", "..")
 
 
 def _safe_mount(mount: str) -> bool:
-    return bool(_SAFE_MOUNT.match(mount)) and all(p not in (".", "..") for p in mount.split("/"))
+    return bool(_SAFE_MOUNT.fullmatch(mount)) and all(p not in (".", "..") for p in mount.split("/"))
 
 
 def read_nofollow(base: Path, parts: Sequence[str], max_bytes: int) -> bytes | None:

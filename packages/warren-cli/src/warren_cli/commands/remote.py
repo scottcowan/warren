@@ -83,7 +83,7 @@ def remote_add(
     `ssh -L` first), or --ecs-cluster/--ecs-service/--aws-audience for a server only
     reachable via an SSM port-forward into its own ECS task.
     """
-    if not _NAME_RE.match(name):
+    if not _NAME_RE.fullmatch(name):
         ui.error(f"Invalid remote name {name!r}: must match ^[a-z0-9_-]+$")
         raise typer.Exit(1)
     if ecs_cluster or ecs_service:

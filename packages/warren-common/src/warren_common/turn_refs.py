@@ -70,7 +70,7 @@ class Snapshot:
 
 
 def validate_prefix(prefix: str) -> str:
-    if not _REF_RE.match(prefix) or ".." in prefix or "//" in prefix:
+    if not _REF_RE.fullmatch(prefix) or ".." in prefix or "//" in prefix:
         raise TurnRefError(f"invalid ref prefix: {prefix!r}")
     return prefix
 

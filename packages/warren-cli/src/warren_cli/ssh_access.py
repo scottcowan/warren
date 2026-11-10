@@ -59,7 +59,7 @@ class SshAccessError(Exception):
 
 
 def check_name(kind: str, value: str) -> str:
-    if not _NAME_RE.match(value or ""):
+    if not _NAME_RE.fullmatch(value or ""):
         raise SshAccessError(f"{kind} {value!r} must match {_NAME_RE.pattern}")
     return value
 
@@ -169,7 +169,7 @@ _LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1"}
 
 
 def check_jump(value: str) -> str:
-    if not _JUMP_RE.match(value or ""):
+    if not _JUMP_RE.fullmatch(value or ""):
         raise SshAccessError(f"jump host {value!r} is not a plain ssh destination")
     return value
 

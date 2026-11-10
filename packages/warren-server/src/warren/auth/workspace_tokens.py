@@ -78,7 +78,7 @@ def is_workspace_token(token: str) -> bool:
 def scoped_route_allowed(
     method: str, path: str, workspace_id: str, routes: tuple[tuple[str, str], ...] = _SCOPED_ROUTES
 ) -> bool:
-    match = _WORKSPACE_PATH_RE.match(path)
+    match = _WORKSPACE_PATH_RE.fullmatch(path)
     if match is None or match.group(1) != workspace_id:
         return False
     suffix = (match.group(2) or "").rstrip("/")

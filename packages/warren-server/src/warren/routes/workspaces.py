@@ -262,7 +262,7 @@ async def _provision_operation(
 @router.get("/operations/{operation_id}", response_model=OperationReceipt)
 async def get_operation(operation_id: str, request: Request) -> OperationReceipt:
     """AM2: read the caller's receipt for a launch operation."""
-    if not re.match(_OPERATION_ID_PATTERN, operation_id):
+    if not re.fullmatch(_OPERATION_ID_PATTERN, operation_id):
         raise HTTPException(status_code=422, detail="invalid operation id")
     user = current_user(request)
     row = await request.app.state.operation_store.get(_operation_principal(request, user.user_id), operation_id)
@@ -812,7 +812,7 @@ async def _resolve_image(body: ProvisionRequest, request: Request) -> str:
     # path — an unvalidated body.project let a caller point project_path outside
     # projects_dir via "../" segments. Same allow-list shape as routes/projects.py's
     # _SAFE_NAME_RE (path-traversal guard, not merely a style rule).
-    if not _SAFE_PROJECT_NAME_RE.match(body.project):
+    if not _SAFE_PROJECT_NAME_RE.fullmatch(body.project):
         raise HTTPException(
             status_code=422,
             detail={"error": "invalid_project_name", "detail": "must match ^[a-z0-9_-]+$"},
@@ -1255,7 +1255,7 @@ async def branch_workspace(workspace_id: str, body: BranchRequest, request: Requ
 
     if current_workspace_scope(request) is not None:
         raise HTTPException(status_code=403, detail="workspace-scoped token cannot branch")
-    if body.new_session_id is not None and not _SAFE_SESSION_ID_RE.match(body.new_session_id):
+    if body.new_session_id is not None and not _SAFE_SESSION_ID_RE.fullmatch(body.new_session_id):
         raise HTTPException(status_code=422, detail="invalid new_session_id")
     user, ws, path = await _owned_workspace_repo(request, workspace_id, body.repo, "branch")
     registry = request.app.state.registry

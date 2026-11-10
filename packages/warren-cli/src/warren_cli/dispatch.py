@@ -59,7 +59,7 @@ _IMAGE_ALLOW_RE = re.compile(r"^[A-Za-z0-9_./:@-]+$")
 
 def _validate_image(image: str) -> str:
     """Reject shell metacharacters in image strings (T-05b-07/T-05b-21)."""
-    if not image or not _IMAGE_ALLOW_RE.match(image):
+    if not image or not _IMAGE_ALLOW_RE.fullmatch(image):
         typer.echo(
             f"invalid image reference: {image!r} — must match {_IMAGE_ALLOW_RE.pattern}",
             err=True,

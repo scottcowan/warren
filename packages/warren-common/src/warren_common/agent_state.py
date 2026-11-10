@@ -69,8 +69,8 @@ def parse_state(raw: bytes | None, *, source: str = "hook") -> AgentState | None
     return AgentState(
         state=obj["state"],
         ts=float(ts),
-        session_id=sid if isinstance(sid, str) and _ID.match(sid) else "",
-        harness=harness if isinstance(harness, str) and _NAME.match(harness) else "",
+        session_id=sid if isinstance(sid, str) and _ID.fullmatch(sid) else "",
+        harness=harness if isinstance(harness, str) and _NAME.fullmatch(harness) else "",
         event=str(obj.get("event", ""))[:64],
         source=source,
     )

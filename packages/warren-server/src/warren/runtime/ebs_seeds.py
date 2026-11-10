@@ -95,9 +95,9 @@ def seed_key(url: str) -> str | None:
     """`<host>/<path>` of a repo's seed bare, lowercased, without scheme, userinfo or a
     trailing .git; None when the URL has no safe key (a port, odd characters, ...).
     Must match git-materialize.sh's seed_key (a unit test runs both)."""
-    if not url or not _URL_CHARS.match(url):
+    if not url or not _URL_CHARS.fullmatch(url):
         return None
-    m = _SCHEME.match(url)
+    m = _SCHEME.fullmatch(url)
     if m:
         first, sep, rest = m.group(2).partition("/")
         k = first.rsplit("@", 1)[-1] + sep + rest
@@ -109,7 +109,7 @@ def seed_key(url: str) -> str | None:
     else:
         return None
     k = k.lstrip("/").removesuffix("/").removesuffix(".git").lower()
-    if not k or not _KEY_CHARS.match(k) or "//" in k or k.endswith("/"):
+    if not k or not _KEY_CHARS.fullmatch(k) or "//" in k or k.endswith("/"):
         return None
     parts = k.split("/")
     if len(parts) < 2 or any(p.startswith((".", "-")) or p.endswith(".git") for p in parts):
@@ -118,7 +118,7 @@ def seed_key(url: str) -> str | None:
 
 
 def valid_owner(owner_id: str) -> bool:
-    return bool(owner_id) and bool(_OWNER_RE.match(owner_id))
+    return bool(owner_id) and bool(_OWNER_RE.fullmatch(owner_id))
 
 
 @dataclass(frozen=True)
@@ -237,7 +237,7 @@ def ls_remote_sync(
     shas: dict[str, str] = {}
     for line in out.splitlines():
         sha, _, ref = line.partition("\t")
-        if ref in refs and _SHA_RE.match(sha):
+        if ref in refs and _SHA_RE.fullmatch(sha):
             shas[ref] = sha
     return shas
 
