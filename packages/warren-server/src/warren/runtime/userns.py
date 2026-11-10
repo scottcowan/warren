@@ -1,7 +1,8 @@
 """WARREN_PODMAN_USERNS: the user namespace rootless podman workspaces run in.
 
 The default, `keep-id:uid=1000,gid=1000`, maps the server's host user to container
-uid/gid 1000 (`warren` in warren's images). Bind mounts the server writes (the git
+uid/gid 1000 (`warren` in warren's images; warren-docker-base runs its workload as that
+user over such mounts). Bind mounts the server writes (the git
 checkout, the harness dir) are then owned by uid 1000 inside the container, and what
 uid 1000 writes there is owned by the server user on the host. Every other container
 uid, root included, maps to the server user's subuid range, as with podman's default
@@ -23,6 +24,8 @@ import structlog
 log = structlog.get_logger(__name__)
 
 DEFAULT_PODMAN_USERNS = "keep-id:uid=1000,gid=1000"
+# `warren` in warren's images: the workload user warren-docker-base drops to.
+WORKLOAD_UID = 1000
 
 # Values that mean "don't pass a userns": podman's own default for a rootless
 # container, where the host user is container root.
@@ -63,13 +66,26 @@ def needs_keep_id_options(value: str) -> bool:
     return ns is not None and ns["nsmode"] == "keep-id" and "value" in ns
 
 
+def keep_id_uid(userns: dict[str, str] | None) -> int | None:
+    """The container uid a parsed keep-id namespace maps the server user to, else None."""
+    if not userns or userns.get("nsmode") != "keep-id":
+        return None
+    for part in userns.get("value", "").split(","):
+        key, _, val = part.partition("=")
+        if key == "uid" and val.isdigit():
+            return int(val)
+    return None
+
+
 _UNSHARE_TIMEOUT_S = 120
 
 
 def remove_tree(path: Path, *, podman_binary: str = "podman") -> bool:
     """Remove a workspace's host-side directory, even what container root wrote there.
 
-    Under keep-id, files a workspace writes as container root (or any uid other than
+    A warren-docker-base workload runs as uid 1000 and leaves nothing a plain rmtree can't
+    remove; this covers `host`-era checkouts and older images. Under keep-id, files a
+    workspace writes as container root (or any uid other than
     the mapped 1000) are owned by one of the server user's subuids on the host, and a
     directory created that way can't be emptied by the server user. `podman unshare`
     runs `rm` as root of the server user's own user namespace, where those subuids are

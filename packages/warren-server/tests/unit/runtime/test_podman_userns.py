@@ -222,3 +222,105 @@ def test_remove_tree_reports_failure_without_raising(tmp_path: Path, monkeypatch
     assert remove_tree(target) is False
     monkeypatch.setattr(userns_mod.shutil, "which", lambda name: None)
     assert remove_tree(target) is False
+
+
+# --- the workload user (warren-docker-base drops to uid 1000) ---
+
+_DROPS = {"Config": {"Labels": {"dev.warren.workload-uid": "1000"}}}
+
+
+async def test_exec_user_label_when_keep_id_1000_and_the_image_drops():
+    kwargs, _ = await _create_kwargs(_DROPS)
+    assert kwargs["labels"]["warren.exec_user"] == "1000:1000"
+    # The image's own user (root here) is still what the container starts as.
+    assert kwargs["user"] == "0:0"
+
+
+@pytest.mark.parametrize(
+    ("userns", "attrs"),
+    [
+        ("keep-id:uid=1000,gid=1000", {"Config": {}}),  # an image from before the drop
+        ("keep-id:uid=1000,gid=1000", {"Config": {"Labels": {"dev.warren.workload-uid": "0"}}}),
+        ("keep-id", _DROPS),  # maps the server's own uid, not 1000
+        ("keep-id:uid=501,gid=501", _DROPS),
+        ("auto", _DROPS),
+        ("host", _DROPS),
+    ],
+)
+async def test_no_exec_user_label_otherwise(userns: str, attrs: dict):
+    kwargs, _ = await _create_kwargs(attrs, userns=userns)
+    assert "warren.exec_user" not in kwargs["labels"]
+
+
+async def test_image_user_still_wins_for_container_start():
+    kwargs, _ = await _create_kwargs({"Config": {"User": "warren", "Labels": {"dev.warren.workload-uid": "1000"}}})
+    assert kwargs["user"] == "warren"
+
+
+def test_keep_id_uid():
+    from warren.runtime.userns import keep_id_uid
+
+    assert keep_id_uid(parse_podman_userns(DEFAULT_PODMAN_USERNS)) == 1000
+    assert keep_id_uid(parse_podman_userns("keep-id")) is None
+    assert keep_id_uid(parse_podman_userns("auto")) is None
+    assert keep_id_uid(None) is None
+
+
+def _exec_runtime(labels: dict):
+    """A PodmanRuntime whose container reports `labels`; returns it and the exec-create bodies."""
+    import json
+
+    from warren_common.runtime.base import WorkspaceHandle
+
+    bodies: list[dict] = []
+    container = MagicMock(id="ctr-1", labels=labels)
+
+    def post(url, data=None, stream=False):
+        resp = MagicMock()
+        if url.endswith("/exec"):
+            bodies.append(json.loads(data))
+            resp.json.return_value = {"Id": "e1"}
+        return resp
+
+    container.client.post.side_effect = post
+    container.client.get.return_value.json.return_value = {"ExitCode": 0}
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        ClientCls.return_value.containers.get.return_value = container
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+    handle = WorkspaceHandle(workspace_id="ws-1", runtime_id="ctr-1", root_path="")
+    return runtime, handle, bodies
+
+
+async def _run(runtime, handle, **kwargs) -> None:
+    with patch("podman.api.stream_frames", return_value=iter([])):
+        async for _ in runtime.exec_stream(handle, ["id", "-u"], **kwargs):
+            pass
+
+
+async def test_exec_runs_as_the_workload_user_from_the_label():
+    runtime, handle, bodies = _exec_runtime({"warren.exec_user": "1000:1000"})
+    await _run(runtime, handle)
+    assert bodies[0]["User"] == "1000:1000"
+
+
+async def test_exec_without_the_label_uses_the_containers_user():
+    runtime, handle, bodies = _exec_runtime({})
+    await _run(runtime, handle)
+    assert "User" not in bodies[0]
+
+
+async def test_explicit_user_overrides_the_label():
+    runtime, handle, bodies = _exec_runtime({"warren.exec_user": "1000:1000"})
+    await _run(runtime, handle, user="0:0")
+    assert bodies[0]["User"] == "0:0"
+
+
+async def test_git_token_chown_and_rm_run_as_root_whatever_the_workload_is():
+    runtime, handle, bodies = _exec_runtime({"warren.exec_user": "1000:1000"})
+    with patch("warren.runtime.podman._git_tokens_tar", return_value=b""), patch(
+        "podman.api.stream_frames", return_value=iter([])
+    ):
+        await runtime.install_git_tokens(handle, {"acme": "tok"})
+        await runtime.drop_git_tokens(handle)
+    assert [b["User"] for b in bodies] == ["0:0", "0:0"]
+    assert bodies[0]["Cmd"][0] == "chown" and bodies[1]["Cmd"][:2] == ["rm", "-rf"]

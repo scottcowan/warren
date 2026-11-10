@@ -33,7 +33,9 @@ RUN apt-get update \
 
 # The two login users. `*`, not a locked `!` password: with UsePAM no, sshd refuses
 # accounts whose password is locked even for key logins. `*` matches no password.
-RUN useradd -m -s /bin/bash -u 1000 warren \
+# `warren` (1000) already exists in warren-docker-base releases that run the workload as
+# it; the older ones don't have it, so create it only when missing.
+RUN { id -u warren >/dev/null 2>&1 || useradd -m -s /bin/bash -u 1000 warren; } \
     && useradd -m -s /bin/bash -u 1001 warren-shell \
     && usermod -p '*' warren \
     && usermod -p '*' warren-shell \

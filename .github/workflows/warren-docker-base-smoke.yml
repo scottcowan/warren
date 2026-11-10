@@ -66,3 +66,6 @@ jobs:
           docker run --rm --entrypoint git warren-docker-base:smoke --version
           docker run --rm --entrypoint curl warren-docker-base:smoke --version
           docker run --rm --entrypoint uv warren-docker-base:smoke --version
+          # The workload user, and the tmux wrapper's privilege-drop tool.
+          test "$(docker run --rm --entrypoint id warren-docker-base:smoke -u warren)" = 1000
+          docker run --rm --entrypoint setpriv warren-docker-base:smoke --version

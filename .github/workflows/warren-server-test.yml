@@ -108,4 +108,8 @@ jobs:
       # with a traceback well before this outer wall-clock backstop, which only exists to
       # stop a wedged interpreter; it is kept under the job's 15-minute timeout-minutes.
       - name: Run test suite
+        env:
+          # The docker-base integration fixture builds the image from this checkout; take its
+          # digest-pinned python base from the mirror (docker-base-smoke verifies the digest).
+          WARREN_ITEST_BASE_REGISTRY: mirror.gcr.io/library
         run: timeout 720 uv run --package warren-server pytest packages/warren-server/tests -v

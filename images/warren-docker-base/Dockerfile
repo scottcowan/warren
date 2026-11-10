@@ -1,5 +1,8 @@
 # syntax=docker/dockerfile:1.7
 # warren-docker-base — multi-arch base image with system tools + warren-sidecar.
+# The workload runs as `warren` (uid 1000), not root, whenever the bind mounts are owned
+# by uid 1000 (podman keep-id, the default); it stays root over root-owned or other-uid
+# mounts (podman `host` userns, rootful docker). See entrypoint.py and the server README.
 # Build from repo root (context=.): docker build -f images/warren-docker-base/Dockerfile .
 # Extension images (e.g. warren-base-claude-code) FROM this image via ARG BASE_IMAGE.
 
@@ -22,6 +25,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tmux \
         zsh \
     && rm -rf /var/lib/apt/lists/*
+
+# The workload user. The entrypoint starts as container root, does what needs root, then
+# drops to this user (uid/gid 1000, the ECS images' `warren` and the one
+# warren-docker-ssh-base logs SSH sessions in as) for the tmux session, harnesses, agent
+# supervisor and app. The image deliberately sets no USER: sshd (docker-ssh-base) needs
+# root at start, and the drop depends on who owns the bind mounts (entrypoint.py).
+# /workspace and /var/lib/warren are where a workspace with no bind mount writes.
+RUN groupadd -g 1000 warren \
+    && useradd -u 1000 -g warren -m -d /home/warren -s /bin/bash warren \
+    && mkdir -p /workspace /var/lib/warren \
+    && chown 1000:1000 /workspace /var/lib/warren
+# Read by warren-server (runtime/podman.py): this image's workload runs as uid 1000 over
+# keep-id mounts, so `warren exec` sessions there run as uid 1000 too.
+LABEL dev.warren.workload-uid="1000"
+# A root `podman exec ... tmux` reaches the workload's tmux server as the workload user.
+COPY --chmod=0755 images/warren-docker-base/warren-tmux.sh /usr/local/bin/tmux
 
 # UX-1: warren's own prompt/banner, shared with the locally-written workspace
 # .zshrc (packages/warren-cli/src/warren_cli/dispatch.py's

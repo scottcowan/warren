@@ -9,6 +9,10 @@ Design notes:
   flush=True to ensure Podman buffers do not hold events (Pitfall 4 / T-04-04-02).
 - Sidecar import wrapped in try/except: if warren_sidecar is not installed,
   sidecar_import_error is emitted and the entrypoint exits non-zero.
+- Root phase, then uid 1000: the image starts as container root (warren-docker-ssh-base's
+  sshd needs it), does the few things that need root, then drops this very process to
+  `warren` (uid/gid 1000) so the tmux server, harness init, agent supervisor, recorder and
+  the app all run unprivileged. See `choose_workload_user` for when it does NOT drop.
 """
 from __future__ import annotations
 
@@ -96,6 +100,10 @@ def _preflight() -> str:
 
 
 _HARNESS_ROOT = "/var/lib/warren/harness"
+_WORKLOAD_UID = 1000
+_WORKLOAD_GID = 1000
+_WORKLOAD_HOME = "/home/warren"
+_WORKLOAD_MARKER = "/etc/warren/workload"
 _HARNESS_INIT = "/usr/local/bin/warren-harness-init"
 
 
@@ -113,14 +121,13 @@ def init_harness_dirs(init: str = _HARNESS_INIT, root: str = _HARNESS_ROOT) -> N
 
 
 def match_mount_owner(root: str) -> None:
-    """Give what this (root) entrypoint wrote under a bind mount to the mount's owner.
+    """Give what a still-root entrypoint wrote under a bind mount to the mount's owner.
 
-    Under rootless podman's default mapping the server's host user is container root,
-    so the harness dir is root-owned here and this is a no-op. Under a keep-id userns
-    (WARREN_PODMAN_USERNS, the default) the server user is uid 1000 inside and the
-    dir is owned by 1000: files container root creates would land on the host as an
-    unprivileged subuid the server can't read or delete, and a uid-1000 harness
-    couldn't write them. Never follows a link.
+    Only reached when the workload stays root (see choose_workload_user) over a mount
+    owned by another non-root uid: rootful docker with a server uid other than 1000.
+    Under rootless podman's `host` userns the dir is root-owned and this is a no-op, and
+    under keep-id the entrypoint has dropped to uid 1000 (harness init then writes as the
+    owner) so it never runs as root. Never follows a link.
     """
     if os.geteuid() != 0:
         return
@@ -140,6 +147,85 @@ def match_mount_owner(root: str) -> None:
             except OSError as e:
                 emit({"type": "harness_chown_failed", "path": path, "detail": str(e)})
                 return
+
+
+def choose_workload_user(
+    probe_paths: list[str],
+    uid: int = _WORKLOAD_UID,
+    env: dict[str, str] | None = None,
+    stat=os.stat,  # noqa: ANN001
+) -> bool:
+    """Whether to drop from container root to `warren` (uid 1000) for the workload.
+
+    Drop only when the bind mounts the server wrote are owned by that uid, i.e. under a
+    keep-id userns (WARREN_PODMAN_USERNS, the default: the server's host user is uid 1000
+    here), or when a rootful docker server's own uid happens to be 1000. Then uid 1000 can
+    write the checkout and what it writes is the server user's on the host.
+
+    Stay root when a mount is owned by root (podman `host` userns: the server's host user
+    IS container root, and a uid-1000 workload would write as an unprivileged subuid the
+    server can't read or delete), by any other uid (rootful docker with a server uid != 1000:
+    chowning the checkout would take it away from that user), or when there is no mount
+    to go by. WARREN_WORKLOAD_USER=root|warren overrides the probe.
+    """
+    env = os.environ if env is None else env
+    forced = env.get("WARREN_WORKLOAD_USER", "")
+    if forced in ("root", "warren"):
+        return forced == "warren"
+    for path in probe_paths:
+        try:
+            st = stat(path, follow_symlinks=False)
+        except OSError:
+            continue
+        return st.st_uid == uid
+    return False
+
+
+def _probe_paths() -> list[str]:
+    paths = [p for p in os.environ.get("WARREN_WORKTREE_PATHS", "").split(":") if p]
+    paths.append(os.environ.get("WARREN_HARNESS_ROOT") or _HARNESS_ROOT)
+    return paths
+
+
+def drop_privileges(uid: int = _WORKLOAD_UID, gid: int = _WORKLOAD_GID, home: str = _WORKLOAD_HOME) -> None:
+    """Become `warren` for good: clear supplementary groups, then gid, then uid.
+
+    Order matters (setgroups/setgid need root). Everything started after this, in this
+    process and its children, runs as uid 1000.
+    """
+    os.setgroups([])
+    os.setgid(gid)
+    os.setuid(uid)
+    os.environ["HOME"] = home
+    os.environ["USER"] = os.environ["LOGNAME"] = "warren"
+
+
+def root_phase() -> None:
+    """Everything that needs container root, then (usually) the drop to uid 1000.
+
+    - /etc/warren/session.env for `warren shell` sessions that don't carry the container env;
+    - /etc/warren/workload, which tells the image's tmux wrapper (and nothing else) that a
+      `podman exec` session, which starts as root, must reach the workload's tmux server
+      as the workload user;
+    - the drop itself. Without it (host userns, other-owner docker mounts, or already
+      non-root) the workload keeps running as root, as before.
+    """
+    if os.geteuid() != 0:
+        return
+    if os.environ.get("WARREN_SHELL_FIRST") == "1":
+        write_session_env()
+    if not choose_workload_user(_probe_paths()):
+        return
+    try:
+        with open(_WORKLOAD_MARKER, "w", encoding="utf-8") as f:
+            f.write(f"{_WORKLOAD_UID} {_WORKLOAD_GID} {_WORKLOAD_HOME} warren\n")
+    except OSError as e:
+        emit({"type": "workload_marker_unavailable", "detail": str(e)})
+    try:
+        drop_privileges()
+    except OSError as e:
+        fail("privilege_drop_failed", str(e))
+    emit({"type": "workload_user", "user": "warren", "uid": _WORKLOAD_UID})
 
 
 def _build_argv(app_cmd: str) -> list[str]:
@@ -247,9 +333,8 @@ def start_agent_supervisor(path: str = _SUPERVISOR) -> subprocess.Popen | None:
 
 
 if __name__ == "__main__":
+    root_phase()
     app_cmd = _preflight()
-    if os.environ.get("WARREN_SHELL_FIRST") == "1" and os.geteuid() == 0:
-        write_session_env()
     start_agent_supervisor()
 
     # ── D-11: supervise workspace app (PID 1 stays alive) ────────────────────

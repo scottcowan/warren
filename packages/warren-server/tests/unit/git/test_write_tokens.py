@@ -532,8 +532,11 @@ async def test_podman_writes_tokens_with_put_archive_not_exec_args():
     rt._client.containers.get.return_value = container
     argvs = []
 
-    async def fake_exec(handle, argv):
+    users = []
+
+    async def fake_exec(handle, argv, *, user=None):
         argvs.append(list(argv))
+        users.append(user)
         yield ExecExit(0)
 
     rt.exec_stream = fake_exec
@@ -551,4 +554,6 @@ async def test_podman_writes_tokens_with_put_archive_not_exec_args():
         assert tar.extractfile(f).read() == (token + "\n").encode()
     assert argvs == [["chown", "1000:1000", "/run/warren-git/acme"], ["rm", "-rf", "/run/warren-git"]]
     assert not any(token in " ".join(a) for a in argvs)
+    # Root, whatever user the workload (and ordinary exec sessions) run as: /run is root's.
+    assert users == ["0:0", "0:0"]
     assert token not in repr(logs)

@@ -88,14 +88,15 @@ was the reference):
 sshd runs as the container's root here, because it serves two users. `PermitRootLogin`
 stays `no`.
 
-**Limitation (rootless podman):** the workload and its checkout belong to the
-container's root, which rootless podman maps to the server's own unprivileged user.
-SSH logins are the non-root `warren`/`warren-shell` users, so an editor can read the
-checkout but can't write files owned by container root. Making podman SSH sessions
-write the checkout needs either container-root logins (root in a rootless container is
-the unprivileged host user, but this image keeps `PermitRootLogin no`) or podman
-workspaces running as a mapped non-root user (`--userns=keep-id`). Both are server-side
-decisions, not made here.
+**Rootless podman:** under the server's default `keep-id:uid=1000,gid=1000` mapping
+the checkout is owned by uid 1000 and warren-docker-base runs the workload as `warren`
+(uid 1000) after its root phase, so the SSH `warren` login and the workload are the same
+user: an editor can write what the agent made and the agent can use what the editor
+saves. `warren-shell` (1001) is a separate account without write access to the checkout.
+Under `WARREN_PODMAN_USERNS=host` the checkout belongs to container root and the SSH
+logins can read but not write it (the workload stays root there); see the server README's
+runtime table. A dev-base/ssh-base published before warren-docker-base's uid-1000 drop
+still has a root workload.
 
 ## sshd hardening
 
@@ -122,7 +123,8 @@ The differences come from the runtime:
 | users | `warren` | `warren`, `warren-shell` |
 
 On ECS the workload still runs as uid 1000 exactly as in ecs-base; on podman the
-workload still runs through warren-docker-base's `/entrypoint.py` exactly as before.
+workload runs through warren-docker-base's `/entrypoint.py`, which drops to uid 1000 over
+uid-1000-owned mounts (keep-id) and stays root otherwise.
 
 ### Enabling agent forwarding
 

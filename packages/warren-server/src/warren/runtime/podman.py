@@ -22,7 +22,7 @@ from podman.errors.exceptions import PodmanError
 
 from warren.git.write_tokens import TOKEN_DIR, TOKEN_UID, encode_tokens
 from warren.images.build_spec import BuildSpec
-from warren.runtime.userns import DEFAULT_PODMAN_USERNS, parse_podman_userns
+from warren.runtime.userns import DEFAULT_PODMAN_USERNS, WORKLOAD_UID, keep_id_uid, parse_podman_userns
 from warren_common.errors import ImageUnavailable, RuntimeUnreachable
 from warren_common.agent_launch import SPEC_ENV as AGENT_SPEC_ENV
 from warren_common.harness_shell import seed_env, server_env, shell_first, workspace_shell
@@ -41,6 +41,12 @@ _WARREN_LABEL_SERVER_INSTANCE = "warren.server_instance"
 _WARREN_LABEL_PROJECT = "warren.project"
 _WARREN_LABEL_INTENT = "warren.intent"
 _WARREN_LABEL_NETWORK = "warren.network"
+# The user `exec` sessions (warren exec, the exec relay) run as: the workload's, when the
+# image drops to it (see _workload_exec_user). Absent means the container's own user.
+_WARREN_LABEL_EXEC_USER = "warren.exec_user"
+# Set by warren-docker-base (and so inherited by its extension images): its entrypoint
+# drops from root to this uid for the workload when the bind mounts are owned by it.
+_IMAGE_LABEL_WORKLOAD_UID = "dev.warren.workload-uid"
 
 # Netavark (and CNI, via ingressPolicy) drops forwarded traffic between two
 # networks that both carry `isolate`; "strict" (netavark >= 1.7) also drops
@@ -129,6 +135,24 @@ def _authorized_keys_tar(pubkey_line: str) -> bytes:
         info.mode = 0o644
         tar.addfile(info, io.BytesIO(data))
     return buf.getvalue()
+
+
+_ROOT = "0:0"
+
+
+def _workload_exec_user(userns: dict[str, str] | None, image_labels: dict[str, str]) -> str:
+    """"1000:1000" when exec sessions should run as the workload user, else "".
+
+    That is when the userns is keep-id mapped to uid 1000 (so the bind mounts are
+    uid 1000's and the image's entrypoint, which checks exactly that, drops to it) and the
+    image says it does so (a warren-docker-base from before the drop has no label and
+    keeps its root workload and root exec).
+    """
+    if keep_id_uid(userns) != WORKLOAD_UID:
+        return ""
+    if image_labels.get(_IMAGE_LABEL_WORKLOAD_UID) != str(WORKLOAD_UID):
+        return ""
+    return f"{WORKLOAD_UID}:{WORKLOAD_UID}"
 
 
 class PodmanRuntime:
@@ -267,7 +291,11 @@ class PodmanRuntime:
             # uid (1000) rather than the image's USER. Pin the image's own user (root when
             # it sets none) so the entrypoint starts as it did before; only the ownership
             # of the bind mounts changes.
-            create_kwargs["user"] = await self._image_user(spec.image)
+            image_user, image_labels = await self._image_config(spec.image)
+            create_kwargs["user"] = image_user
+            exec_user = _workload_exec_user(self._userns, image_labels)
+            if exec_user:
+                labels[_WARREN_LABEL_EXEC_USER] = exec_user
         # Publish the allocated SSH host port (D-05: fixed at provision time,
         # lives for the workspace's whole life). Only include the `ports`
         # kwarg when a port was actually allocated — never auto-assign an
@@ -374,9 +402,9 @@ class PodmanRuntime:
     def git_write_problem(self) -> str:
         return ""
 
-    async def _exec_checked(self, handle: WorkspaceHandle, argv: list[str]) -> None:
+    async def _exec_checked(self, handle: WorkspaceHandle, argv: list[str], *, user: str | None = None) -> None:
         exit_code: int | None = None
-        async for item in self.exec_stream(handle, argv):
+        async for item in self.exec_stream(handle, argv, user=user):
             if isinstance(item, ExecExit):
                 exit_code = item.exit_code
         if exit_code != 0:
@@ -392,15 +420,23 @@ class PodmanRuntime:
             await asyncio.to_thread(container.put_archive, path=TOKEN_DIR.rsplit("/", 1)[0] or "/", data=data)
         except (APIError, PodmanError, ConnectionError, NotFound) as e:
             raise RuntimeUnreachable(str(e)) from e
+        # As container root, whatever the workload runs as: /run is root's, and the tokens
+        # stay readable by the workload user (TOKEN_UID) either way.
         await self._exec_checked(
-            handle, ["chown", f"{TOKEN_UID}:{TOKEN_UID}", *[f"{TOKEN_DIR}/{o}" for o in sorted(tokens)]]
+            handle,
+            ["chown", f"{TOKEN_UID}:{TOKEN_UID}", *[f"{TOKEN_DIR}/{o}" for o in sorted(tokens)]],
+            user=_ROOT,
         )
 
     async def drop_git_tokens(self, handle: WorkspaceHandle) -> None:
-        await self._exec_checked(handle, ["rm", "-rf", TOKEN_DIR])
+        await self._exec_checked(handle, ["rm", "-rf", TOKEN_DIR], user=_ROOT)
 
     async def _image_user(self, image: str) -> str:
         """The image's configured USER, or "0:0" when it sets none (podman's default)."""
+        return (await self._image_config(image))[0]
+
+    async def _image_config(self, image: str) -> tuple[str, dict[str, str]]:
+        """The image's configured USER ("0:0" when it sets none, podman's default) and labels."""
         try:
             obj = await asyncio.to_thread(self._client.images.get, image)
         except ImageNotFound as e:
@@ -410,7 +446,11 @@ class PodmanRuntime:
         attrs = getattr(obj, "attrs", None)
         config = attrs.get("Config") if isinstance(attrs, dict) else None
         user = config.get("User") if isinstance(config, dict) else None
-        return user.strip() if isinstance(user, str) and user.strip() else "0:0"
+        labels = config.get("Labels") if isinstance(config, dict) else None
+        return (
+            user.strip() if isinstance(user, str) and user.strip() else "0:0",
+            {str(k): str(v) for k, v in labels.items()} if isinstance(labels, dict) else {},
+        )
 
     async def start(self, handle: WorkspaceHandle) -> None:
         container = await asyncio.to_thread(self._client.containers.get, handle.runtime_id)
@@ -653,8 +693,14 @@ class PodmanRuntime:
     async def exec(self, handle: WorkspaceHandle, cmd: list[str]) -> AsyncIterator[bytes]:
         raise NotImplementedError("use exec_stream")
 
-    async def exec_stream(self, handle: WorkspaceHandle, argv: list[str]) -> AsyncIterator[bytes | ExecExit]:
+    async def exec_stream(
+        self, handle: WorkspaceHandle, argv: list[str], *, user: str | None = None
+    ) -> AsyncIterator[bytes | ExecExit]:
         """#59: run argv in the container (no TTY, no stdin), yielding output chunks then ExecExit.
+
+        Runs as `user`, else as the workload user when the container's image drops to it
+        (the `warren.exec_user` label; files it creates in the checkout are then the
+        server user's, not a subuid's), else as the container's own user.
 
         Closing the generator early closes the attach stream; the exec session's process
         isn't killed by the Podman API, so callers bound time by closing."""
@@ -662,10 +708,16 @@ class PodmanRuntime:
 
         def _start() -> tuple[str, Any, Any]:
             container = self._client.containers.get(handle.runtime_id)
-            created = container.client.post(
-                f"/containers/{container.id}/exec",
-                data=json.dumps({"AttachStdout": True, "AttachStderr": True, "AttachStdin": False, "Tty": False, "Cmd": list(argv)}),
+            body: dict[str, Any] = {
+                "AttachStdout": True, "AttachStderr": True, "AttachStdin": False, "Tty": False, "Cmd": list(argv),
+            }
+            container_labels = container.labels
+            run_as = user or (
+                container_labels.get(_WARREN_LABEL_EXEC_USER) if isinstance(container_labels, dict) else None
             )
+            if run_as:
+                body["User"] = run_as
+            created = container.client.post(f"/containers/{container.id}/exec", data=json.dumps(body))
             created.raise_for_status()
             exec_id = created.json()["Id"]
             started = container.client.post(
