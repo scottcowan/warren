@@ -734,7 +734,10 @@ def test_provision_bedrock_mode_threads_into_spec(env_defaults, auth_headers, te
     assert spec.template_env["CLAUDE_CODE_USE_BEDROCK"] == "1"
 
 
-_DECLARED_PORTS = {"t3": {"port": 3773, "description": ""}, "code": {"port": 8080, "description": "code-server"}}
+_DECLARED_PORTS = {
+    "t3": {"port": 3773, "description": "", "protocol": "tcp"},
+    "code": {"port": 8080, "description": "code-server", "protocol": "tcp"},
+}
 
 
 def test_provision_persists_named_ports_and_get_workspaces_returns_them(env_defaults, auth_headers):

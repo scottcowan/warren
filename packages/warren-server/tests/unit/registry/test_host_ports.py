@@ -157,7 +157,7 @@ def test_workspace_view_returns_host_ports_next_to_ports():
 
     view = WorkspaceView.from_workspace(_ws({"t3": {"host": "127.0.0.1", "port": 41001}}))
     dumped = view.model_dump()
-    assert dumped["ports"]["t3"] == {"port": 3773, "description": ""}
+    assert dumped["ports"]["t3"] == {"port": 3773, "description": "", "protocol": "tcp"}
     assert dumped["host_ports"] == {"t3": {"host": "127.0.0.1", "port": 41001}}
 
 
@@ -180,3 +180,10 @@ def test_workspace_view_host_ports_are_loopback_declared_and_well_formed_only():
     broken = _ws(None)
     broken.host_ports_json = "{not json"
     assert WorkspaceView.from_workspace(broken).host_ports == {}
+
+
+def test_ports_view_exposes_protocol_defaulting_to_tcp():
+    from warren.registry.models import _ports_view
+
+    view = _ports_view({"a": {"port": 1, "protocol": "http"}, "b": {"port": 2}, "c": {"port": 3, "protocol": "x"}})
+    assert {k: v.protocol for k, v in view.items()} == {"a": "http", "b": "tcp", "c": "tcp"}
