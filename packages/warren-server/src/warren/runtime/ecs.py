@@ -59,6 +59,7 @@ from warren.runtime.ecs_storage import (
     StorageUnavailable,
     WorkspaceStorageUnavailable,
 )
+from warren.secrets.names import INTERNAL_NAMES, is_denied
 from warren.runtime.ecs_secrets import (
     GIT_INIT_FILE,
     WORKSPACE_FILE,
@@ -329,6 +330,9 @@ class ECSRuntime:
                 continue
             if not is_env_name(name):
                 log.warning("ecs_secret_skipped_not_env_name", workspace_id=spec.workspace_id, name=name)
+                continue
+            if is_denied(name) or name in INTERNAL_NAMES:
+                log.warning("ecs_secret_skipped_reserved_name", workspace_id=spec.workspace_id, name=name)
                 continue
             out[name] = values[name]
         return out

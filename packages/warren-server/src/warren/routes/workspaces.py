@@ -28,6 +28,7 @@ from warren.images.resolve import template_image
 from warren.ratelimit import SlidingWindowRateLimiter
 from warren.registry.models import OperationReceipt, ProvisionedWorkspaceView, WorkspaceView
 from warren.registry.store import CapacityExhausted
+from warren.secrets.names import INTERNAL_NAMES, is_denied
 from warren.registry.registry import (
     ROOT_REPO,
     BranchSource,
@@ -451,6 +452,11 @@ async def _provision_workspace(
         from warren.secrets.store import secret_store_from_state
 
         secret_env = await secret_store_from_state(request.app.state).resolve(secret_owner_id, secret_names)
+        # A row stored before the reserved-name rule (secrets/names.py) must not reach
+        # the container's environment (LD_PRELOAD, PATH, ... act in its root phase).
+        for _name in [n for n in secret_env if is_denied(n) or n in INTERNAL_NAMES]:
+            log.warning("secret_skipped_reserved_name", name=_name)
+            del secret_env[_name]
 
     spec = WorkspaceSpec(
         workspace_id=workspace_id,

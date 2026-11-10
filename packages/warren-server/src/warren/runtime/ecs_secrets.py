@@ -37,6 +37,7 @@ import uuid
 from typing import Iterator, Mapping
 
 import structlog
+from warren.secrets.names import denied_message, is_deliverable
 from warren_common.errors import ProvisionError
 
 log = structlog.get_logger(__name__)
@@ -61,6 +62,8 @@ def encode(secrets: Mapping[str, str]) -> bytes:
     for name in sorted(secrets):
         if not is_env_name(name):
             raise ValueError(f"secret name {name!r} is not an environment variable name")
+        if not is_deliverable(name):
+            raise ValueError(denied_message(name))
         value = base64.b64encode(secrets[name].encode("utf-8")).decode("ascii")
         lines.append(f"{name}={value}\n")
     return "".join(lines).encode("ascii")
