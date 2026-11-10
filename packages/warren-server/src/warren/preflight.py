@@ -19,7 +19,13 @@ from typing import Any
 import structlog
 
 from warren.errors import PreflightError
-from warren.podman_host import pasta_apparmor_warning, pasta_host_loopback_warning, read_local_pasta_profile
+from warren.podman_host import (
+    pasta_apparmor_warning,
+    pasta_host_loopback_warning,
+    pasta_refusal_message,
+    read_local_pasta_profile,
+    rootless_uses_pasta,
+)
 from warren.runtime import podman as _podman_module
 from warren.runtime.userns import KEEP_ID_OPTIONS_MIN_PODMAN, needs_keep_id_options
 
@@ -98,15 +104,15 @@ def _warn_pasta_host_loopback(info: dict[str, Any], socket: Path) -> None:
         return
     log.warning("podman_pasta_host_loopback", socket=str(socket), **warning)
     _stdlib_log.warning(
-        "Podman %s runs rootless networking through pasta: workspaces can reach host loopback "
-        "via 169.254.1.2, including other workspaces' published ports (docs/threat-model.md, "
-        "residual risk 6)",
+        "Podman %s runs rootless networking through pasta (allowed by WARREN_PODMAN_ALLOW_PASTA): "
+        "workspaces can reach host loopback via 169.254.1.2, including other workspaces' "
+        "published ports (docs/threat-model.md, residual risk 6)",
         warning["podman_version"],
     )
 
 
 async def run_preflight(
-    socket_path: str | Path, *, same_host: bool = False, userns: str = ""
+    socket_path: str | Path, *, same_host: bool = False, userns: str = "", allow_pasta: bool = False
 ) -> None:
     """Raise PreflightError on fatal misconfiguration; log warning for `vfs`.
 
@@ -114,6 +120,8 @@ async def run_preflight(
       * socket path does not exist on disk
       * `client.ping()` raises (socket present but unreachable)
       * summed UIDMap size < 65536 (Pitfall #4)
+      * rootless podman whose network helper is pasta, unless `allow_pasta`
+        (WARREN_PODMAN_ALLOW_PASTA): workspaces could reach host loopback
 
     Warning (non-fatal):
       * graphDriverName == "vfs" (Pitfall #5)
@@ -156,6 +164,9 @@ async def run_preflight(
             "Podman using vfs storage driver at %s — install fuse-overlayfs for 10-100x speedup",
             socket,
         )
+
+    if rootless_uses_pasta(info) and not allow_pasta:
+        raise PreflightError(pasta_refusal_message(info))
 
     _warn_pasta_apparmor(info, socket, same_host)
     _check_userns_support(info, userns)

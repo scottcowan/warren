@@ -201,10 +201,11 @@ ubuntu-latest) through the bridge gateway, `host.containers.internal`,
 `10.0.2.2`, `169.254.1.2`, the host's own IP and the owning container's IP.
 **With pasta** this doesn't hold everywhere: on podman 6.0.1 with default
 options, `169.254.1.2` reached host loopback, and so published SSH and template
-ports, from other workspaces. The server logs `podman_pasta_host_loopback` at
-startup when podman runs rootless pasta; use slirp4netns
+ports, from other workspaces. The server therefore refuses to start on rootless
+pasta unless `WARREN_PODMAN_ALLOW_PASTA=1` (then it logs
+`podman_pasta_host_loopback`); use slirp4netns
 (`default_rootless_network_cmd = "slirp4netns"` under `[network]` in
-`containers.conf`) on hosts that run untrusted workspaces side by side. On
+`containers.conf`). On
 Docker Desktop and colima, `host.docker.internal` reaches the desktop host's
 loopback, and with it these ports. See [threat-model.md](threat-model.md),
 residual risk 6.
