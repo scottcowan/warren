@@ -26,13 +26,16 @@ from warren.notify.targets import (
     Resolver,
     Target,
     default_resolver,
-    is_public_destination,
+    resolve_public_destination,
 )
 
 log = structlog.get_logger(__name__)
 
 # (url, body, timeout) -> HTTP status
-Sender = Callable[[str, bytes, float], Awaitable[int]]
+# (url, body, timeout, address): `address` is the validated IP to connect to for
+# owner-registered URLs (the sender must not resolve the host itself); None for the
+# operator's trusted server-wide URL.
+Sender = Callable[..., Awaitable[int]]
 OwnerLookup = Callable[[str], Awaitable[Target | None]]
 WatchedOwners = Callable[[], Awaitable[set[str]]]
 
@@ -41,20 +44,44 @@ _DEDUPE_PRUNE_AT = 2048
 
 
 class HttpxSender:
-    """POST JSON with httpx; no redirects (a redirect could point anywhere)."""
+    """POST JSON with httpx; no redirects (a redirect could point anywhere).
 
-    def __init__(self) -> None:
+    With `address`, the connection goes to that IP (already validated by the caller)
+    while the Host header, TLS SNI and certificate verification stay on the URL's
+    host name, so the name is never resolved a second time.
+    """
+
+    def __init__(self, verify: Any = True) -> None:
         self._client: Any = None
+        self._verify = verify
 
-    async def __call__(self, url: str, body: bytes, timeout: float) -> int:
+    async def __call__(self, url: str, body: bytes, timeout: float, address: str | None = None) -> int:
         import httpx  # noqa: PLC0415
 
-        if self._client is None:
-            self._client = httpx.AsyncClient(follow_redirects=False)
-        resp = await self._client.post(
-            url, content=body, timeout=timeout,
-            headers={"Content-Type": "application/json", "User-Agent": "warren-notify"},
-        )
+        headers = {"Content-Type": "application/json", "User-Agent": "warren-notify"}
+        if address is None:
+            if self._client is None:
+                self._client = httpx.AsyncClient(follow_redirects=False, verify=self._verify)
+            resp = await self._client.post(url, content=body, timeout=timeout, headers=headers)
+            return resp.status_code
+        from urllib.parse import urlsplit  # noqa: PLC0415
+
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        port = parts.port or 443
+        ip_host = f"[{address}]" if ":" in address else address
+        pinned = f"https://{ip_host}:{port}{parts.path or '/'}"
+        headers["Host"] = host if port == 443 else f"{host}:{port}"
+        # A fresh client per pinned delivery: a pooled connection is keyed by the IP,
+        # so sharing one could send a request for another host name down it.
+        async with httpx.AsyncClient(
+            follow_redirects=False, verify=self._verify, trust_env=False,
+            limits=httpx.Limits(max_keepalive_connections=0),
+        ) as client:
+            resp = await client.post(
+                pinned, content=body, timeout=timeout, headers=headers,
+                extensions={"sni_hostname": host},
+            )
         return resp.status_code
 
     async def aclose(self) -> None:
@@ -81,6 +108,7 @@ class Notifier:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
         resolver: Resolver = default_resolver,
+        allowed_ports: frozenset[int] = frozenset({443}),
         wall_clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.server_target = server_target
@@ -97,6 +125,7 @@ class Notifier:
         self._clock = clock
         self._sleep = sleep
         self._resolver = resolver
+        self._allowed_ports = frozenset(allowed_ports)
         self._wall_clock = wall_clock
         self._last_sent: dict[tuple[str, str], float] = {}
         self._tasks: list[asyncio.Task] = []
@@ -197,9 +226,16 @@ class Notifier:
     async def _deliver_one(self, n: Notification, target: Target) -> bool:
         fields = {"notify_event": n.event, "workspace_id": n.workspace_id, "target": target.kind}
         url = target.url.get_secret_value()
-        if target.require_public and not await is_public_destination(url, self._resolver):
-            log.warning("notify_target_rejected", reason="non_public_destination", **fields)
-            return False
+        addresses: list[str] | None = None
+        if target.require_public:
+            # Resolve once per delivery; the sender connects to one of these addresses
+            # and never resolves the name itself (DNS rebinding).
+            addresses = await resolve_public_destination(
+                url, self._resolver, allowed_ports=self._allowed_ports, timeout=self.timeout_seconds
+            )
+            if not addresses:
+                log.warning("notify_target_rejected", reason="non_public_destination", **fields)
+                return False
         body = render(n, target.format)
         attempts = 1 + self.max_retries
         # The sender gets the timeout too; this outer bound catches one that ignores it.
@@ -207,7 +243,12 @@ class Notifier:
         for attempt in range(attempts):
             status: int | None = None
             try:
-                code = await asyncio.wait_for(self._sender(url, body, self.timeout_seconds), timeout=guard)
+                call = (
+                    self._sender(url, body, self.timeout_seconds)
+                    if addresses is None
+                    else self._sender(url, body, self.timeout_seconds, addresses[attempt % len(addresses)])
+                )
+                code = await asyncio.wait_for(call, timeout=guard)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # timeouts, connection errors

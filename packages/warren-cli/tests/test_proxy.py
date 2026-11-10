@@ -31,8 +31,8 @@ runner = CliRunner()
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="fake `aws` is a POSIX shebang script")
 
 _WS = "abc12345-aaaa-bbbb-cccc-ddddeeeeffff"
-_TASK1 = "arn:aws:ecs:us-east-1:1:task/prod-cluster/task1111"
-_TASK2 = "arn:aws:ecs:us-east-1:1:task/prod-cluster/task2222"
+_TASK1 = "arn:aws:ecs:us-east-1:123456789012:task/prod-cluster/task1111"
+_TASK2 = "arn:aws:ecs:us-east-1:123456789012:task/prod-cluster/task2222"
 
 _CONFIG = (
     '[defaults]\nserver = "prodecs"\n'
@@ -202,11 +202,11 @@ def test_store_skips_ports_in_use_and_honours_an_explicit_one(tmp_path):
     store = proxy.MappingStore(tmp_path / "proxy.json")
     m, _ = store.add("prodecs", "ws1", 1, port_base=47100, port_free=lambda p: p != 47100)
     assert m.local_port == 47101
-    pinned, _ = store.add("prodecs", "ws2", 2, local_port=50000)
+    pinned, _ = store.add("prodecs", "ws2", 2, local_port=50000, port_free=lambda p: True)
     assert pinned.local_port == 50000
     with pytest.raises(proxy.ProxyError, match="already used by prodecs/ws2:2"):
-        store.add("prodecs", "ws3", 3, local_port=50000)
-    moved, _ = store.add("prodecs", "ws1", 1, local_port=50001)
+        store.add("prodecs", "ws3", 3, local_port=50000, port_free=lambda p: True)
+    moved, _ = store.add("prodecs", "ws1", 1, local_port=50001, port_free=lambda p: True)
     assert moved.local_port == 50001 and len(store.load()) == 2
 
 
@@ -1073,7 +1073,7 @@ async def test_ssm_forwarder_reports_expired_sso(fake_aws, monkeypatch):
     monkeypatch.setenv("FAKE_AWS_EXPIRED", "1")
     monkeypatch.setenv("AWS_PROFILE", "warren-dev")
     with pytest.raises(proxy.AwsCredentialsExpired, match=r"run `aws sso login --profile warren-dev`"):
-        await proxy.SsmForwarder().start(proxy.Target(workspace_id=_WS, cluster="c", task_arn=_TASK1), 3773)
+        await proxy.SsmForwarder().start(proxy.Target(workspace_id=_WS, cluster="prod-cluster", task_arn=_TASK1), 3773)
 
 
 # ---------------------------------------------------------------------------

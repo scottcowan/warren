@@ -135,8 +135,11 @@ async def migrate_state(
                         continue
                     copied += 1
                     if apply:
-                        for item in items:
-                            await table.put(item, condition="attribute_not_exists(pk)")
+                        # One transaction per entity: a failure part-way can never leave a
+                        # row half-copied (a rerun only checks the first item).
+                        await table.transact(
+                            [table.put_op(item, condition="attribute_not_exists(pk)") for item in items]
+                        )
                 summary[entity] = {"copied": copied, "present": present}
             if apply:
                 await recount(table)

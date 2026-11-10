@@ -326,3 +326,12 @@ def test_kind_defaults_to_user_and_agent_needs_a_harness():
     assert (oc.agent.port, oc.agent.max_peers, oc.agent.restart.max_restarts) == (9000, 2, 2)
     with pytest.raises(HarnessSelectionError, match="not ACP: set agent.adapter"):
         resolve_template(root, "cl")
+
+
+def test_port_protocol_defaults_to_tcp_and_accepts_http():
+    cfg = ProjectConfig.model_validate(
+        {"name": "demo", "ports": {"t3": {"port": 3773, "protocol": "http"}, "ssh": 2222}}
+    )
+    assert cfg.ports["t3"].protocol == "http" and cfg.ports["ssh"].protocol == "tcp"
+    with pytest.raises(ValueError):
+        ProjectConfig.model_validate({"name": "demo", "ports": {"t3": {"port": 3773, "protocol": "udp"}}})

@@ -672,11 +672,28 @@ def test_bare_seeds_setting_needs_ebs(monkeypatch):
         ecs_ebs_bare_seeds=True,
         ecs_ebs_infra_role_arn="arn:aws:iam::123456789012:role/x",
         ecs_secrets_kms_key_id="k",
+        server_id="prod-1",
     )
     assert s.ecs_ebs_seed_repo_ttl_days == 30 and s.ecs_ebs_seed_refresh_interval_seconds == 86400
     assert WarrenSettings().git_clone_filter == ""
     with pytest.raises(ValidationError):
         WarrenSettings(git_clone_filter="sparse:oid=x")
+
+
+def test_ebs_needs_explicit_server_id(monkeypatch):
+    import socket
+
+    from pydantic import ValidationError
+    from warren.config import WarrenSettings
+
+    monkeypatch.setenv("WARREN_SECRET_KEY", "x" * 32)
+    ebs = dict(runtime_type="ecs", ecs_workspace_storage="ebs")
+    with pytest.raises(ValidationError, match="WARREN_SERVER_ID"):
+        WarrenSettings(**ebs)
+    with pytest.raises(ValidationError, match="WARREN_SERVER_ID"):
+        WarrenSettings(server_id=socket.gethostname(), **ebs)
+    WarrenSettings(server_id="prod-1", **ebs)
+    WarrenSettings()  # podman/efs deployments keep the hostname default
 
 
 async def test_clone_filter_reaches_git_init_only_when_set(tmp_path):

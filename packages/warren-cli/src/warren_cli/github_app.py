@@ -78,7 +78,7 @@ def _sha256(value: str) -> str:
 
 
 def _registration_path(state_root: Path, workspace_id: str) -> Path:
-    if not _WORKSPACE_ID_RE.match(workspace_id):
+    if not _WORKSPACE_ID_RE.fullmatch(workspace_id):
         raise ValueError(f"invalid workspace id {workspace_id!r}")
     return state_root / workspace_id / REGISTRATION_FILE
 
@@ -134,7 +134,7 @@ class _CredentialsHandler(BaseHTTPRequestHandler):
         if url.path == "/healthz":
             self._reply(200, "ok\n")
             return
-        match = re.match(r"^/git-credential/([^/]+)$", url.path)
+        match = re.fullmatch(r"/git-credential/([^/]+)", url.path)
         if match is None:
             self._reply(404, "not found\n")
             return

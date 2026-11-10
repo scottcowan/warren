@@ -107,3 +107,49 @@ async def test_is_public_destination():
     assert not await is_public_destination("https://127.0.0.1/x", public)
     assert not await is_public_destination("https://169.254.169.254/latest", public)
     assert await is_public_destination("https://8.8.8.8/x", fails)
+
+
+@pytest.mark.parametrize(
+    "addr",
+    [
+        "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254", "0.0.0.0", "224.0.0.1",
+        "240.0.0.1", "100.64.0.1", "::1", "::", "fe80::1", "fd00::1", "fc00::1", "ff02::1",
+        "::ffff:127.0.0.1", "::ffff:169.254.169.254", "::ffff:10.0.0.1", "2002:7f00:1::1",
+        "64:ff9b::7f00:1", "64:ff9b:1::1", "2001:0:4136:e378:8000:63bf:3fff:fdd2", "fe80::1%eth0",
+    ],
+)
+def test_is_public_address_rejects(addr):
+    from warren.notify.targets import is_public_address
+
+    assert not is_public_address(addr)
+
+
+@pytest.mark.parametrize("addr", ["93.184.216.34", "8.8.8.8", "2606:2800:220:1:248:1893:25c8:1946", "::ffff:8.8.8.8"])
+def test_is_public_address_accepts(addr):
+    from warren.notify.targets import is_public_address
+
+    assert is_public_address(addr)
+
+
+async def test_resolve_public_destination_once_dedupes_and_ports():
+    from warren.notify.targets import resolve_public_destination
+
+    calls = []
+
+    async def resolver(host, port):
+        calls.append((host, port))
+        return ["8.8.8.8", "8.8.8.8", "2606:2800:220:1:248:1893:25c8:1946"]
+
+    got = await resolve_public_destination("https://h.example.com/x", resolver, allowed_ports=frozenset({443}))
+    assert got == ["8.8.8.8", "2606:2800:220:1:248:1893:25c8:1946"]
+    assert calls == [("h.example.com", 443)]
+    assert await resolve_public_destination("https://h.example.com:8443/x", resolver, allowed_ports=frozenset({443})) is None
+
+
+def test_settings_allowed_ports(monkeypatch):
+    monkeypatch.delenv("WARREN_NOTIFY_ALLOWED_PORTS", raising=False)
+    assert _settings(monkeypatch).notify_allowed_ports_set == frozenset({443})
+    s = _settings(monkeypatch, WARREN_NOTIFY_ALLOWED_PORTS="443, 8443")
+    assert s.notify_allowed_ports_set == frozenset({443, 8443})
+    with pytest.raises(ValidationError):
+        _settings(monkeypatch, WARREN_NOTIFY_ALLOWED_PORTS="abc")

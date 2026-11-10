@@ -43,6 +43,7 @@ class Workspace(BaseModel):
 class WorkspacePort(BaseModel):
     port: int
     description: str = ""
+    protocol: str = "tcp"
 
 
 def _ports_view(raw: object) -> dict[str, WorkspacePort]:
@@ -55,7 +56,12 @@ def _ports_view(raw: object) -> dict[str, WorkspacePort]:
             continue
         port, desc = entry.get("port"), entry.get("description", "")
         if isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535:
-            out[str(name)] = WorkspacePort(port=port, description=desc if isinstance(desc, str) else "")
+            protocol = entry.get("protocol")
+            out[str(name)] = WorkspacePort(
+                port=port,
+                description=desc if isinstance(desc, str) else "",
+                protocol=protocol if protocol in ("tcp", "http") else "tcp",
+            )
     return out
 
 

@@ -22,7 +22,7 @@ class GhError(RuntimeError):
 
 def github_repo(url: str | None) -> str | None:
     """`owner/repo` for a GitHub remote URL, else None."""
-    m = _GITHUB_URL_RE.match(url or "")
+    m = _GITHUB_URL_RE.fullmatch(url or "")
     return f"{m['owner']}/{m['repo']}" if m else None
 
 

@@ -153,11 +153,14 @@ credentials endpoint `169.254.170.2` from the agent. So:
 | T18 | Agent steals the operator's Claude login, or uses it to bypass a template meant to run on Bedrock | The sandbox can't read the Keychain or host `~/.claude`. In subscription mode, warren copies in the access token without the refresh token on each connect, so a stolen copy expires and a sandbox refresh can't rotate the host's token. In Bedrock mode (`model_access: bedrock`, or `CLAUDE_CODE_USE_BEDROCK`/`ANTHROPIC_BEDROCK_BASE_URL` in env), warren reads no Keychain item, deletes any earlier copy, rejects a `CLAUDE_CODE_OAUTH_TOKEN` secret, and only connects with the workspace's own AWS credentials (`export` endpoint locally, task role on ECS) | this PR |
 | T19 | An agent steered by untrusted input (issue, PR comment, dependency, web page) pushes malicious commits, rewrites branches or opens PRs with its `git_write` token | Opt-in per template (`git_write: true`), rejected at provision unless the deployment has a GitHub App issuer. The token covers only the template's writable `git-worktree` github.com repos, with exactly `contents: write` + `pull_requests: write` (never administration, workflows or secrets). 1-hour GitHub lifetime, re-minted 10 minutes before expiry and the old one revoked; revoked (`DELETE /installation/token`) and its file removed on stop/destroy; mint/refresh/revoke audited without the token. Stored 0600 under `/run/warren-git` in the container (never env, URLs, `.git/config` or the volume). **Operators must protect `main`** (and release branches): require pull-request reviews, disallow force-push and deletion, so the agent's pushes land only on its own `warren/...` branches and reach `main` through human review | git/write_tokens.py |
 | T20 | An sshd in a workspace (opt-in `warren-ecs-ssh-base` / `warren-docker-ssh-base`, for editor remoting) becomes a network entry point, a way past ECS Exec's IAM check, or a root foothold | sshd listens on the task's `127.0.0.1:2222` only (no port mapping, inbound rule or load balancer); the only path to it is an SSM port-forward to the task, which needs `ssm:StartSession` on that task, the permission ECS Exec already needs (and that already gives a root shell), so it admits no one ECS Exec doesn't. sshd runs as uid 1000, started after the entrypoint's privilege drop, so a compromise of it yields the workload's own privileges. Public keys only (`AuthenticationMethods publickey`, no password/keyboard-interactive/PAM/host-based/GSSAPI), `AllowUsers warren`, `PermitRootLogin no`, local TCP forwarding only (no remote/Unix-socket/tun forwarding), no X11 or agent forwarding unless a derived image opts in. No host key in the image: one per workspace, generated on its volume. Authorized keys come from the owner's own secret (or the template's plain env), never RunTask overrides. Asserted with `sshd -T` and live logins by the image smoke test ([workspace-ssh.md](workspace-ssh.md)). The podman counterpart, opt-in `warren-docker-ssh-base`, carries the same sshd hardening and adds no server path: the server publishes its port 22 on the host's loopback only with `WARREN_SSH_ACCESS_ENABLED=true`, the key is the owner-gated `POST /workspaces/{id}/connect` mint (one per workspace, emptied on stop/destroy), and `warren ssh-config` keeps that private key client-side in `~/.warren/ssh/` (owner-only, replaced and invalidated by the next mint). Its sshd runs as container root (two login users), with root logins refused; container root is the agent's own identity there, so this grants nothing new | this PR |
-| T21 | A browser session token is stolen (XSS, local process, proxy state) and used with full API power | Web-session tokens are a distinct scope with an allow-list that excludes exec, connect, git credentials, token minting and admin; short TTL with hard cap; revoke on disable. Tokens never reach page JS (proxy holds them) | design, not yet built |
-| T22 | Cross-site request forges a state-changing call through the proxy | Server stays bearer-only (no cookie auth); proxy cookie is HttpOnly SameSite=Strict with Host/Origin checks; `X-Warren-Client` header on web mutations; no CORS | design, proxy branch `feat-proxy-hardening` |
-| T23 | Agent-controlled text (transcripts, run results, git errors, ref names, template text) executes script or spoofs UI in the SPA | Text-only rendering, ANSI allow-list, no auto-linking, strict CSP (no inline script, no eval, `frame-ancestors 'none'`, Trusted Types) | design, not yet built |
-| T24 | Admin session turns into impersonation of every owner | Admin routes denied to web scope; audit events for admin mint, disable and revoke; decision on `/runs` admin bypass | design, not yet built |
+| T21 | A workspace secret named like a process or credential-endpoint variable (`LD_PRELOAD`, `PATH`, `BASH_ENV`, `ENV`, `GIT_*`, `AWS_CONTAINER_CREDENTIALS_FULL_URI`, `AWS_ENDPOINT_URL_KMS`, `WARREN_*`) is exported by the root entrypoint, giving code execution in the task or redirecting the decrypt helper | One shared reserved-name denylist (`secrets/names.py`) enforced by the entrypoint/loaders and as a 422 on `PUT /secrets` | #85 |
+| T22 | EBS volumes, snapshots and bare seeds are tagged and swept by `warren.server_instance`; a hostname-default `server_id` orphans them on redeploy and lets two servers sweep each other's resources | `WARREN_SERVER_ID` must be set explicitly (and differ from the hostname) when EBS storage or bare seeds are enabled; settings validation fails at startup naming the fix | round 2 |
+| T24 | A browser session token is stolen (XSS, local process, proxy state) and used with full API power | Web-session tokens are a distinct scope with an allow-list that excludes exec, connect, git credentials, token minting and admin; short TTL with hard cap; revoke on disable. Tokens never reach page JS (proxy holds them) | design, not yet built |
+| T25 | Cross-site request forges a state-changing call through the proxy | Server stays bearer-only (no cookie auth); proxy cookie is HttpOnly SameSite=Strict with Host/Origin checks; `X-Warren-Client` header on web mutations; no CORS | design, proxy branch `feat-proxy-hardening` |
+| T26 | Agent-controlled text (transcripts, run results, git errors, ref names, template text) executes script or spoofs UI in the SPA | Text-only rendering, ANSI allow-list, no auto-linking, strict CSP (no inline script, no eval, `frame-ancestors 'none'`, Trusted Types) | design, not yet built |
+| T27 | Admin session turns into impersonation of every owner | Admin routes denied to web scope; audit events for admin mint, disable and revoke; decision on `/runs` admin bypass | design, not yet built |
 | T16 | Data exfiltration over the network | **Observed, not blocked.** Podman egress byte counters feed the idle reaper only (D-05). Fail-closed egress (NET-01) is future work; see residual risks | — |
+| T23 | Owner-registered notification webhook points the control plane at internal services (SSRF), including by DNS rebinding | HTTPS-only URL shape with no credentials. Per delivery the host is resolved **once** and every returned address must be globally routable (loopback, private, link-local incl. `169.254.169.254`, multicast, reserved, ULA and the IPv4-mapped/6to4/NAT64/Teredo forms are refused). The destination is now **pinned**: the POST connects to one of those validated IPs while the `Host` header, TLS SNI and certificate verification stay on the original host name, so a second DNS answer can't redirect it. Redirects are off, no connection is reused across host names, owner URLs are limited to `WARREN_NOTIFY_ALLOWED_PORTS` (default `443`), and the URL is never logged. The operator's server-wide URL is trusted and not restricted | notify/targets.py, notify/dispatcher.py |
 
 ## Known residual risks
 
@@ -215,13 +218,26 @@ credentials endpoint `169.254.170.2` from the agent. So:
 11. **Images built FROM a bumped base by digest** (`warren-agent-base`,
     `warren-ecs-agent-base`, `warren-docker-ssh-base`, and `warren-ecs-ssh-base` once its dev-base pin is a digest) lag a harness bump until the base is republished and the digest
     updated.
-12. **`warren proxy` listeners have no authentication of their own.** They bind loopback
-    only, and refuse anything else, but any process or other user on the operator's
-    machine that can connect to `127.0.0.1:<port>` reaches that workspace port over the
-    operator's SSM session or SSH forward. On a podman/docker server host, any local
-    process or user can likewise reach a workspace's published template ports on
-    `127.0.0.1`. Whatever the app on that port enforces (for example T3 Code's
-    pairing) is the only remaining check. Don't run the proxy on a shared host.
+12. **`warren proxy` listeners.** Mappings of kind `tcp` (the default) are still a loopback byte
+    relay with no authentication of their own: any process or user on the operator's machine that
+    can connect to `127.0.0.1:<port>` reaches that workspace port over the operator's SSM session
+    or SSH forward, and a DNS-rebinding page can reach a web app on it. On a podman/docker server
+    host, any local process or user can likewise reach a workspace's published template ports on
+    `127.0.0.1`. Whatever the service enforces (for example T3 Code's pairing) is the only check;
+    don't run the proxy on a shared host. Mitigated for `kind: http` mappings (template
+    `protocol: http`): exact loopback `Host` check (DNS rebinding), a one-time start link exchanged
+    for an `HttpOnly`, `SameSite=Strict` session cookie held server-side with an idle expiry (other
+    local processes and pages), same-origin enforcement with no CORS (cross-site requests and
+    WebSockets), strict request parsing (smuggling) and size, time and connection limits. Residual
+    for `http`: a process running as the operator can read the terminal or the browser's cookies;
+    cookies are shared across ports of `127.0.0.1`; no TLS on loopback. `tcp` mappings now also
+    refuse ports held by another process (and `proxy run` fails if a port cannot be bound), write
+    `proxy.json` owner-only without following symlinks, and halt if their workspace id changes.
+    `--unix` mappings listen on a 0600 socket in a 0700 directory instead of a TCP port, with a
+    peer-uid check per connection, so other local users and DNS-rebinding pages cannot reach them;
+    residual: any process running as the operator can still connect (file permissions are the only
+    authentication, so an `http` mapping on a socket issues no start link or cookie), and
+    sockets are not available on Windows.
 13. **`git_write` tokens are live inside the workspace.** Until revoked on stop or
     superseded (at most an hour), the agent can push to and open PRs on every repo the
     token covers, and can send the token anywhere (open egress). Only branch protection
@@ -236,7 +252,18 @@ credentials endpoint `169.254.170.2` from the agent. So:
     (off by default) or type credentials into a workspace you don't trust. The ssh
     client is set to publickey only (`warren ssh-config`), so an impostor sshd can't
     prompt for a password. On EBS the host key is in the volume's snapshots.
-
-15. **Admin can mint a token for any user.** `POST /admin/users/{id}/tokens` is by design an impersonation primitive and is not yet audited as an event. Treat the admin token as equivalent to every owner's.
-16. **Unscoped legacy user tokens remain full API.** Until the web-session scope ships, any token the CLI holds can exec and mint further tokens; a UI must not be exposed before it does.
-17. **Rendering agent output in a browser is a new injection surface.** Even with text-only rendering and strict CSP, a bug in the ANSI or link handling is reachable by anything the agent can print.
+15. **The shared workspace task role can decrypt any envelope whose ciphertext it holds.**
+    ECS secrets travel as KMS envelopes that the workspace task role can open (it must, to
+    read its own), and that role is shared across workspaces. Envelope ciphertext appears
+    in ECS `RunTask` overrides and in CloudTrail `ExecuteCommand` records, so anyone who
+    can read it and act as the task role (including an agent that obtains the role's
+    credentials, risk 3) can open it. Treat that ciphertext as sensitive: limit
+    `ecs:DescribeTasks` and CloudTrail read access (and the log destinations they feed) to
+    people who may already read the secrets.
+16. **Write tokens are readable by the agent for their lifetime.** A write-access GitHub
+    token file is readable by the workload (uid 1000) while the token is live, at most one
+    hour (T19). Revocation on stop/destroy is best effort: if the revoke call fails or the
+    server is down, the token stays valid until it expires.
+17. **Admin can mint a token for any user.** `POST /admin/users/{id}/tokens` is by design an impersonation primitive and is not yet audited as an event. Treat the admin token as equivalent to every owner's.
+18. **Unscoped legacy user tokens remain full API.** Until the web-session scope ships, any token the CLI holds can exec and mint further tokens; a UI must not be exposed before it does.
+19. **Rendering agent output in a browser is a new injection surface.** Even with text-only rendering and strict CSP, a bug in the ANSI or link handling is reachable by anything the agent can print.

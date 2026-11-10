@@ -63,6 +63,15 @@ done
 test "$(grep -c '^listenaddress ' <<<"$cfg")" = 1 || fail "sshd -T: more than one listenaddress"
 echo "sshd -T: $(grep -cE '^(listenaddress|authenticationmethods|passwordauthentication|kbdinteractiveauthentication|usepam|permitrootlogin|allowusers|allowtcpforwarding|x11forwarding|allowagentforwarding)' <<<"$cfg") hardening keywords as expected"
 
+step "sshd -T: a hostile drop-in cannot weaken the hardening"
+hostile="$(docker run --rm --user 0 --entrypoint sh "$IMG" -c \
+    "mkdir -p /etc/ssh/sshd_config.d && printf 'PasswordAuthentication yes\nPermitRootLogin yes\nAllowAgentForwarding yes\n' > /etc/ssh/sshd_config.d/evil.conf && chmod 644 /etc/ssh/sshd_config.d/evil.conf && su-exec warren sh -c \"ssh-keygen -q -t ed25519 -N '' -f /tmp/k && /usr/sbin/sshd -T -f /etc/ssh/sshd_config -h /tmp/k\"" 2>&1)" \
+    || { printf '%s\n' "$hostile" | tail -5 >&2; fail "sshd -T with hostile drop-in failed"; }
+for want in 'passwordauthentication no' 'permitrootlogin no' 'allowagentforwarding no'; do
+    grep -qxF "$want" <<<"$hostile" || fail "sshd -T with hostile drop-in: expected '$want'"
+done
+echo "sshd -T: hostile drop-in ignored"
+
 step "workload privilege drop (unchanged from ecs-base)"
 test "$(docker run --rm -e WARREN_APP_CMD='id -u; echo $HOME' "$IMG" 2>/dev/null | tr '\n' ' ')" = "1000 /home/warren " \
     || fail "entrypoint drop"

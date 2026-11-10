@@ -106,6 +106,35 @@ Surprising, read from code:
 
 Verified by reading: all of the above. Run: nothing.
 
+### Status against merged work
+
+Re-checked against `main` after PRs #90, #91, #94, #96, #97 and #98. Findings above keep their original wording; this
+section records what has changed since.
+
+Fixed or mitigated by merged PRs:
+
+| Item | PR | Effect |
+|---|---|---|
+| Notification webhook SSRF and DNS rebinding | #90 | Destination pinned to the validated IP; anchored name and id regexes (threat model T23). |
+| Proxy hardening | #91 | `warren proxy` gains a hardened `http` mapping kind and tcp hardening, including unix-socket listeners. This is the base the browser proxy in section 4 builds on; the cookie, Host/Origin and `X-Warren-Client` controls of 4.4 are still to be built on top of it. |
+| EBS ownership re-checks; runs 404 | #94 | EBS volume, snapshot and seed tags are re-verified before every delete or restore. `/runs` now returns 404 (not 403) for another owner's run, narrowing F4/F9 for non-admins. The admin read bypass remains, audited per read as `run.read` with `outcome="admin"`; open decision 1 still stands. |
+| Secret-name denylist, stable `server_id` | #96 | Secret names that would shadow process or credential-endpoint variables are refused (T21); `server_id` is stable so EBS sweeps do not orphan resources (T22). |
+| Bounded lists and streams | #97 | F6 partly fixed: `GET /workspaces` is paged (`limit` default 100, max 500, `cursor`, `X-Next-Cursor`) with an owner-filtered store query, and `/events` ends after 1 hour or 10000 lines. Server change 5 is done for `/workspaces` only. |
+| SSH key names, ECS id validation, atomic state migration | #98 | CLI-side validation; no web-UI finding depended on these, listed for completeness. |
+
+Still open:
+
+| Area | Findings and server changes |
+|---|---|
+| Token scopes and lineage | F1, F2; server changes 1, 2, 4 (scope column, `wrnu_` prefix, allow-list, web-session endpoints, parent/child lineage and revoke-on-parent) |
+| Workspace-token caps and proof body hash | Caps on workspace-scoped tokens and a request-body hash in the signed proof, so a captured proof cannot be replayed with a different body (follow-on to F1) |
+| Audit events | F2, F3, F14; server change 3 (web sessions, `/tokens`, `/admin/*`, projects, ensure_running, git pull, branch) |
+| Admin minting guard | F3; residual risk 17: `POST /admin/users/{id}/tokens` is still an unaudited impersonation primitive |
+| Bootstrap revocation | Revoking the bootstrap/admin token and its descendants; not yet implemented |
+| Rate limiting and error bodies | F5, F11, F13; server changes 6 and 13. In progress in draft PR #92, not merged |
+| Remaining pagination | F6 for `/secrets`, `/projects`, `/tokens`; per-user cap on concurrent `/events` streams |
+| Unchanged | F7, F8, F9 (foreign-id 404 on all sub-routes), F10, F12, F15; server changes 7 to 12, 14, 15 |
+
 ## 4. Browser session design
 
 ### 4.1 Creation (recommended)
@@ -228,20 +257,20 @@ Route-classification fixture: `packages/warren-server/tests/fixtures/route_inven
 
 ## 6. Threat model additions
 
-Drafted here and added to `docs/threat-model.md` as T21 to T24 and residual risks 15 to 17.
+Drafted here and added to `docs/threat-model.md` as T24 to T27 and residual risks 17 to 19 (T21 to T23 and residual risks 15 and 16 were taken by merged PRs #90 and #96 and the ECS KMS work).
 
 | # | Threat | Control | Where |
 |---|---|---|---|
-| T21 | A browser session token is stolen (XSS, local process, proxy state) and used with full API power | Web-session tokens are a distinct scope with an allow-list that excludes exec, connect, git credentials, token minting and admin; short TTL with hard cap; revoke on disable. Tokens never reach page JS (proxy holds them) | design, not yet built |
-| T22 | Cross-site request forges a state-changing call through the proxy | Server stays bearer-only (no cookie auth); proxy cookie is HttpOnly SameSite=Strict with Host/Origin checks; `X-Warren-Client` header on web mutations; no CORS | design, proxy branch `feat-proxy-hardening` |
-| T23 | Agent-controlled text (transcripts, run results, git errors, ref names, template text) executes script or spoofs UI in the SPA | Text-only rendering, ANSI allow-list, no auto-linking, strict CSP (no inline script, no eval, `frame-ancestors 'none'`, Trusted Types) | design, not yet built |
-| T24 | Admin session turns into impersonation of every owner | Admin routes denied to web scope; audit events for admin mint, disable and revoke; decision on `/runs` admin bypass | design, not yet built |
+| T24 | A browser session token is stolen (XSS, local process, proxy state) and used with full API power | Web-session tokens are a distinct scope with an allow-list that excludes exec, connect, git credentials, token minting and admin; short TTL with hard cap; revoke on disable. Tokens never reach page JS (proxy holds them) | design, not yet built |
+| T25 | Cross-site request forges a state-changing call through the proxy | Server stays bearer-only (no cookie auth); proxy cookie is HttpOnly SameSite=Strict with Host/Origin checks; `X-Warren-Client` header on web mutations; no CORS | design, proxy branch `feat-proxy-hardening` |
+| T26 | Agent-controlled text (transcripts, run results, git errors, ref names, template text) executes script or spoofs UI in the SPA | Text-only rendering, ANSI allow-list, no auto-linking, strict CSP (no inline script, no eval, `frame-ancestors 'none'`, Trusted Types) | design, not yet built |
+| T27 | Admin session turns into impersonation of every owner | Admin routes denied to web scope; audit events for admin mint, disable and revoke; decision on `/runs` admin bypass | design, not yet built |
 
-Residual risks to append:
+Residual risks appended (numbered 17 to 19 in `docs/threat-model.md`):
 
-15. **Admin can mint a token for any user.** `POST /admin/users/{id}/tokens` is by design an impersonation primitive and is not yet audited as an event. Treat the admin token as equivalent to every owner's.
-16. **Unscoped legacy user tokens remain full API.** Until the web-session scope ships, any token the CLI holds can exec and mint further tokens; a UI must not be exposed before it does.
-17. **Rendering agent output in a browser is a new injection surface.** Even with text-only rendering and strict CSP, a bug in the ANSI or link handling is reachable by anything the agent can print.
+17. **Admin can mint a token for any user.** `POST /admin/users/{id}/tokens` is by design an impersonation primitive and is not yet audited as an event. Treat the admin token as equivalent to every owner's.
+18. **Unscoped legacy user tokens remain full API.** Until the web-session scope ships, any token the CLI holds can exec and mint further tokens; a UI must not be exposed before it does.
+19. **Rendering agent output in a browser is a new injection surface.** Even with text-only rendering and strict CSP, a bug in the ANSI or link handling is reachable by anything the agent can print.
 
 ## 7. Open decisions for the owner
 

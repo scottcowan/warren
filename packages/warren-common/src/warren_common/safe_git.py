@@ -388,7 +388,7 @@ def _object_subdirs(objects_fd: int) -> list[str]:
             if entry.is_symlink():
                 raise SafeGitError(f"objects dir contains a symlink: {entry.name}")
             if entry.is_dir(follow_symlinks=False) and (
-                entry.name == "pack" or _LOOSE_DIR.match(entry.name)
+                entry.name == "pack" or _LOOSE_DIR.fullmatch(entry.name)
             ):
                 names.append(entry.name)
     return names
@@ -515,7 +515,7 @@ def _publish_objects(src: Path, objects_fd: int, linked: set[str]) -> None:
     """Copy objects git created in `src` back into the repo through `objects_fd`."""
     new = []
     for sub in os.listdir(src):
-        if sub != "pack" and not _LOOSE_DIR.match(sub):
+        if sub != "pack" and not _LOOSE_DIR.fullmatch(sub):
             continue
         for name in os.listdir(src / sub):
             rel = os.path.join(sub, name)

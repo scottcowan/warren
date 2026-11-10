@@ -117,7 +117,7 @@ class GitPullError(ProvisionError):
 
 
 def _validate_workspace_id(workspace_id: str) -> None:
-    if not workspace_id or not _SAFE_WORKSPACE_ID.match(workspace_id):
+    if not workspace_id or not _SAFE_WORKSPACE_ID.fullmatch(workspace_id):
         raise GitError(f"unsafe workspace_id: {_sanitize(workspace_id)!r}")
 
 
@@ -129,7 +129,7 @@ _SAFE_FOLDER_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def _validate_folder_name(name: str) -> None:
-    if not name or name in (".", "..") or not _SAFE_FOLDER_NAME.match(name):
+    if not name or name in (".", "..") or not _SAFE_FOLDER_NAME.fullmatch(name):
         raise GitError(f"unsafe folder name: {_sanitize(name)!r}")
 
 

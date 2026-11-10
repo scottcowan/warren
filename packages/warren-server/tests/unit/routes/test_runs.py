@@ -71,9 +71,12 @@ def test_owner_reads_status_and_result(authz):
 
 def test_other_users_are_denied(authz):
     client, _, _ = authz
-    assert _get(client, "/runs/run-a", "bob").status_code == 403
-    assert _get(client, "/runs/run-a/result", "bob").status_code == 403
-    assert _get(client, "/runs/nope", "bob").status_code == 404
+    # Another owner's run is indistinguishable from a missing one (no existence oracle).
+    other = _get(client, "/runs/run-a", "bob")
+    missing = _get(client, "/runs/nope", "bob")
+    assert other.status_code == missing.status_code == 404
+    assert other.json() == missing.json()
+    assert _get(client, "/runs/run-a/result", "bob").status_code == 404
     assert _get(client, "/runs/run-a", "").status_code == 401
 
 

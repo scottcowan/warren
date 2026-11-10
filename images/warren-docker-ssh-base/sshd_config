@@ -11,10 +11,9 @@
 #     (routes/workspaces.py _SSH_LOGIN_USER / _SSH_BREAK_GLASS_USER);
 #   - sshd runs as the container's root (it serves two users). PermitRootLogin stays no.
 #
-# Drop-ins come first so that a derived image can override a setting: for most
-# keywords sshd uses the first value it reads. To allow agent forwarding, add
-# /etc/ssh/sshd_config.d/agent-forwarding.conf containing `AllowAgentForwarding yes`.
-Include /etc/ssh/sshd_config.d/*.conf
+# The drop-in Include is deliberately LAST: for most keywords sshd uses the first value
+# it reads, so a drop-in can add settings but never weaken the hardening below. To change
+# a hardened setting (e.g. agent forwarding), a derived image must edit this file itself.
 
 Port 22
 AddressFamily inet
@@ -62,3 +61,6 @@ Banner none
 LogLevel INFO
 
 Subsystem sftp internal-sftp
+
+# Last on purpose (see the top of this file).
+Include /etc/ssh/sshd_config.d/*.conf

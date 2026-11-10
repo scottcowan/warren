@@ -345,7 +345,7 @@ class Supervisor:
             self.set_state(IDLE, event)
 
     def remember_session(self, sid: Any) -> None:
-        if isinstance(sid, str) and _ID.match(sid) and sid != self.session_id:
+        if isinstance(sid, str) and _ID.fullmatch(sid) and sid != self.session_id:
             self.session_id = sid
             self._put(SESSION_FILE, {"harness": self.harness, "session_id": sid, "ts": _now()})
             self.record("agent.session", session_id=sid)
@@ -367,7 +367,7 @@ class Supervisor:
                     raw = str(json.loads(raw).get("session_id", ""))
                 except (ValueError, AttributeError):
                     continue
-            if _ID.match(raw) and mtime > best_mtime:
+            if _ID.fullmatch(raw) and mtime > best_mtime:
                 best, best_mtime = raw, mtime
         return best
 

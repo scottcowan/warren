@@ -37,6 +37,7 @@ import uuid
 from typing import Iterator, Mapping
 
 import structlog
+from warren.secrets.names import denied_message, is_deliverable
 from warren_common.errors import ProvisionError
 
 log = structlog.get_logger(__name__)
@@ -52,7 +53,7 @@ _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEX
 
 
 def is_env_name(name: str) -> bool:
-    return bool(_ENV_NAME.match(name))
+    return bool(_ENV_NAME.fullmatch(name))
 
 
 def encode(secrets: Mapping[str, str]) -> bytes:
@@ -61,6 +62,8 @@ def encode(secrets: Mapping[str, str]) -> bytes:
     for name in sorted(secrets):
         if not is_env_name(name):
             raise ValueError(f"secret name {name!r} is not an environment variable name")
+        if not is_deliverable(name):
+            raise ValueError(denied_message(name))
         value = base64.b64encode(secrets[name].encode("utf-8")).decode("ascii")
         lines.append(f"{name}={value}\n")
     return "".join(lines).encode("ascii")
@@ -89,7 +92,7 @@ def _open_dir(name: str, dir_fd: int | None, *, create: bool, mode: int) -> int:
 
 @contextlib.contextmanager
 def _workspace_dir(local_mount: str, workspace_id: str, *, create: bool) -> Iterator[int]:
-    if not _WORKSPACE_ID.match(workspace_id):
+    if not _WORKSPACE_ID.fullmatch(workspace_id):
         raise ProvisionError(f"invalid workspace id {workspace_id!r}")
     fds: list[int] = []
     try:

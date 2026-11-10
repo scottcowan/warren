@@ -13,7 +13,7 @@ import structlog
 import typer
 
 from .. import proxy as core
-from .. import ui
+from .. import proxy_unix, ui
 from ..config import WarrenCLIConfig
 
 proxy_app = typer.Typer(
@@ -74,10 +74,10 @@ def _pick_ecs_server(cfg: WarrenCLIConfig, server: Optional[str]) -> str:
     raise typer.Exit(1)
 
 
-def _declared_ports(cfg: WarrenCLIConfig, server: str, workspace: str) -> dict[str, int]:
-    """The workspace's template `ports` ({name: port}), read from the control plane."""
+def _declared_ports(cfg: WarrenCLIConfig, server: str, workspace: str) -> tuple[dict[str, int], dict[str, str]]:
+    """The workspace's template `ports` ({name: port}) and their protocols, read from the control plane."""
     ws = core.match_workspace(asyncio.run(core.fetch_workspaces(cfg, server)), workspace)
-    return core.declared_ports(ws)
+    return core.declared_ports(ws), core.declared_protocols(ws)
 
 
 @proxy_app.command("add")
@@ -91,6 +91,22 @@ def proxy_add(
     ),
     local_port: Optional[int] = typer.Option(
         None, "--local-port", help="Local port to use (default: the first free one from [proxy] port_base)"
+    ),
+    kind: Optional[str] = typer.Option(
+        None,
+        "--kind",
+        help="tcp: plain byte relay (default; ssh, T3, ACP). http: HTTP-aware gateway for web UIs "
+        "(Host/Origin checks, session cookie). With --from-template or a port name, defaults to the "
+        "template port's `protocol`.",
+    ),
+    unix: bool = typer.Option(
+        False,
+        "--unix",
+        help="Listen on a 0600 Unix socket instead of a loopback TCP port (curl --unix-socket, "
+        "ssh ProxyCommand `nc -U`; browsers cannot use it). Not on Windows.",
+    ),
+    socket: Optional[str] = typer.Option(
+        None, "--socket", help="With --unix: absolute socket path (default: ~/.warren/run/<server>-<workspace>-<name>.sock)"
     ),
     server: Optional[str] = typer.Option(
         None, "--server", help="Remote profile (default: [defaults] server, else the only ecs/ssh/local one)"
@@ -115,16 +131,32 @@ def proxy_add(
     if from_template and local_port is not None:
         ui.error("--local-port maps one port; it can't be combined with --from-template")
         raise typer.Exit(2)
+    if kind is not None and kind not in core.KINDS:
+        ui.error(f"--kind must be one of: {', '.join(core.KINDS)}")
+        raise typer.Exit(2)
+    if socket is not None and not unix:
+        ui.error("--socket needs --unix")
+        raise typer.Exit(2)
+    if unix and local_port is not None:
+        ui.error("--local-port is for TCP listeners; a --unix mapping has none")
+        raise typer.Exit(2)
+    if unix and from_template and socket is not None:
+        ui.error("--socket names one socket; it can't be combined with --from-template")
+        raise typer.Exit(2)
+    if unix and not proxy_unix.supported():
+        ui.error("--unix is not supported on this platform (Windows has no usable Unix sockets here); use a TCP mapping")
+        raise typer.Exit(2)
     cfg = _load_cfg(config)
     server = _pick_server(cfg, server)
     store = core.MappingStore()
     wanted: list[tuple[int, Optional[str]]]
+    protocols: dict[str, str] = {}
     try:
         core.remote_for(cfg, server)
         if remote_port is not None and remote_port.isdigit():
             wanted = [(int(remote_port), None)]
         else:
-            declared = _declared_ports(cfg, server, workspace)
+            declared, protocols = _declared_ports(cfg, server, workspace)
             if from_template:
                 if not declared:
                     raise core.ProxyError(
@@ -140,7 +172,8 @@ def proxy_add(
                     f"workspace {workspace!r} declares no port named {remote_port!r} (declared: {known})"
                 )
         results = [
-            store.add(server, workspace, port, local_port=local_port, name=name, port_base=cfg.proxy.port_base)
+            store.add(server, workspace, port, local_port=local_port, name=name, kind=kind or protocols.get(name or ""),
+                      listen="unix" if unix else None, socket_path=socket, port_base=cfg.proxy.port_base)
             for port, name in wanted
         ]
     except core.ProxyError as exc:
@@ -149,6 +182,11 @@ def proxy_add(
     for mapping, created in results:
         verb = "added" if created else "already mapped"
         typer.echo(f"{mapping.label} {verb}: {mapping.address}")
+        if mapping.listen == "unix" and mapping.kind == "http":
+            typer.echo(
+                f"  no start link: the socket's 0600 permissions authenticate. Try:\n"
+                f"  curl --unix-socket {mapping.resolved_socket_path} http://localhost/"
+            )
     if any(created for _, created in results):
         typer.echo("Serve it with `warren proxy run` (picks up new mappings while running).", err=True)
 
@@ -167,7 +205,7 @@ def proxy_list(output_json: bool = typer.Option(False, "--json", help="Print JSO
     if not mappings:
         typer.echo("no mappings — add one with `warren proxy add <workspace> <port>`")
         return
-    for m in sorted(mappings, key=lambda m: m.local_port):
+    for m in sorted(mappings, key=lambda m: (m.listen, m.local_port, m.label)):
         suffix = f" (port {m.remote_port})" if m.name else ""
         typer.echo(f"{m.address:<24} -> {m.label}{suffix}")
 
@@ -190,6 +228,13 @@ def proxy_rm(
         raise typer.Exit(1)
     for m in removed:
         typer.echo(f"removed {m.label} ({m.address})")
+        if m.listen == "unix":
+            try:
+                path = m.resolved_socket_path
+            except OSError:
+                path = None
+            if path:
+                proxy_unix.unlink_owned_socket(path)
 
 
 @proxy_app.command("run")
@@ -229,6 +274,8 @@ def proxy_run(
         raise typer.Exit(1) from exc
     daemon = core.ProxyDaemon(store, core.ControlPlaneResolver(cfg), core.RuntimeForwarder(), settings)
 
+    failed: list[bool] = []
+
     async def _main() -> None:
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
@@ -239,8 +286,13 @@ def proxy_run(
                 pass
 
         def _started() -> None:
-            if not daemon.proxies:
-                ui.error("could not listen on any mapping's port (see the log above)")
+            if daemon.failed:
+                # A mapped port we could not bind may be held by another process: fail loudly
+                # rather than serve some mappings while a client talks to a squatter.
+                for m, why in daemon.failed.items():
+                    where = m.address if m.listen == "unix" else f"127.0.0.1:{m.local_port}"
+                    ui.error(f"could not listen on {where} for {m.label}: {why}")
+                failed.append(True)
                 stop.set()
 
         await daemon.run(stop, started=_started)
@@ -249,6 +301,8 @@ def proxy_run(
         asyncio.run(_main())
     except KeyboardInterrupt:
         pass
+    if failed:
+        raise typer.Exit(1)
 
 
 @proxy_app.command("stdio")

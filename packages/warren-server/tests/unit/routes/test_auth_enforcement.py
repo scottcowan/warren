@@ -159,7 +159,7 @@ def test_workspaces_bogus_token_returns_401(env_defaults):
 
 def test_workspaces_bootstrap_token_not_401(env_defaults, auth_headers):
     fake_registry = _make_fake_registry()
-    fake_registry.store.list_all = AsyncMock(return_value=[])
+    fake_registry.store.list_all = AsyncMock(return_value=[]); fake_registry.store.list_for_owner = AsyncMock(return_value=[])
     with _lifespan_patches(fake_registry):
         with TestClient(app, headers=auth_headers) as client:
             app.state.registry = fake_registry
@@ -169,7 +169,7 @@ def test_workspaces_bootstrap_token_not_401(env_defaults, auth_headers):
 
 def test_admin_mint_then_new_token_authorizes_workspaces(env_defaults, auth_headers):
     fake_registry = _make_fake_registry()
-    fake_registry.store.list_all = AsyncMock(return_value=[])
+    fake_registry.store.list_all = AsyncMock(return_value=[]); fake_registry.store.list_for_owner = AsyncMock(return_value=[])
     with _lifespan_patches(fake_registry):
         with TestClient(app, headers=auth_headers) as client:
             app.state.registry = fake_registry
@@ -190,7 +190,7 @@ def test_admin_mint_then_new_token_authorizes_workspaces(env_defaults, auth_head
 
 def test_revoked_token_401s_while_admin_token_still_works(env_defaults, auth_headers):
     fake_registry = _make_fake_registry()
-    fake_registry.store.list_all = AsyncMock(return_value=[])
+    fake_registry.store.list_all = AsyncMock(return_value=[]); fake_registry.store.list_for_owner = AsyncMock(return_value=[])
     with _lifespan_patches(fake_registry):
         with TestClient(app, headers=auth_headers) as client:
             app.state.registry = fake_registry
@@ -238,7 +238,7 @@ def test_admin_mint_records_created_by_token_id(env_defaults, auth_headers):
 
 def test_disabled_user_token_401s_immediately(env_defaults, auth_headers):
     fake_registry = _make_fake_registry()
-    fake_registry.store.list_all = AsyncMock(return_value=[])
+    fake_registry.store.list_all = AsyncMock(return_value=[]); fake_registry.store.list_for_owner = AsyncMock(return_value=[])
     with _lifespan_patches(fake_registry):
         with TestClient(app, headers=auth_headers) as client:
             app.state.registry = fake_registry

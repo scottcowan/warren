@@ -60,7 +60,7 @@ def test_host_block_proxies_over_ssm_and_pins_the_host_key_alias():
     assert "\nHost warren-abc12345\n" in block
     d = _directives(block)
     assert d["ProxyCommand"] == f"/opt/bin/warren proxy stdio --server prodecs {_WS} 2222"
-    assert d["HostKeyAlias"] == f"warren-prodecs-{_WS}"
+    assert d["HostKeyAlias"] == f"warren-prodecs+{_WS}"
     assert d["User"] == "warren"
     assert d["Port"] == "2222"
     assert d["StrictHostKeyChecking"] == "accept-new"
@@ -117,7 +117,7 @@ def test_ssh_config_cli_no_resolve(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     d = _directives(result.stdout)
     assert d["ProxyCommand"] == f"/opt/bin/warren proxy stdio --config {cfg.resolve()} --server prodecs {_WS} 2222"
-    assert d["HostKeyAlias"] == f"warren-prodecs-{_WS}"
+    assert d["HostKeyAlias"] == f"warren-prodecs+{_WS}"
 
 
 def test_ssh_config_cli_resolves_a_prefix_to_the_full_id(tmp_path, monkeypatch):
@@ -130,7 +130,7 @@ def test_ssh_config_cli_resolves_a_prefix_to_the_full_id(tmp_path, monkeypatch):
         result = runner.invoke(app, ["ssh-config", "abc1", "--server", "prodecs", "--config", str(_config(tmp_path))])
     assert result.exit_code == 0, result.output
     # A stopped workspace still gets a block: the ProxyCommand resolves the task at connect time.
-    assert _directives(result.stdout)["HostKeyAlias"] == f"warren-prodecs-{_WS}"
+    assert _directives(result.stdout)["HostKeyAlias"] == f"warren-prodecs+{_WS}"
 
 
 def test_ssh_config_needs_server_when_several_remotes(tmp_path):
@@ -172,7 +172,7 @@ def test_podman_block_jumps_through_the_ssh_remotes_host():
     assert d["HostName"] == "127.0.0.1" and d["Port"] == "30007"
     assert d["ProxyJump"] == "node2"
     assert d["User"] == "warren-shell"  # the shell user, not the ForceCommand one
-    assert d["HostKeyAlias"] == f"warren-homelab-{_WS}"
+    assert d["HostKeyAlias"] == f"warren-homelab+{_WS}"
     assert d["IdentityFile"] == "/k/id" and d["IdentitiesOnly"] == "yes"
     assert d["PasswordAuthentication"] == "no"
 
@@ -236,12 +236,12 @@ def test_ssh_config_cli_podman_mints_saves_and_prints(tmp_path, monkeypatch):
         result = runner.invoke(app, ["ssh-config", "abc1", "--server", "homelab", "--config", str(_config(tmp_path))])
     assert result.exit_code == 0, result.output
     assert connect.called
-    key = Path.home() / ".warren" / "ssh" / f"homelab-{_WS}"
+    key = Path.home() / ".warren" / "ssh" / f"homelab+{_WS}"
     assert key.read_text() == _CONN["private_key"]
     d = _directives(result.stdout)
     assert d["IdentityFile"] == str(key)
     assert d["ProxyJump"] == "node2"
-    assert d["HostKeyAlias"] == f"warren-homelab-{_WS}"
+    assert d["HostKeyAlias"] == f"warren-homelab+{_WS}"
     # stdout is only the block (it gets appended to ~/.ssh/config); the note goes to stderr.
     assert "BEGIN OPENSSH" not in result.stdout
     assert result.stdout.lstrip().startswith("# warren workspace")
@@ -257,7 +257,7 @@ def test_ssh_config_cli_podman_not_owner(tmp_path, monkeypatch):
         )
     assert result.exit_code == 1
     assert "not your workspace" in result.output
-    assert not (Path.home() / ".warren" / "ssh" / f"homelab-{_WS}").exists()
+    assert not (Path.home() / ".warren" / "ssh" / f"homelab+{_WS}").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -472,3 +472,29 @@ def test_hangup_from_ssh_stops_the_ssm_forward(tmp_path):
     finally:
         if child.poll() is None:
             child.kill()
+
+
+def test_alias_and_key_path_do_not_collide_across_server_workspace_splits(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    assert ssh_access.host_key_alias("a-b", "c") != ssh_access.host_key_alias("a", "b-c")
+    assert ssh_access.key_path("a-b", "c") != ssh_access.key_path("a", "b-c")
+
+
+def test_save_replaces_the_ambiguous_legacy_key_and_leaves_no_temp(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    legacy = tmp_path / ".warren" / "ssh" / "homelab-ws1"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("old")
+    path = ssh_access.key_path("homelab", "ws1")
+    ssh_access.save_private_key(path, "new")
+    assert path.read_text() == "new\n"
+    assert not legacy.exists()
+    assert sorted(p.name for p in path.parent.iterdir()) == [path.name]
+
+
+def test_save_ignores_a_stale_fixed_temp_name(tmp_path):
+    path = tmp_path / "ssh" / "k"
+    path.parent.mkdir()
+    (path.parent / "k.tmp").write_text("attacker")
+    ssh_access.save_private_key(path, "x")
+    assert path.read_text() == "x\n"

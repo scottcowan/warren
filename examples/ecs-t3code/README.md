@@ -109,7 +109,7 @@ templates:
     permission: write
     harnesses: [claude]
     app: t3 serve --host 127.0.0.1 --port 3773 --no-browser --base-dir /var/lib/warren/t3
-    ports: {t3: 3773}   # lets `warren proxy add <workspace> --from-template` find it
+    ports: {t3: {port: 3773, protocol: http}}   # lets `warren proxy add <workspace> --from-template` find it, and map it through the HTTP gateway
 ```
 
 warren treats an `app` that isn't a shell or a harness as a service and passes it to the

@@ -26,11 +26,11 @@ proxy is the long-running version of it.
 ## Commands
 
 ```bash
-warren proxy add <workspace> <remote-port | port-name> [--local-port N] [--server NAME]
+warren proxy add <workspace> <remote-port | port-name> [--local-port N] [--kind tcp|http] [--server NAME]
 warren proxy add <workspace> --from-template [--server NAME]
 warren proxy list [--json]
 warren proxy rm <local-port | workspace | workspace:remote-port | workspace/port-name> [--server NAME]
-warren proxy run [--idle-minutes M] [--keepalive-seconds S] [--log-level info]
+warren proxy run [--open] [--idle-minutes M] [--keepalive-seconds S] [--log-level info]
 warren proxy stdio <workspace> <remote-port> [--server NAME]
 ```
 
@@ -88,6 +88,118 @@ to a different port, the next `--from-template` points the same local address at
 the new port. If that new port is already mapped under another entry, `add` stops
 and asks you to `warren proxy rm` one of them. `--local-port` can't be combined
 with `--from-template`, since it maps a single port.
+
+## Mapping kinds
+
+Each mapping has a `kind`, stored in `proxy.json` (files without one load as `tcp`).
+
+```bash
+warren proxy add <workspace> 8080 --kind http     # HTTP gateway
+warren proxy add <workspace> --from-template      # each port's `protocol:` (tcp|http) picks the kind
+```
+
+A template port declares its kind with `protocol: tcp|http` (default `tcp`):
+`ports: {code: {port: 8080, protocol: http}}`. The workspace API returns it next to `ports`.
+
+### `tcp` (default)
+
+A plain bidirectional byte relay: SSH, ACP, T3's native pairing, anything that is not a
+browser-reachable web UI. It adds no authentication, so it relies on the service's own.
+
+- Refuses to bind anything but loopback (`--bind 0.0.0.0` or a LAN address fails closed).
+- `add --local-port` refuses a port another process already listens on. `proxy run` exits
+  non-zero if any mapped port cannot be bound (a squatter on a predictable port), and
+  never serves a client from a port it does not hold.
+- `proxy.json` is written atomically via an exclusive temp file (0600), in a 0700 directory,
+  and the CLI refuses to write through a symlink.
+- Workspace, server and port names are validated (`[A-Za-z0-9-]` workspaces, lowercase port
+  names) before they reach a file, a log or a command line.
+- If a mapping later resolves to a different workspace id than it first served, the proxy
+  logs `proxy_workspace_identity_changed` and stops serving that mapping until restarted.
+- It does not protect against: a DNS-rebinding page or any local process reaching a web app on
+  that port. Use `http` for those.
+
+### `http`
+
+An HTTP-aware gateway (stdlib asyncio) in front of a web UI. What it stops:
+
+| Threat | Control |
+| --- | --- |
+| DNS rebinding (a page on `evil.example` resolving to 127.0.0.1) | `Host` must be exactly `127.0.0.1:<port>`, `localhost:<port>` (or `[::1]:<port>` when bound there); anything else gets 421. Case, trailing dots, `0x7f.1` and `127.0.0.1.evil.example` do not pass |
+| Any local process or page using the port | Every request needs a session cookie; without one, 401. The cookie comes from a one-time link (below) printed only to the terminal that runs `warren proxy run` |
+| Cross-site requests and cross-site WebSockets | State-changing methods and upgrades need `Origin` equal to one of the allowed origins and `Sec-Fetch-Site` of `same-origin` or `none`; the cookie is `SameSite=Strict`. No CORS header is ever emitted (the upstream's are removed) and `OPTIONS` is refused |
+| Request smuggling / header injection | Strict parser: one `Host`, no `Content-Length` with `Transfer-Encoding`, no duplicate or signed lengths, only `chunked`, no obs-fold, no bare CR/LF/NUL, origin-form targets only; chunk framing is validated and re-encoded; hop-by-hop headers are dropped; each request uses its own upstream connection |
+| Resource exhaustion | Head size (16 KiB), header count, request body size (64 MiB), header and keep-alive timeouts, upstream connect and response timeouts, at most 64 concurrent connections per mapping |
+
+Gateway responses set `Cache-Control: no-store` (start/exchange and errors),
+`X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer` (added to upstream responses
+if absent). The app's own CSP is left alone. Streaming (SSE, chunked, WebSocket) passes through
+after validation; streamed response bodies are not size limited.
+
+**The exchange flow.** `warren proxy run` prints, per http mapping, to stderr:
+
+```
+prod/<workspace>/code: open http://127.0.0.1:47100/__proxy/start?k=<secret>  (single use, expires in 120s)
+```
+
+(`--open` also opens it in a browser.) The secret is `secrets.token_urlsafe(32)`, compared in
+constant time, valid once and for 120 seconds, and never logged; it is not in the daemon's log.
+A GET to that path answers `303` to `/` and sets `warren_proxy_<port>=<session-id>; HttpOnly;
+SameSite=Strict; Path=/` (no `Domain`; no `Secure`, which is not possible for plain http on
+loopback). The session id is a separate random value validated server-side; it expires when
+the proxy process exits and after 30 idle minutes. The cookie never reaches the app. Expired or
+spent link: `kill -USR1 <pid>` (POSIX) prints fresh ones, or restart `proxy run`.
+
+**What it does not protect against.** Another process running as you can read the terminal,
+the process environment, or the browser's cookies. Browsers share cookies across ports of
+`127.0.0.1`, so another local web service on a different port can see the session cookie in
+requests to it (the cookie name carries the port so mappings do not overwrite each other).
+Non-browser clients without `Origin`/`Sec-Fetch-Site` pass the origin check but still need the
+cookie. TLS is not used on loopback. The upstream app's own authorization still applies.
+
+**Extension point.** `warren_cli.proxy_http.UpstreamAuthProvider` (set as
+`ProxySettings.upstream_auth`) is called once per allowed request and may return headers to add
+upstream, replacing any same-named client header. The default adds none. Injecting the operator's
+identity for the control plane is intentionally not implemented yet.
+
+### Unix sockets
+
+`--unix` serves a mapping on a Unix socket instead of a loopback TCP port. No local port is
+allocated, so nothing else on the machine can connect to a TCP port that happens to be open.
+
+```bash
+warren proxy add <workspace> 8080 --unix --kind http          # ~/.warren/run/<server>-<workspace>-<name>.sock
+warren proxy add <workspace> t3 --unix --socket /run/user/1000/t3.sock
+warren proxy add <workspace> --from-template --unix           # default path for each port
+```
+
+The socket is created 0600 in a 0700 directory owned by you (`~/.warren/run` by default; a custom
+`--socket` must be an absolute path), is never bound through a symlink or over a file that is not a
+stale socket of yours, and the proxy also checks each connection's peer uid against yours (macOS
+and Linux). `warren proxy rm` removes the socket if it is a socket you own and leaves anything
+else alone. File permissions are the authentication, so an `http` mapping on a socket has no start
+link, session cookie, Host check or Origin check (a socket is not reachable from a web page); strict request parsing and the size, time and connection limits still apply.
+`warren proxy list` shows `unix:<path>`.
+
+```bash
+curl --unix-socket ~/.warren/run/prod-ws1-code.sock http://localhost/
+```
+
+```python
+import httpx
+client = httpx.Client(transport=httpx.HTTPTransport(uds="/home/me/.warren/run/prod-ws1-code.sock"))
+client.get("http://localhost/")
+```
+
+```
+# ~/.ssh/config: ssh over the socket of a mapping to the workspace's sshd (port 2222)
+Host ws1
+    ProxyCommand nc -U /home/me/.warren/run/prod-ws1-ssh.sock
+```
+
+Browsers cannot connect to a Unix socket, so use a TCP `http` mapping for a web UI. The T3 Code
+desktop app likewise needs a TCP address; keep T3 on a TCP mapping. Unix sockets are not
+supported on Windows: `--unix` fails there with a clear error.
 
 ### Settings
 
@@ -342,8 +454,13 @@ template:
 ```yaml
 templates:
   t3:
-    ports: {t3: 3773}
+    ports: {t3: {port: 3773, protocol: http}}
 ```
+
+`protocol: http` maps it with the [HTTP gateway](#mapping-kinds); T3 serves HTTP and WebSockets, so
+it gets the Host, Origin and session-cookie checks. Open the link `warren proxy run` prints in a
+browser to start a session; a client that cannot hold the session cookie (a native app that just
+stores an address) needs `protocol: tcp` and relies on T3's own pairing instead.
 
 Then connect with one command:
 
