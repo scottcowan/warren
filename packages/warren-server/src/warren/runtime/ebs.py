@@ -285,9 +285,40 @@ class EBSVolumes:
     # Mutations (each idempotent against "already gone")
     # ------------------------------------------------------------------
 
-    async def _delete_volume(self, volume_id: str) -> bool:
-        """True once the volume is gone; False if it is still attached."""
+    async def _volume(self, volume_id: str) -> dict | None:
         ec2 = self._ensure_client()
+        try:
+            resp = await asyncio.to_thread(ec2.describe_volumes, VolumeIds=[volume_id])
+        except Exception as exc:
+            if _code(exc) == "InvalidVolume.NotFound":
+                return None
+            raise
+        found = resp.get("Volumes", [])
+        return found[0] if found else None
+
+    def _ours(self, resource: dict, workspace_id: str | None, storage: str, owner_id: str | None) -> bool:
+        if not self._owned(resource, workspace_id, storage):
+            return False
+        return owner_id is None or _tags(resource).get(TAG_OWNER_ID) == owner_id
+
+    async def _delete_volume(
+        self,
+        volume_id: str,
+        workspace_id: str | None = None,
+        *,
+        storage: str = STORAGE_WORKSPACE,
+        owner_id: str | None = None,
+    ) -> bool:
+        """True once the volume is gone; False if it is still attached. Re-describes the
+        volume right before the delete and refuses (leaves it, reports gone) anything whose
+        tags are not provably ours now: listings and recorded ids can be stale."""
+        ec2 = self._ensure_client()
+        current = await self._volume(volume_id)
+        if current is None:
+            return True
+        if not self._ours(current, workspace_id, storage, owner_id):
+            log.warning("ebs_delete_refused_not_owned", kind="volume", volume_id=volume_id)
+            return True
         try:
             await asyncio.to_thread(ec2.delete_volume, VolumeId=volume_id)
         except Exception as exc:
@@ -300,7 +331,21 @@ class EBSVolumes:
         log.info("ebs_volume_deleted", volume_id=volume_id)
         return True
 
-    async def _delete_snapshot(self, snapshot_id: str) -> None:
+    async def _delete_snapshot(
+        self,
+        snapshot_id: str,
+        workspace_id: str | None = None,
+        *,
+        storage: str = STORAGE_WORKSPACE,
+        owner_id: str | None = None,
+    ) -> None:
+        """Delete a snapshot only after re-describing it and confirming its tags are ours."""
+        current = await self._snapshot(snapshot_id)
+        if current is None:
+            return
+        if not self._ours(current, workspace_id, storage, owner_id):
+            log.warning("ebs_delete_refused_not_owned", kind="snapshot", snapshot_id=snapshot_id)
+            return
         ec2 = self._ensure_client()
         try:
             await asyncio.to_thread(ec2.delete_snapshot, SnapshotId=snapshot_id)
@@ -351,7 +396,7 @@ class EBSVolumes:
             return None  # someone else (stop vs sweep) already handled it
         await self.snapshot_store.put(workspace_id, snapshot_id)
         log.info("ebs_snapshot_started", workspace_id=workspace_id, volume_id=volume_id, snapshot_id=snapshot_id)
-        await self._delete_volume(volume_id)
+        await self._delete_volume(volume_id, workspace_id)
         return snapshot_id
 
     # ------------------------------------------------------------------
@@ -399,7 +444,7 @@ class EBSVolumes:
         if recorded:
             snap_ids.add(recorded)
         for snap_id in sorted(snap_ids):
-            await self._delete_snapshot(snap_id)
+            await self._delete_snapshot(snap_id, workspace_id)
         await self.snapshot_store.delete(workspace_id)
 
         deadline = self._clock() + float(self._setting("ecs_ebs_detach_wait_seconds", 180.0))
@@ -409,7 +454,7 @@ class EBSVolumes:
             for vol in await self.volumes(workspace_id):
                 if vol.get("State") in ("deleting", "deleted"):
                     continue
-                if vol.get("State") in _LIVE_VOLUME_STATES or not await self._delete_volume(vol["VolumeId"]):
+                if vol.get("State") in _LIVE_VOLUME_STATES or not await self._delete_volume(vol["VolumeId"], workspace_id):
                     pending = True
             if not pending:
                 log.info("ebs_workspace_purged", workspace_id=workspace_id, snapshots=len(snap_ids))
@@ -441,8 +486,10 @@ class EBSVolumes:
         snaps = {s["SnapshotId"]: s for s in await self.snapshots(workspace_id)}
         if recorded and recorded not in snaps:
             found = await self._snapshot(recorded)
-            if found is not None:
+            if found is not None and self._owned(found, workspace_id):
                 snaps[recorded] = found
+            elif found is not None:
+                log.warning("ebs_recorded_snapshot_not_owned", workspace_id=workspace_id, snapshot_id=recorded)
         candidates = sorted(
             (s for s in snaps.values() if s.get("State") in _USABLE_SNAPSHOT_STATES),
             key=lambda s: _ts(s.get("StartTime")),
@@ -467,7 +514,10 @@ class EBSVolumes:
                         retry_after_seconds=retry_after,
                     )
                 await self._sleep(poll)
-                snap = await self._snapshot(snap["SnapshotId"]) or {"SnapshotId": snap["SnapshotId"], "State": "error"}
+                refreshed = await self._snapshot(snap["SnapshotId"])
+                if refreshed is None or not self._owned(refreshed, workspace_id):
+                    refreshed = {"SnapshotId": snap["SnapshotId"], "State": "error"}
+                snap = refreshed
             if snap.get("State") == "completed":
                 chosen = snap
                 break
@@ -480,7 +530,7 @@ class EBSVolumes:
         await self.snapshot_store.put(workspace_id, chosen["SnapshotId"])
         for snap_id in snaps:
             if snap_id != chosen["SnapshotId"]:
-                await self._delete_snapshot(snap_id)
+                await self._delete_snapshot(snap_id, workspace_id)
         return chosen["SnapshotId"]
 
     async def prune(self, workspace_id: str, snaps: list[dict]) -> int:
@@ -496,7 +546,7 @@ class EBSVolumes:
             if snap is newest_done:
                 continue
             if _ts(snap.get("StartTime")) <= cutoff or snap.get("State") not in _USABLE_SNAPSHOT_STATES:
-                await self._delete_snapshot(snap["SnapshotId"])
+                await self._delete_snapshot(snap["SnapshotId"], workspace_id)
                 deleted += 1
         settled = not any(s.get("State") == "pending" for s in ordered)
         if settled and await self.snapshot_store.get(workspace_id) != newest_done["SnapshotId"]:
@@ -533,7 +583,7 @@ class EBSVolumes:
                     if await workspace_exists(workspace_id):
                         if await self.snapshot_and_delete(vol):
                             stats["snapshotted"] += 1
-                    elif await self._delete_volume(vol["VolumeId"]):
+                    elif await self._delete_volume(vol["VolumeId"], workspace_id):
                         stats["volumes_deleted"] += 1
             except Exception:
                 log.exception("ebs_sweep_volume_failed", volume_id=vol["VolumeId"], workspace_id=workspace_id)
@@ -552,7 +602,7 @@ class EBSVolumes:
                         stats["snapshots_deleted"] += await self.prune(workspace_id, snaps)
                     else:
                         for snap in snaps:
-                            await self._delete_snapshot(snap["SnapshotId"])
+                            await self._delete_snapshot(snap["SnapshotId"], workspace_id)
                             stats["snapshots_deleted"] += 1
                         await self.snapshot_store.delete(workspace_id)
             except Exception:

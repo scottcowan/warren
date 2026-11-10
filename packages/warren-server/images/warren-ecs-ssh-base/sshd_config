@@ -4,11 +4,9 @@
 # the entrypoint has dropped privileges. It is reached only through an SSM port-forward
 # to the task's own loopback, so it listens on 127.0.0.1 and nowhere else.
 #
-# Drop-ins come first so that a derived image can override a setting: for most
-# keywords sshd uses the first value it reads. To allow agent forwarding, add
-# /etc/ssh/sshd_config.d/agent-forwarding.conf containing `AllowAgentForwarding yes`
-# in an image built FROM this one (and `ForwardAgent yes` on the client).
-Include /etc/ssh/sshd_config.d/*.conf
+# The drop-in Include is deliberately LAST: for most keywords sshd uses the first value
+# it reads, so a drop-in can add settings but never weaken the hardening below. To change
+# a hardened setting (e.g. agent forwarding), a derived image must edit this file itself.
 
 Port 2222
 ListenAddress 127.0.0.1:2222
@@ -61,3 +59,6 @@ LogLevel INFO
 
 # JetBrains Gateway uploads its backend over SFTP; VS Code uses it for some file ops.
 Subsystem sftp internal-sftp
+
+# Last on purpose (see the top of this file).
+Include /etc/ssh/sshd_config.d/*.conf

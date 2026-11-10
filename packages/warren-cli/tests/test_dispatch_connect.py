@@ -295,7 +295,7 @@ def test_connect_via_execvp_env_is_allowlisted_not_full_os_environ(tmp_path, mon
     assert captured["env"]["FOO"] == "bar"
 
 
-_ECS_TASK = "arn:aws:ecs:us-east-1:123:task/cl/abc"
+_ECS_TASK = "arn:aws:ecs:us-east-1:123456789012:task/my-cluster/abc"
 
 
 class _FakePopen:
@@ -557,7 +557,7 @@ def test_connect_via_ecs_exec_missing_aws_cli_uses_ui_error(monkeypatch, capsys)
     monkeypatch.setattr(d.os, "execvp", lambda *a: execs.append(a))
 
     with pytest.raises(typer_mod.Exit):
-        d.connect_via_ecs_exec("my-cluster", "arn:aws:ecs:us-east-1:123:task/cl/abc")
+        d.connect_via_ecs_exec("my-cluster", "arn:aws:ecs:us-east-1:123456789012:task/my-cluster/abc")
 
     assert "aws CLI not found" in capsys.readouterr().err
     assert not execs
@@ -578,7 +578,7 @@ def test_connect_ecs_missing_aws_cli(monkeypatch):
         with pytest.raises((SystemExit, typer_mod.Exit)):
             d._connect_via_execvp({
                 "runtime_type": "ecs",
-                "container_id": "arn:aws:ecs:us-east-1:123:task/cl/abc",
+                "container_id": "arn:aws:ecs:us-east-1:123456789012:task/my-cluster/abc",
                 "ecs_cluster": "my-cluster",
                 "app": "bash",
                 "workspace_id": "ws-ecs",
@@ -604,7 +604,7 @@ def test_connect_ecs_missing_ssm_plugin(monkeypatch):
         with pytest.raises((SystemExit, typer_mod.Exit)):
             d._connect_via_execvp({
                 "runtime_type": "ecs",
-                "container_id": "arn:aws:ecs:us-east-1:123:task/cl/abc",
+                "container_id": "arn:aws:ecs:us-east-1:123456789012:task/my-cluster/abc",
                 "ecs_cluster": "my-cluster",
                 "app": "bash",
                 "workspace_id": "ws-ecs",
@@ -652,7 +652,7 @@ def test_tunnel_ecs_execvp(monkeypatch):
             d._tunnel_via_execvp(
                 {
                     "runtime_type": "ecs",
-                    "container_id": "arn:aws:ecs:us-east-1:123:task/cl/abc",
+                    "container_id": "arn:aws:ecs:us-east-1:123456789012:task/my-cluster/abc",
                     "ecs_cluster": "my-cluster",
                     "workspace_id": "ws-ecs",
                 },
@@ -696,7 +696,7 @@ def test_tunnel_ecs_local_port_override(monkeypatch):
             d._tunnel_via_execvp(
                 {
                     "runtime_type": "ecs",
-                    "container_id": "arn:aws:ecs:us-east-1:123:task/cl/abc",
+                    "container_id": "arn:aws:ecs:us-east-1:123456789012:task/my-cluster/abc",
                     "ecs_cluster": "my-cluster",
                     "workspace_id": "ws-ecs",
                 },
@@ -753,7 +753,7 @@ def test_tunnel_describe_tasks_failure_surfaces_error():
             d._tunnel_via_execvp(
                 {
                     "runtime_type": "ecs",
-                    "container_id": "arn:aws:ecs:us-east-1:123:task/cl/abc",
+                    "container_id": "arn:aws:ecs:us-east-1:123456789012:task/my-cluster/abc",
                     "ecs_cluster": "my-cluster",
                     "workspace_id": "ws-ecs",
                 },

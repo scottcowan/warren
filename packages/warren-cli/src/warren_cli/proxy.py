@@ -37,7 +37,9 @@ import json
 import os
 import re
 import socket
+import stat
 import subprocess
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Literal, Protocol
@@ -46,6 +48,10 @@ from urllib.parse import urlparse
 import structlog
 
 from warren_common.fileperms import restrict_to_owner
+
+from . import proxy_http, proxy_unix
+
+from . import proxy_http
 
 log = structlog.get_logger(__name__)
 
@@ -119,6 +125,14 @@ class Mapping:
     # added by name or with --from-template. Not part of identity: naming an
     # existing mapping must not restart its listener.
     name: str | None = field(default=None, compare=False)
+    # "tcp": a plain byte relay (ssh, T3, ACP). "http": the HTTP-aware gateway in
+    # front of a web UI (proxy_http.py). Part of identity: changing it restarts the listener.
+    kind: str = "tcp"
+    # "tcp": listen on 127.0.0.1:local_port. "unix": listen on a 0600 Unix socket at
+    # socket_path (None = the default path, see proxy_unix.default_socket_path);
+    # local_port is 0 then. Both are part of identity.
+    listen: str = "tcp"
+    socket_path: str | None = None
 
     @property
     def key(self) -> tuple[str, str, int]:
@@ -131,8 +145,53 @@ class Mapping:
         return f"{self.server}/{self.workspace}:{self.remote_port}"
 
     @property
+    def resolved_socket_path(self) -> str | None:
+        """The unix socket this mapping listens on (the default path when none was
+        chosen); None for tcp mappings."""
+        if self.listen != "unix":
+            return None
+        if self.socket_path:
+            return self.socket_path
+        return str(proxy_unix.default_socket_path(self.server, self.workspace, self.name or str(self.remote_port)))
+
+    @property
     def address(self) -> str:
+        if self.listen == "unix":
+            return f"unix:{self.resolved_socket_path}"
         return f"http://{LOOPBACK_HOST}:{self.local_port}"
+
+
+KINDS = ("tcp", "http")
+LISTENS = ("tcp", "unix")
+_WORKSPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
+_PORT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+_SERVER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def validate_identifiers(server: str, workspace: str, name: str | None = None) -> None:
+    """Strict shapes for the strings that reach file paths, command lines and logs."""
+    if not _SERVER_RE.match(server):
+        raise ProxyError(f"invalid server name {server!r}")
+    if not _WORKSPACE_RE.match(workspace):
+        raise ProxyError(f"invalid workspace id {workspace!r}: letters, digits and '-' only")
+    if name is not None and not _PORT_NAME_RE.match(name):
+        raise ProxyError(f"invalid port name {name!r}: lowercase letters, digits and '-' only")
+
+
+KINDS = ("tcp", "http")
+_WORKSPACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,63}$")
+_PORT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+_SERVER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def validate_identifiers(server: str, workspace: str, name: str | None = None) -> None:
+    """Strict shapes for the strings that reach file paths, command lines and logs."""
+    if not _SERVER_RE.match(server):
+        raise ProxyError(f"invalid server name {server!r}")
+    if not _WORKSPACE_RE.match(workspace):
+        raise ProxyError(f"invalid workspace id {workspace!r}: letters, digits and '-' only")
+    if name is not None and not _PORT_NAME_RE.match(name):
+        raise ProxyError(f"invalid port name {name!r}: lowercase letters, digits and '-' only")
 
 
 def _valid_port(port: int) -> bool:
@@ -168,22 +227,59 @@ class MappingStore:
                     server=str(row["server"]),
                     workspace=str(row["workspace"]),
                     remote_port=int(row["remote_port"]),
-                    local_port=int(row["local_port"]),
+                    local_port=int(row.get("local_port") or 0),
                     name=str(row["name"]) if row.get("name") else None,
+                    kind=str(row.get("kind") or "tcp"),
+                    listen=str(row.get("listen") or "tcp"),
+                    socket_path=str(row["socket_path"]) if row.get("socket_path") else None,
                 )
-            except (KeyError, TypeError, ValueError):
+                if m.kind not in KINDS:
+                    raise ValueError(f"unknown kind {m.kind!r}")
+                if m.listen not in LISTENS:
+                    raise ValueError(f"unknown listen {m.listen!r}")
+                validate_identifiers(m.server, m.workspace, m.name)
+                if not _valid_port(m.remote_port):
+                    raise ValueError("port out of range")
+                if m.listen == "tcp" and (not _valid_port(m.local_port) or m.socket_path):
+                    raise ValueError("tcp mapping needs a local port and no socket path")
+                if m.socket_path is not None and not (os.path.isabs(m.socket_path) and "\0" not in m.socket_path):
+                    raise ValueError("socket path must be absolute")
+            except (KeyError, TypeError, ValueError, ProxyError):
                 log.warning("proxy_mapping_skipped", reason="malformed entry", path=str(self.path))
                 continue
             out.append(m)
         return out
 
     def save(self, mappings: Iterable[Mapping]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        rows = [{k: v for k, v in asdict(m).items() if k != "name" or v} for m in mappings]
-        tmp.write_text(json.dumps({"mappings": rows}, indent=2) + "\n")
-        restrict_to_owner(tmp)
-        os.replace(tmp, self.path)
+        """Atomic, owner-only write; refuses to write through a symlink."""
+        parent = self.path.parent
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if self.path.is_symlink():
+            raise ProxyError(f"refusing to write {self.path}: it is a symlink")
+        with contextlib.suppress(OSError):
+            restrict_to_owner(parent, directory=True)
+        rows = [
+            {k: v for k, v in asdict(m).items() if (k != "name" or v)
+                and (k != "kind" or v != "tcp")
+                and (k != "listen" or v != "tcp")
+                and (k != "socket_path" or v)
+                and (k != "local_port" or m.listen == "tcp")
+            }
+            for m in mappings
+        ]
+        # mkstemp: O_EXCL, 0600, unpredictable name, so nothing planted can be followed.
+        fd, tmp_name = tempfile.mkstemp(prefix=self.path.name + ".", suffix=".tmp", dir=parent)
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps({"mappings": rows}, indent=2) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            restrict_to_owner(tmp_name)
+            os.replace(tmp_name, self.path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
+            raise
 
     def add(
         self,
@@ -193,6 +289,9 @@ class MappingStore:
         *,
         local_port: int | None = None,
         name: str | None = None,
+        kind: str | None = None,
+        listen: str | None = None,
+        socket_path: str | None = None,
         port_base: int = 47100,
         port_free: Callable[[int], bool] = _port_bindable,
     ) -> tuple[Mapping, bool]:
@@ -209,10 +308,23 @@ class MappingStore:
         address stays stable; if the new remote port is already mapped too, that's
         a conflict for the operator to resolve with ``warren proxy rm``.
         """
+        validate_identifiers(server, workspace, name)
+        if kind is not None and kind not in KINDS:
+            raise ProxyError(f"unknown mapping kind {kind!r} (expected one of: {', '.join(KINDS)})")
+        validate_identifiers(server, workspace, name)
+        if kind is not None and kind not in KINDS:
+            raise ProxyError(f"unknown mapping kind {kind!r} (expected one of: {', '.join(KINDS)})")
         if not _valid_port(remote_port):
             raise ProxyError(f"remote port {remote_port} is not a TCP port")
         if local_port is not None and not _valid_port(local_port):
             raise ProxyError(f"local port {local_port} is not a TCP port")
+        if listen is not None and listen not in LISTENS:
+            raise ProxyError(f"unknown listen mode {listen!r} (expected one of: {', '.join(LISTENS)})")
+        if socket_path is not None:
+            if listen != "unix":
+                raise ProxyError("a socket path needs listen=unix")
+            if not os.path.isabs(socket_path) or "\0" in socket_path:
+                raise ProxyError(f"socket path {socket_path!r} must be absolute")
         mappings = self.load()
         existing = next((m for m in mappings if m.key == (server, workspace, remote_port)), None)
         if name:
@@ -228,8 +340,35 @@ class MappingStore:
                         f"remove one with `warren proxy rm`"
                     )
                 existing = named
-        if existing and (local_port is None or local_port == existing.local_port):
-            if (existing.name or None) == (name or existing.name) and existing.remote_port == remote_port:
+        if listen == "unix" or (listen is None and existing is not None and existing.listen == "unix"):
+            if local_port is not None:
+                raise ProxyError("a unix-socket mapping has no local port; drop --local-port")
+            sock = socket_path if socket_path is not None else (existing.socket_path if existing else None)
+            if sock is not None:
+                clash = next((m for m in mappings if m is not existing and m.socket_path == sock), None)
+                if clash is not None:
+                    raise ProxyError(f"socket path {sock} is already used by {clash.label}")
+            mapping = Mapping(
+                server=server,
+                workspace=workspace,
+                remote_port=remote_port,
+                local_port=0,
+                name=name or (existing.name if existing else None),
+                kind=kind or (existing.kind if existing else "tcp"),
+                listen="unix",
+                socket_path=sock,
+            )
+            if existing == mapping and existing.name == mapping.name:
+                return existing, False
+            self.save([*(m for m in mappings if m is not existing), mapping])
+            return mapping, existing is None
+        if existing and existing.listen == "tcp" and (local_port is None or local_port == existing.local_port):
+            new_kind = kind or existing.kind
+            if (
+                (existing.name or None) == (name or existing.name)
+                and existing.remote_port == remote_port
+                and existing.kind == new_kind
+            ):
                 return existing, False
             renamed = Mapping(
                 server=server,
@@ -237,16 +376,22 @@ class MappingStore:
                 remote_port=remote_port,
                 local_port=existing.local_port,
                 name=name or existing.name,
+                kind=new_kind,
+                listen=existing.listen,
+                socket_path=existing.socket_path,
             )
             self.save([renamed if m is existing else m for m in mappings])
             return renamed, False
         name = name or (existing.name if existing else None)
+        kind = kind or (existing.kind if existing else "tcp")
         others = [m for m in mappings if m is not existing]
-        used = {m.local_port for m in others}
+        used = {m.local_port for m in others if m.listen == "tcp"}
         if local_port is not None:
             if local_port in used:
-                owner = next(m for m in others if m.local_port == local_port)
+                owner = next(m for m in others if m.listen == "tcp" and m.local_port == local_port)
                 raise ProxyError(f"local port {local_port} is already used by {owner.label}")
+            if not port_free(local_port):
+                raise ProxyError(f"local port {local_port} is already in use by another process")
             port = local_port
         else:
             port = next(
@@ -255,7 +400,7 @@ class MappingStore:
             )
             if port is None:
                 raise ProxyError(f"no free local port in {port_base}-{port_base + _PORT_SEARCH_SPAN - 1}")
-        mapping = Mapping(server=server, workspace=workspace, remote_port=remote_port, local_port=port, name=name)
+        mapping = Mapping(server=server, workspace=workspace, remote_port=remote_port, local_port=port, name=name, kind=kind)
         self.save([*others, mapping])
         return mapping, existing is None
 
@@ -269,7 +414,7 @@ class MappingStore:
             if server is not None and m.server != server:
                 return False
             if selector.isdigit():
-                return m.local_port == int(selector)
+                return m.listen == "tcp" and m.local_port == int(selector)
             ws_, slash, port_name = selector.rpartition("/")
             if slash and ws_ and port_name:
                 return m.workspace == ws_ and m.name == port_name
@@ -431,6 +576,17 @@ def declared_ports(ws: dict) -> dict[str, int]:
         if isinstance(port, int) and not isinstance(port, bool) and _valid_port(port):
             out[str(name)] = port
     return out
+
+
+def declared_protocols(ws: dict) -> dict[str, str]:
+    """``{name: "tcp" | "http"}`` for the declared ports (a server predating
+    ``protocol`` sends none: tcp)."""
+    raw = ws.get("ports")
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(n): "http" if isinstance(e, dict) and e.get("protocol") == "http" else "tcp" for n, e in raw.items()
+    }
 
 
 async def fetch_workspaces(cfg: Any, server: str) -> list[dict]:
@@ -709,6 +865,10 @@ class ProxySettings:
     # after the last resolve, checks the control plane for a moved host port first
     # (an SSH forward to a stale port stays up and just drops connections).
     revalidate_seconds: float = 15.0
+    # kind "http" mappings: gateway limits/timeouts, and the upstream-auth hook
+    # (None: add no headers).
+    http_limits: proxy_http.GatewayLimits = proxy_http.GatewayLimits()
+    upstream_auth: proxy_http.UpstreamAuthProvider | None = None
 
 
 class MappingProxy:
@@ -735,18 +895,79 @@ class MappingProxy:
         # weakly too): a garbage collection mid-relay would destroy it and drop
         # the connection.
         self._connections: set[asyncio.Task] = set()
+        self.gateway: proxy_http.HttpGateway | None = None
+        self.socket_path: str | None = None  # set while a unix listener is bound
+        self._socket_id: tuple[int, int] | None = None  # (st_dev, st_ino) of the socket we made
+        # The workspace id this mapping first resolved to; a later resolve to another id
+        # halts the mapping (see _check_identity).
+        self._pinned_workspace: str | None = None
+        self.halted: str | None = None
         self._log = log.bind(mapping=mapping.label, local_port=mapping.local_port)
 
     async def listen(self) -> None:
+        if self.mapping.listen == "unix":
+            await self._listen_unix()
+            return
         host = check_loopback(self.settings.bind)
+        if self.mapping.kind == "http":
+            self.gateway = proxy_http.HttpGateway(
+                bind=host,
+                port=self.mapping.local_port,
+                provider=self.settings.upstream_auth,
+                limits=self.settings.http_limits,
+            )
         self._server = await asyncio.start_server(self._handle, host, self.mapping.local_port)
         self._log.info("proxy_listening", address=f"{host}:{self.mapping.local_port}")
+
+    async def _listen_unix(self) -> None:
+        m = self.mapping
+        if m.socket_path:
+            path = Path(m.socket_path)
+        else:
+            run_dir = proxy_unix.ensure_run_dir()
+            path = proxy_unix.default_socket_path(m.server, m.workspace, m.name or str(m.remote_port), run_dir=run_dir)
+        sock = proxy_unix.bind_unix(path)
+        if m.kind == "http":
+            self.gateway = proxy_http.HttpGateway(
+                bind="unix",
+                port=0,
+                provider=self.settings.upstream_auth,
+                limits=self.settings.http_limits,
+                trusted_peer=True,
+            )
+        try:
+            self._server = await asyncio.start_unix_server(self._handle, sock=sock)
+        except BaseException:
+            sock.close()
+            self._unlink_socket(str(path), None)
+            raise
+        st = os.lstat(path)
+        self.socket_path, self._socket_id = str(path), (st.st_dev, st.st_ino)
+        self._log.info("proxy_listening", address=f"unix:{path}")
+
+    @staticmethod
+    def _unlink_socket(path: str, ident: tuple[int, int] | None) -> None:
+        """Remove ``path`` if it is still the socket we made (never a replacement)."""
+        try:
+            st = os.lstat(path)
+            if stat.S_ISSOCK(st.st_mode) and (ident is None or (st.st_dev, st.st_ino) == ident):
+                os.unlink(path)
+        except OSError:
+            pass
+
+    def start_link(self) -> str | None:
+        """A fresh one-time exchange URL for a TCP-listening http mapping (None for tcp
+        kind and for unix sockets, where file permissions authenticate)."""
+        return self.gateway.start_link() if self.gateway is not None and not self.gateway.trusted_peer else None
 
     async def close(self) -> None:
         if self._server is not None:
             self._server.close()
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self._server.wait_closed(), timeout=2)
+        if self.socket_path is not None:
+            self._unlink_socket(self.socket_path, self._socket_id)
+            self.socket_path = self._socket_id = None
         for task in (self._idle_task, self._keepalive_task):
             if task is not None:
                 task.cancel()
@@ -777,6 +998,26 @@ class MappingProxy:
         self._suspect = False
         return target
 
+    def _check_identity(self, target: Target) -> None:
+        """A mapping is for one workspace. If a later resolve names a different one (the
+        id the saved prefix matched is gone and another now matches, or the server was
+        repointed), stop serving it rather than hand a client someone else's workspace."""
+        if self._pinned_workspace is None:
+            self._pinned_workspace = target.workspace_id
+            return
+        if target.workspace_id != self._pinned_workspace:
+            self.halted = (
+                f"workspace changed from {self._pinned_workspace} to {target.workspace_id}; "
+                "restart `warren proxy run` after checking with `warren list`"
+            )
+            self._log.error(
+                "proxy_workspace_identity_changed",
+                expected=self._pinned_workspace,
+                got=target.workspace_id,
+            )
+            self._stop_session("workspace_changed")
+            raise ProxyError(f"mapping halted: {self.halted}")
+
     async def ensure_session(self) -> Session:
         """The live session, starting one (resolving the target afresh) when there is
         none, the last one's process has exited, or a podman/docker target's host port
@@ -787,6 +1028,7 @@ class MappingProxy:
                 if not self._needs_revalidation():
                     return self.session
                 target = await self._resolve()
+                self._check_identity(target)
                 if self.target is not None and target.endpoint == self.target.endpoint:
                     return self.session
                 self._stop_session("target_moved")
@@ -795,6 +1037,7 @@ class MappingProxy:
                 self._stop_session("exited")
             if target is None:
                 target = await self._resolve()
+            self._check_identity(target)
             if self.target is not None and target.endpoint != self.target.endpoint:
                 if target.kind == "ecs":
                     self._log.info("proxy_task_changed", old_task_arn=self.target.task_arn, task_arn=target.task_arn)
@@ -818,6 +1061,8 @@ class MappingProxy:
             return self.session
 
     async def _connect_upstream(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        if self.halted:
+            raise ProxyError(f"mapping halted: {self.halted}")
         for attempt in range(2):
             session = await self.ensure_session()
             try:
@@ -836,16 +1081,28 @@ class MappingProxy:
             )
         raise ProxyError("the SSM port-forward is not accepting connections")
 
+    @staticmethod
+    def _peer_ok(writer: asyncio.StreamWriter) -> bool:
+        sock = writer.get_extra_info("socket")
+        return sock is not None and proxy_unix.peer_allowed(sock)
+
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
         if task is not None:
             self._connections.add(task)
             task.add_done_callback(self._connections.discard)
+        if self.mapping.listen == "unix" and not self._peer_ok(writer):
+            self._log.warning("proxy_peer_rejected", reason="peer uid is not this user")
+            writer.close()
+            return
         self.active += 1
         if self._idle_task is not None:
             self._idle_task.cancel()
             self._idle_task = None
         try:
+            if self.gateway is not None:
+                await self.gateway.serve(reader, writer, self._connect_upstream)
+                return
             try:
                 up_reader, up_writer = await self._connect_upstream()
             except ProxyError as exc:
@@ -906,6 +1163,7 @@ class ProxyDaemon:
         settings: ProxySettings,
         *,
         reload_seconds: float = 5.0,
+        announce: Callable[[Mapping, str], None] | None = None,
     ) -> None:
         check_loopback(settings.bind)
         self.store = store
@@ -913,11 +1171,19 @@ class ProxyDaemon:
         self.forwarder = forwarder
         self.settings = settings
         self.reload_seconds = reload_seconds
+        # Called with (mapping, one-time URL) for http mappings; the URL carries a secret, so
+        # it goes to the operator's terminal via this callback and is never logged.
+        self.announce = announce
+        # Mappings whose port could not be bound, with the reason. `warren proxy run` treats
+        # any entry at startup as fatal so a client never talks to whatever holds the port.
+        self.failed: dict[Mapping, str] = {}
         self.proxies: dict[Mapping, MappingProxy] = {}
         self._mtime: float | None = None
 
     async def reconcile(self) -> None:
         wanted = set(self.store.load())
+        for mapping in [m for m in self.failed if m not in wanted]:
+            del self.failed[mapping]
         for mapping in [m for m in self.proxies if m not in wanted]:
             await self.proxies.pop(mapping).close()
         for mapping in wanted - set(self.proxies):
@@ -925,9 +1191,22 @@ class ProxyDaemon:
             try:
                 await proxy.listen()
             except OSError as exc:
-                log.error("proxy_listen_failed", mapping=mapping.label, local_port=mapping.local_port, error=str(exc))
+                log.error("proxy_listen_failed", mapping=mapping.label, address=mapping.address, error=str(exc))
+                self.failed[mapping] = str(exc)
                 continue
+            self.failed.pop(mapping, None)
             self.proxies[mapping] = proxy
+            self._announce(proxy)
+
+    def _announce(self, proxy: MappingProxy) -> None:
+        link = proxy.start_link()
+        if link is not None and self.announce is not None:
+            self.announce(proxy.mapping, link)
+
+    def reissue_links(self) -> None:
+        """Mint and announce a fresh one-time link for every http mapping."""
+        for proxy in self.proxies.values():
+            self._announce(proxy)
 
     def _store_mtime(self) -> float | None:
         try:

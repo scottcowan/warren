@@ -71,7 +71,7 @@ def agent_message(event: str, agent: st.AgentState | None) -> str:
 
 def code(value: Any, default: str = "unknown") -> str:
     """A machine code (reason, harness) safe to put in a message, else `default`."""
-    return value if isinstance(value, str) and _CODE.match(value) else default
+    return value if isinstance(value, str) and _CODE.fullmatch(value) else default
 
 
 @dataclass(frozen=True)

@@ -274,6 +274,36 @@ class DynamoTable:
                 return items
             kwargs["ExclusiveStartKey"] = last
 
+    async def query_desc_filtered(
+        self, pk: str, *, index: str, before: str | None, attr: str, value: str, want: int
+    ) -> list[dict]:
+        """Up to `want` items of one partition whose `attr` equals `value`, newest sort
+        key first, starting strictly below the sort key `before`. The equality filter runs
+        server-side (only matching items cross the wire) and the walk stops once `want`
+        matches are collected, so a page costs what it reads, not the partition."""
+        values: dict[str, Any] = {":k": pk, ":f": value}
+        cond = "#k = :k"
+        names = {"#k": "gsi1pk", "#f": attr}
+        if before is not None:
+            cond += " AND #s < :s"
+            names["#s"] = "gsi1sk"
+            values[":s"] = before
+        kwargs: dict[str, Any] = {
+            "TableName": self.name, "IndexName": index, "KeyConditionExpression": cond,
+            "FilterExpression": "#f = :f",
+            "ExpressionAttributeNames": names,
+            "ExpressionAttributeValues": values, "ScanIndexForward": False,
+        }
+        items: list[dict] = []
+        while len(items) < want:
+            resp = await self._call("query", **kwargs)
+            items.extend(resp.get("Items", []))
+            last = resp.get("LastEvaluatedKey")
+            if not last:
+                break
+            kwargs["ExclusiveStartKey"] = last
+        return items[:want]
+
     async def batch_get(self, keys: list[dict[str, str]]) -> list[dict]:
         out: list[dict] = []
         for start in range(0, len(keys), 100):
@@ -576,6 +606,25 @@ class DynamoWorkspaceStore:
     async def list_all(self) -> list[Workspace]:
         rows = [_item_to_workspace(it) for it in await self._by_status(ALL_STATUSES)]
         return sorted(rows, key=lambda w: w.created_at, reverse=True)
+
+    async def list_for_owner(
+        self, owner_id: str, *, limit: int, after: tuple[str, str] | None = None
+    ) -> list[Workspace]:
+        """One page of an owner's rows, newest first; see the SQLite store. The only GSI is
+        keyed by status, so this walks each status partition newest-first with a server-side
+        owner filter and merges, never materialising more than `limit` rows per partition."""
+        before = f"{after[0]}#{after[1]}" if after is not None else None
+        results = await asyncio.gather(*(
+            self._t.query_desc_filtered(
+                f"WSSTATUS#{s}", index=GSI1, before=before, attr="owner_id", value=owner_id, want=limit
+            )
+            for s in ALL_STATUSES
+        ))
+        rows = sorted(
+            (_item_to_workspace(it) for items in results for it in items),
+            key=lambda w: (w.created_at, w.workspace_id), reverse=True,
+        )
+        return rows[:limit]
 
 
 class DynamoLaunchAttemptStore:

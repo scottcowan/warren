@@ -62,7 +62,8 @@ def _refuse_scoped(request: Request) -> None:
 
 
 async def _visible_run(request: Request, run_id: str) -> dict[str, Any]:
-    """The run, if the caller owns it or is an admin; 404/403 otherwise. A run whose
+    """The run, if the caller owns it or is an admin; 404 otherwise (a missing run and
+    another owner's run are indistinguishable, so run ids cannot be probed). A run whose
     workspace ended without completing (destroyed by hand, failed) is finished here."""
     _refuse_scoped(request)
     user = current_user(request)
@@ -73,7 +74,7 @@ async def _visible_run(request: Request, run_id: str) -> dict[str, Any]:
     if run["owner_id"] != user.user_id:
         if not user.is_admin:
             log.warning("run_read_denied", run_id=run_id, user_id=user.user_id)
-            raise HTTPException(status_code=403, detail="not run owner")
+            raise HTTPException(status_code=404, detail="run not found")
         audit_event("run.read", request=request, outcome="admin", owner_id=run["owner_id"], workspace_id=run_id)
     if run["status"] == runs.RUNNING:
         run = await _settle(request, store, run)

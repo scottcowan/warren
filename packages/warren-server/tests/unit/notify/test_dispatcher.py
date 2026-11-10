@@ -39,9 +39,11 @@ class FakeSender:
     def __init__(self, *responses) -> None:
         self.responses = list(responses)
         self.calls: list[tuple[str, dict]] = []
+        self.addresses: list[str | None] = []
 
-    async def __call__(self, url: str, body: bytes, timeout: float) -> int:
+    async def __call__(self, url: str, body: bytes, timeout: float, address: str | None = None) -> int:
         self.calls.append((url, json.loads(body)))
+        self.addresses.append(address)
         r = self.responses.pop(0) if self.responses else 200
         if isinstance(r, BaseException):
             raise r
@@ -197,3 +199,76 @@ async def test_watched_owners():
     n = Notifier(watched_owners=owners, sender=FakeSender())
     assert await n.watched_owners() == {"u1"}
     assert await Notifier(sender=FakeSender()).watched_owners() == set()
+
+
+async def test_rebinding_resolver_connects_only_to_validated_ip():
+    """First answer public, second internal: delivery must use the first, once."""
+    answers = [["93.184.216.34"], ["127.0.0.1"]]
+    asked = []
+
+    async def resolver(host, port):
+        asked.append(host)
+        return answers.pop(0)
+
+    owner = Target(url=SecretStr(OWNER_URL), kind="owner", require_public=True)
+    sender = FakeSender()
+    n = Notifier(owner_lookup=lambda _o: _ret(owner), sender=sender, resolver=resolver, sleep=FakeSleep())
+    await n.deliver(ev.Notification.for_workspace(ev.AGENT_WAITING, WS, "m"))
+    assert len(asked) == 1
+    assert sender.addresses == ["93.184.216.34"]
+
+
+async def test_dual_stack_and_multiple_records_all_validated():
+    async def ok(host, port):
+        return ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"]
+
+    async def one_bad(host, port):
+        return ["93.184.216.34", "10.0.0.1"]
+
+    owner = Target(url=SecretStr(OWNER_URL), kind="owner", require_public=True)
+    sender = FakeSender()
+    n = Notifier(owner_lookup=lambda _o: _ret(owner), sender=sender, resolver=ok, sleep=FakeSleep())
+    await n.deliver(ev.Notification.for_workspace(ev.AGENT_WAITING, WS, "m"))
+    assert sender.addresses == ["93.184.216.34"]
+    sender2 = FakeSender()
+    n2 = Notifier(owner_lookup=lambda _o: _ret(owner), sender=sender2, resolver=one_bad, sleep=FakeSleep())
+    await n2.deliver(ev.Notification.for_workspace(ev.AGENT_WAITING, WS, "m"))
+    assert sender2.calls == []
+
+
+async def test_failed_attempt_rotates_to_next_validated_address():
+    async def two(host, port):
+        return ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"]
+
+    owner = Target(url=SecretStr(OWNER_URL), kind="owner", require_public=True)
+    sender = FakeSender(503, 200)
+    n = Notifier(owner_lookup=lambda _o: _ret(owner), sender=sender, resolver=two, sleep=FakeSleep())
+    await n.deliver(ev.Notification.for_workspace(ev.AGENT_WAITING, WS, "m"))
+    assert sender.addresses == ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"]
+
+
+async def test_resolver_timeout_rejects():
+    async def slow(host, port):
+        await asyncio.sleep(3600)
+
+    owner = Target(url=SecretStr(OWNER_URL), kind="owner", require_public=True)
+    sender = FakeSender()
+    n = Notifier(owner_lookup=lambda _o: _ret(owner), sender=sender, resolver=slow, sleep=FakeSleep(), timeout_seconds=0.05)
+    await n.deliver(ev.Notification.for_workspace(ev.AGENT_WAITING, WS, "m"))
+    assert sender.calls == []
+
+
+async def test_owner_url_port_restricted_and_server_url_unpinned():
+    owner = Target(url=SecretStr("https://hooks.example.com:8443/x"), kind="owner", require_public=True)
+    sender = FakeSender()
+    n = Notifier(owner_lookup=lambda _o: _ret(owner), sender=sender, resolver=_public, sleep=FakeSleep())
+    await n.deliver(ev.Notification.for_workspace(ev.AGENT_WAITING, WS, "m"))
+    assert sender.calls == []
+    n = Notifier(owner_lookup=lambda _o: _ret(owner), sender=sender, resolver=_public, sleep=FakeSleep(),
+                 allowed_ports=frozenset({443, 8443}))
+    await n.deliver(ev.Notification.for_workspace(ev.AGENT_WAITING, WS, "m"))
+    assert sender.addresses == ["93.184.216.34"]
+    s2 = FakeSender()
+    n = _notifier(s2)
+    await n.deliver(ev.Notification.for_workspace(ev.AGENT_WAITING, WS, "m"))
+    assert s2.addresses == [None]

@@ -119,6 +119,24 @@ def _remote_auth_headers(profile: RemoteProfile) -> dict[str, str]:
     return {"Authorization": f"Bearer {profile.auth_token.get_secret_value()}"}
 
 
+async def fetch_all_workspaces(
+    client: httpx.AsyncClient, *, page_size: int = 100, max_pages: int = 100
+) -> list[dict]:
+    """Every workspace the caller owns: GET /workspaces page by page, following the
+    server's ``X-Next-Cursor`` header until it is absent (or ``max_pages`` is hit)."""
+    rows: list[dict] = []
+    params: dict[str, str | int] = {"limit": page_size}
+    for _ in range(max_pages):
+        r = await client.get("/workspaces", params=params)
+        r.raise_for_status()
+        rows.extend(r.json())
+        cursor = r.headers.get("X-Next-Cursor")
+        if not cursor:
+            break
+        params = {"limit": page_size, "cursor": cursor}
+    return rows
+
+
 @contextlib.asynccontextmanager
 async def make_remote_client(profile: RemoteProfile, *, timeout: float = 5.0) -> AsyncIterator[httpx.AsyncClient]:
     """Return an httpx.AsyncClient for a RemoteProfile, carrying a Bearer header when configured.
