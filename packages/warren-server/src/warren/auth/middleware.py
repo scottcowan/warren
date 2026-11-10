@@ -58,6 +58,34 @@ def _client_ip(scope: dict) -> str:
     client = scope.get("client")
     return client[0] if client else "unknown"
 
+
+_TOKEN_KEY_CHARS = 8
+
+
+def _failed_auth_key(scope: dict) -> str:
+    """Limiter key: client IP plus the first 8 chars of the presented token.
+
+    Every client arrives via the loopback proxy and shares one IP, so IP alone would make
+    one noisy client lock out all the others. The 8-char prefix is not enough to
+    reconstruct a token; it only separates callers."""
+    token = _extract_bearer_token(scope) or ""
+    return f"{_client_ip(scope)}|{token[:_TOKEN_KEY_CHARS]}"
+
+
+def _budgeted_route(method: str, path: str) -> bool:
+    if method == "GET" and path == "/workspaces":
+        return True
+    if method == "GET" and path.startswith("/workspaces/") and path.endswith("/git-credential"):
+        return path.count("/") == 3
+    return method == "POST" and path == "/runs"
+
+
+_SECURITY_HEADERS: list[tuple[bytes, bytes]] = [
+    (b"x-content-type-options", b"nosniff"),
+    (b"cache-control", b"no-store"),
+    (b"referrer-policy", b"no-referrer"),
+]
+
 # Explicit allowlist, module-level. Adding a path here is the ONLY way to ship an
 # unauthenticated route (D-06). Deliberately does NOT include the API docs endpoints or /peers —
 # peer discovery is a privileged surface, not a public health check.
@@ -142,7 +170,7 @@ class AuthMiddleware:
         user, token_id = resolved
 
         scope["state"] = {**scope.get("state", {}), "user": user, "token_id": token_id}
-        await self.app(scope, receive, send)
+        await self._dispatch(scope, receive, send, token_id)
 
     async def _handle_workspace_token(self, scope, receive, send, auth_store, token, pepper) -> None:
         """AI9: resolve a workspace-scoped token, check its key binding, and only
@@ -174,7 +202,43 @@ class AuthMiddleware:
             "workspace_scope": ws_token.workspace_id,
             "workspace_token": ws_token,
         }
-        await self.app(scope, receive, send)
+        await self._dispatch(scope, receive, send, ws_token.token_id)
+
+    async def _dispatch(self, scope, receive, send, token_id) -> None:
+        """Run the app for an authenticated request: enforce the per-token request budget
+        on the hot routes and add the security response headers."""
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        state = getattr(scope.get("app"), "state", None)
+        limiter = getattr(state, "request_budget_limiter", None)
+        if limiter is not None and _budgeted_route(scope.get("method", "GET"), scope["path"]):
+            if not limiter.allow(str(token_id)):
+                log.warning("request_budget_exceeded", path=scope["path"], token_id=str(token_id))
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": _TOO_MANY_REQUESTS_STATUS,
+                        "headers": [
+                            *_TOO_MANY_REQUESTS_HEADERS,
+                            *_SECURITY_HEADERS,
+                            (b"retry-after", b"60"),
+                        ],
+                    }
+                )
+                await send(
+                    {"type": "http.response.body", "body": b'{"detail":"request budget exceeded"}'}
+                )
+                return
+
+        async def send_with_headers(message) -> None:
+            if message["type"] == "http.response.start":
+                present = {k.lower() for k, _ in message.get("headers", [])}
+                extra = [h for h in _SECURITY_HEADERS if h[0] not in present]
+                message = {**message, "headers": [*message.get("headers", []), *extra]}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
 
     @staticmethod
     async def _forbid(scope: dict, send) -> None:
@@ -199,7 +263,7 @@ class AuthMiddleware:
             self._last_prune_at = now
 
         ip = _client_ip(scope)
-        if not self._failed_auth_limiter.allow(ip):
+        if not self._failed_auth_limiter.allow(_failed_auth_key(scope)):
             log.warning("auth_rate_limited", path=scope.get("path"), client_ip=ip)
             if scope.get("type") == "websocket":
                 await send({"type": "websocket.close", "code": 4429})
