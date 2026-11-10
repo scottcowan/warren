@@ -145,9 +145,19 @@ class Mapping:
         return f"{self.server}/{self.workspace}:{self.remote_port}"
 
     @property
+    def resolved_socket_path(self) -> str | None:
+        """The unix socket this mapping listens on (the default path when none was
+        chosen); None for tcp mappings."""
+        if self.listen != "unix":
+            return None
+        if self.socket_path:
+            return self.socket_path
+        return str(proxy_unix.default_socket_path(self.server, self.workspace, self.name or str(self.remote_port)))
+
+    @property
     def address(self) -> str:
         if self.listen == "unix":
-            return f"unix:{self.socket_path or '<default socket>'}"
+            return f"unix:{self.resolved_socket_path}"
         return f"http://{LOOPBACK_HOST}:{self.local_port}"
 
 

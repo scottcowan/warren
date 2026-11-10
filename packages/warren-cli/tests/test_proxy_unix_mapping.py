@@ -107,3 +107,69 @@ def test_unlink_owned_socket_only_removes_our_sockets(tmp_path):
     link.symlink_to(reg)
     assert proxy_unix.unlink_owned_socket(str(link)) is False and link.is_symlink()
     assert proxy_unix.unlink_owned_socket(str(d / "missing")) is False
+
+
+def test_cli_add_unix_prints_socket_path_and_curl_example(tmp_path):
+    import json as _json
+
+    from typer.testing import CliRunner
+
+    from warren_cli.main import app
+    from test_proxy import _config
+
+    runner = CliRunner()
+    cfg = _config(tmp_path)
+    sock = "/tmp/wr-test.sock"
+    r = runner.invoke(app, ["proxy", "add", "ws1", "3773", "--unix", "--socket", sock, "--kind", "http", "--config", str(cfg)])
+    assert r.exit_code == 0, r.output
+    assert f"unix:{sock}" in r.output
+    assert f"curl --unix-socket {sock} http://localhost/" in r.output
+    assert "127.0.0.1" not in r.output
+    listed = runner.invoke(app, ["proxy", "list"])
+    assert sock in listed.output
+    data = _json.loads(runner.invoke(app, ["proxy", "list", "--json"]).output)
+    assert data[0]["listen"] == "unix"
+    r = runner.invoke(app, ["proxy", "add", "ws1", "2222", "--unix", "--local-port", "47300", "--config", str(cfg)])
+    assert r.exit_code != 0
+    r = runner.invoke(app, ["proxy", "add", "ws1", "2222", "--socket", sock, "--config", str(cfg)])
+    assert r.exit_code == 2 and "--unix" in r.output
+    assert runner.invoke(app, ["proxy", "rm", "ws1"]).exit_code == 0
+
+
+def test_cli_add_unix_refused_on_windows(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from warren_cli import proxy_unix
+    from warren_cli.main import app
+    from test_proxy import _config
+
+    monkeypatch.setattr(proxy_unix, "supported", lambda: False)
+    r = CliRunner().invoke(app, ["proxy", "add", "ws1", "3773", "--unix", "--config", str(_config(tmp_path))])
+    assert r.exit_code == 2 and "not supported" in r.output
+
+
+def test_cli_rm_unlinks_only_a_real_socket(tmp_path):
+    import socket
+    import tempfile
+    from pathlib import Path
+
+    from typer.testing import CliRunner
+
+    from warren_cli.main import app
+    from test_proxy import _config
+
+    d = Path(tempfile.mkdtemp(prefix="wu"))
+    sp = str(d / "a.sock")
+    s = socket.socket(socket.AF_UNIX)
+    s.bind(sp)
+    s.close()
+    runner = CliRunner()
+    cfg = _config(tmp_path)
+    runner.invoke(app, ["proxy", "add", "ws1", "3773", "--unix", "--socket", sp, "--config", str(cfg)])
+    assert runner.invoke(app, ["proxy", "rm", "ws1"]).exit_code == 0
+    assert not Path(sp).exists()
+    reg = d / "plain"
+    reg.write_text("x")
+    runner.invoke(app, ["proxy", "add", "ws1", "3773", "--unix", "--socket", str(reg), "--config", str(cfg)])
+    assert runner.invoke(app, ["proxy", "rm", "ws1"]).exit_code == 0
+    assert reg.exists()
