@@ -65,7 +65,8 @@ echo "sshd -T: $(grep -cE '^(listenaddress|authenticationmethods|passwordauthent
 
 step "sshd -T: a hostile drop-in cannot weaken the hardening"
 hostile="$(docker run --rm --user 0 --entrypoint sh "$IMG" -c \
-    "mkdir -p /etc/ssh/sshd_config.d && printf 'PasswordAuthentication yes\nPermitRootLogin yes\nAllowAgentForwarding yes\n' > /etc/ssh/sshd_config.d/evil.conf && ssh-keygen -q -t ed25519 -N '' -f /tmp/k && /usr/sbin/sshd -T -f /etc/ssh/sshd_config -h /tmp/k" 2>/dev/null)"
+    "mkdir -p /etc/ssh/sshd_config.d && printf 'PasswordAuthentication yes\nPermitRootLogin yes\nAllowAgentForwarding yes\n' > /etc/ssh/sshd_config.d/evil.conf && chmod 644 /etc/ssh/sshd_config.d/evil.conf && su-exec warren sh -c \"ssh-keygen -q -t ed25519 -N '' -f /tmp/k && /usr/sbin/sshd -T -f /etc/ssh/sshd_config -h /tmp/k\"" 2>&1)" \
+    || { printf '%s\n' "$hostile" | tail -5 >&2; fail "sshd -T with hostile drop-in failed"; }
 for want in 'passwordauthentication no' 'permitrootlogin no' 'allowagentforwarding no'; do
     grep -qxF "$want" <<<"$hostile" || fail "sshd -T with hostile drop-in: expected '$want'"
 done
