@@ -280,6 +280,8 @@ class MappingStore:
         local_port: int | None = None,
         name: str | None = None,
         kind: str | None = None,
+        listen: str | None = None,
+        socket_path: str | None = None,
         port_base: int = 47100,
         port_free: Callable[[int], bool] = _port_bindable,
     ) -> tuple[Mapping, bool]:
@@ -306,6 +308,13 @@ class MappingStore:
             raise ProxyError(f"remote port {remote_port} is not a TCP port")
         if local_port is not None and not _valid_port(local_port):
             raise ProxyError(f"local port {local_port} is not a TCP port")
+        if listen is not None and listen not in LISTENS:
+            raise ProxyError(f"unknown listen mode {listen!r} (expected one of: {', '.join(LISTENS)})")
+        if socket_path is not None:
+            if listen != "unix":
+                raise ProxyError("a socket path needs listen=unix")
+            if not os.path.isabs(socket_path) or "\0" in socket_path:
+                raise ProxyError(f"socket path {socket_path!r} must be absolute")
         mappings = self.load()
         existing = next((m for m in mappings if m.key == (server, workspace, remote_port)), None)
         if name:
@@ -321,7 +330,29 @@ class MappingStore:
                         f"remove one with `warren proxy rm`"
                     )
                 existing = named
-        if existing and (local_port is None or local_port == existing.local_port):
+        if listen == "unix" or (listen is None and existing is not None and existing.listen == "unix"):
+            if local_port is not None:
+                raise ProxyError("a unix-socket mapping has no local port; drop --local-port")
+            sock = socket_path if socket_path is not None else (existing.socket_path if existing else None)
+            if sock is not None:
+                clash = next((m for m in mappings if m is not existing and m.socket_path == sock), None)
+                if clash is not None:
+                    raise ProxyError(f"socket path {sock} is already used by {clash.label}")
+            mapping = Mapping(
+                server=server,
+                workspace=workspace,
+                remote_port=remote_port,
+                local_port=0,
+                name=name or (existing.name if existing else None),
+                kind=kind or (existing.kind if existing else "tcp"),
+                listen="unix",
+                socket_path=sock,
+            )
+            if existing == mapping and existing.name == mapping.name:
+                return existing, False
+            self.save([*(m for m in mappings if m is not existing), mapping])
+            return mapping, existing is None
+        if existing and existing.listen == "tcp" and (local_port is None or local_port == existing.local_port):
             new_kind = kind or existing.kind
             if (
                 (existing.name or None) == (name or existing.name)
@@ -344,10 +375,10 @@ class MappingStore:
         name = name or (existing.name if existing else None)
         kind = kind or (existing.kind if existing else "tcp")
         others = [m for m in mappings if m is not existing]
-        used = {m.local_port for m in others}
+        used = {m.local_port for m in others if m.listen == "tcp"}
         if local_port is not None:
             if local_port in used:
-                owner = next(m for m in others if m.local_port == local_port)
+                owner = next(m for m in others if m.listen == "tcp" and m.local_port == local_port)
                 raise ProxyError(f"local port {local_port} is already used by {owner.label}")
             if not port_free(local_port):
                 raise ProxyError(f"local port {local_port} is already in use by another process")
@@ -373,7 +404,7 @@ class MappingStore:
             if server is not None and m.server != server:
                 return False
             if selector.isdigit():
-                return m.local_port == int(selector)
+                return m.listen == "tcp" and m.local_port == int(selector)
             ws_, slash, port_name = selector.rpartition("/")
             if slash and ws_ and port_name:
                 return m.workspace == ws_ and m.name == port_name

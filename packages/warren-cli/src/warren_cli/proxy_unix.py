@@ -157,3 +157,19 @@ def peer_uid(sock: socket.socket) -> int | None:
 def peer_allowed(sock: socket.socket) -> bool:
     """True only when the peer is provably this user (fails closed)."""
     return peer_uid(sock) == os.getuid()
+
+
+def unlink_owned_socket(path: str) -> bool:
+    """Remove ``path`` only if it is a socket (not a symlink) owned by this user;
+    True when it was removed."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+        return False
+    try:
+        os.unlink(path)
+    except OSError:
+        return False
+    return True
