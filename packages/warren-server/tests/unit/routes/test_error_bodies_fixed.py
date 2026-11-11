@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from warren.http_errors import fixed_detail
 
-_SECRET = "/home/secret/path http://169.254.169.254/x"
+_SECRET = "/srv/internal/path http://169.254.169.254/x"
 
 
 def test_fixed_detail_never_echoes_exception_text() -> None:
