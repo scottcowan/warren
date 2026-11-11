@@ -30,6 +30,8 @@ from typing import Awaitable, Callable
 
 from fastapi import HTTPException, Request
 
+from warren.http_errors import fixed_detail
+
 IdentityResolver = Callable[[Request], Awaitable[str]]
 
 _RESOLVERS: dict[str, IdentityResolver] = {}
@@ -90,7 +92,7 @@ async def _aws_identity_resolver(request: Request) -> str:
     except AwsIdentityError as exc:
         raise HTTPException(
             status_code=401,
-            detail={"error": "aws_identity_invalid", "detail": str(exc)},
+            detail={"error": "aws_identity_invalid", "detail": fixed_detail("aws_identity_invalid", exc)},
         ) from exc
 
 
