@@ -10,7 +10,7 @@ can never exist with zero tokens.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import aiosqlite
 import structlog
@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from warren.auth.deps import current_token_id, require_admin
 from warren.auth.models import Token, User
+from warren.auth.scopes import default_expiry
 from warren.auth.store import LastAdminError, TokenLimitReached
 from warren.auth.tokens import derive_token_pepper, generate_token, hash_token
 from warren.state.errors import StateConflict
@@ -59,9 +60,11 @@ class UserDisableResponse(BaseModel):
     revoked_token_count: int
 
 
-def _token_expiry(request: Request) -> datetime:
+async def _token_expiry(request: Request, acting_token_id: str | None) -> datetime:
+    """Default expiry, clamped so the new token never outlives the token minting it."""
     ttl_days = request.app.state.settings.token_ttl_days
-    return datetime.now(timezone.utc) + timedelta(days=ttl_days)
+    parent = await request.app.state.auth_store.get_token(acting_token_id) if acting_token_id else None
+    return default_expiry(datetime.now(timezone.utc), ttl_days, parent)
 
 
 @router.post("/users", status_code=201, response_model=UserCreateResponse)
@@ -82,7 +85,7 @@ async def create_user(
     token = await store.create_token(
         user_id=user.user_id,
         hashed_token=hashed,
-        expires_at=_token_expiry(request),
+        expires_at=await _token_expiry(request, acting_token_id),
         created_by_token_id=acting_token_id,
     )
 
@@ -133,7 +136,7 @@ async def mint_token(
         token = await store.create_token(
             user_id=user.user_id,
             hashed_token=hashed,
-            expires_at=_token_expiry(request),
+            expires_at=await _token_expiry(request, acting_token_id),
             created_by_token_id=acting_token_id,
             max_active=settings.max_tokens_per_user,
         )
@@ -238,7 +241,8 @@ async def revoke_token(
     """
     store = request.app.state.auth_store
 
-    revoked = await store.revoke_token(token_id)
+    # The token and everything minted from it, transitively.
+    revoked = await store.revoke_token_lineage(token_id)
     if not revoked:
         raise HTTPException(status_code=404, detail="token not found")
 

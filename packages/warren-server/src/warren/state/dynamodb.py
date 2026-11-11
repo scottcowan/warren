@@ -67,6 +67,7 @@ from typing import Any, get_args
 
 import structlog
 from warren.auth.models import Token, User, WorkspaceToken
+from warren.auth.scopes import DEFAULT_SCOPE, check_child_token
 from warren.auth.store import LastAdminError, TokenLimitReached
 from warren.registry.models import Workspace, WorkspaceStatus
 from warren.registry.store import (
@@ -958,6 +959,7 @@ def _item_to_token(item: dict) -> Token:
         expires_at=datetime.fromisoformat(item["expires_at"]) if item.get("expires_at") else None,
         revoked_at=datetime.fromisoformat(item["revoked_at"]) if item.get("revoked_at") else None,
         created_by_token_id=item.get("created_by_token_id"),
+        scope=item.get("scope") or DEFAULT_SCOPE,
     )
 
 
@@ -984,16 +986,25 @@ class DynamoAuthStore:
         """The token item and its by-hash and by-id pointers, for a `tokens` row."""
         ttl = self._token_ttl(fields.get("expires_at"), fields.get("revoked_at"))
         uid, tid = fields["user_id"], fields["token_id"]
-        return [
+        items = [
             {
                 "pk": f"USER#{uid}", "sk": f"TOKEN#{tid}", "token_id": tid, "user_id": uid,
                 "hashed_token": fields["hashed_token"], "created_at": fields["created_at"],
                 "expires_at": fields.get("expires_at"), "revoked_at": fields.get("revoked_at"),
-                "created_by_token_id": fields.get("created_by_token_id"), "ttl": ttl,
+                "created_by_token_id": fields.get("created_by_token_id"),
+                "scope": fields.get("scope") or DEFAULT_SCOPE, "ttl": ttl,
             },
             {"pk": f"TOKENHASH#{fields['hashed_token']}", "sk": "META", "token_id": tid, "user_id": uid, "ttl": ttl},
             {"pk": f"TOKENID#{tid}", "sk": "META", "user_id": uid, "ttl": ttl},
         ]
+        if fields.get("created_by_token_id"):
+            # Lineage index: lets a revoke find a token's children with one Query, whichever
+            # user's partition they live in.
+            items.append({
+                "pk": f"TOKENCHILD#{fields['created_by_token_id']}", "sk": f"TOKEN#{tid}",
+                "token_id": tid, "user_id": uid, "ttl": ttl,
+            })
+        return items
 
     def workspace_token_items(self, fields: dict[str, Any]) -> list[dict[str, Any]]:
         ttl = self._token_ttl(fields["expires_at"], fields.get("revoked_at"))
@@ -1117,7 +1128,11 @@ class DynamoAuthStore:
         expires_at: datetime | None = None,
         created_by_token_id: str | None = None,
         max_active: int | None = None,
+        scope: str = DEFAULT_SCOPE,
     ) -> Token:
+        check_child_token(
+            await self.get_token(created_by_token_id) if created_by_token_id else None, scope, expires_at
+        )
         token_id = uuid.uuid4().hex
         expires_iso = expires_at.isoformat() if expires_at else None
         for attempt in range(_MAX_ATTEMPTS):
@@ -1133,6 +1148,7 @@ class DynamoAuthStore:
             items = self.token_items({
                 "token_id": token_id, "user_id": user_id, "hashed_token": hashed_token,
                 "created_at": now, "expires_at": expires_iso, "created_by_token_id": created_by_token_id,
+                "scope": scope,
             })
             seq_condition = "attribute_exists(pk) AND " + (
                 "#q = :seq" if "token_seq" in user else "attribute_not_exists(#q)"
@@ -1147,13 +1163,14 @@ class DynamoAuthStore:
             try:
                 await self._t.transact(ops)
             except TransactionCancelled as exc:
-                if exc.failed(0) or exc.failed(1) or exc.failed(2):
+                if any(exc.failed(i) for i in range(len(items))):
                     raise StateConflict("token hash or id already exists") from exc
                 await _backoff(attempt)  # a concurrent mint for this user: count again
                 continue
             return Token(
                 token_id=token_id, user_id=user_id, created_at=datetime.fromisoformat(now),
                 expires_at=expires_at, revoked_at=None, created_by_token_id=created_by_token_id,
+                scope=scope,  # type: ignore[arg-type]
             )
         raise RuntimeError(f"user {user_id}: token mint kept racing a concurrent mint")
 
@@ -1179,6 +1196,11 @@ class DynamoAuthStore:
                 f"{'WSTOKENID' if ws else 'TOKENID'}#{item['token_id']}",
             ):
                 await self._t.update(pk, sets={"ttl": ttl}, condition=_EXISTS)
+            if not ws and item.get("created_by_token_id"):
+                await self._t.update(
+                    f"TOKENCHILD#{item['created_by_token_id']}", f"TOKEN#{item['token_id']}",
+                    sets={"ttl": ttl}, condition=_EXISTS,
+                )
         return ok
 
     async def revoke_all_tokens_for_user(self, user_id: str) -> int:
@@ -1207,6 +1229,13 @@ class DynamoAuthStore:
             return None
         return _item_to_user(user), token["token_id"]
 
+    async def get_active_user_and_token_by_hashed_token(self, hashed_token: str) -> tuple[User, Token] | None:
+        resolved = await self.get_active_user_and_token_id_by_hashed_token(hashed_token)
+        if resolved is None:
+            return None
+        token = await self.get_token(resolved[1])
+        return (resolved[0], token) if token is not None else None
+
     async def get_token(self, token_id: str) -> Token | None:
         pointer = await self._t.get(f"TOKENID#{token_id}")
         if pointer is None:
@@ -1222,6 +1251,41 @@ class DynamoAuthStore:
         if item is None or item.get("revoked_at"):
             return False
         return await self._revoke(item, _utcnow_iso())
+
+    async def revoke_token_lineage(self, token_id: str) -> int:
+        """Revoke `token_id` and all its descendants; see the SQLite store. Children come
+        from the TOKENCHILD# index (a Query, never a Scan), plus a Query of each involved
+        user's own partition for tokens minted before the index existed."""
+        root = await self.get_token(token_id)
+        if root is None:
+            return 0
+        seen = {token_id}
+        frontier = [token_id]
+        users: dict[str, list[dict]] = {}
+        user_ids = {root.user_id}
+        while frontier:
+            found: set[str] = set()
+            for parent in frontier:
+                for it in await self._t.query(f"TOKENCHILD#{parent}", "TOKEN#"):
+                    found.add(it["token_id"])
+                    if it["user_id"] not in user_ids:
+                        user_ids.add(it["user_id"])
+            for uid in user_ids:
+                if uid not in users:
+                    users[uid] = await self._t.query(f"USER#{uid}", "TOKEN#")
+                found.update(it["token_id"] for it in users[uid] if it.get("created_by_token_id") in frontier)
+            frontier = [t for t in found if t not in seen]
+            seen.update(frontier)
+        now = _utcnow_iso()
+        count = 0
+        for tid in seen:
+            pointer = await self._t.get(f"TOKENID#{tid}")
+            if pointer is None:
+                continue
+            item = await self._t.get(f"USER#{pointer['user_id']}", f"TOKEN#{tid}")
+            if item is not None and not item.get("revoked_at") and await self._revoke(item, now):
+                count += 1
+        return count
 
     # -- workspace tokens ----------------------------------------------------
 

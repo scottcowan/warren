@@ -11,13 +11,14 @@ supplying the right id.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 from warren.auth.deps import current_token_id, current_user
 from warren.auth.models import Token, User
+from warren.auth.scopes import DEFAULT_SCOPE, TokenLineageViolation, TokenScope, default_expiry
 from warren.auth.store import TokenLimitReached
 from warren.auth.tokens import derive_token_pepper, generate_token, hash_token
 
@@ -33,11 +34,20 @@ class MintedToken(BaseModel):
     token: str
     created_at: datetime
     expires_at: datetime | None = None
+    scope: TokenScope = DEFAULT_SCOPE
+
+
+class MintRequest(BaseModel):
+    """Optional body. Omitting it mints a `full` token as before. A scope broader than the
+    calling token's is refused (403); the expiry is clamped to the calling token's."""
+
+    scope: TokenScope = DEFAULT_SCOPE
 
 
 @router.post("", status_code=201, response_model=MintedToken)
 async def mint_own_token(
     request: Request,
+    body: MintRequest | None = None,
     user: User = Depends(current_user),
     acting_token_id: str | None = Depends(current_token_id),
 ) -> MintedToken:
@@ -46,8 +56,8 @@ async def mint_own_token(
     Issue #11: capped at `settings.max_tokens_per_user` live (non-expired, non-revoked)
     tokens -- previously any valid token could mint unlimited further ones, unboundedly
     growing a stolen token's blast radius. `created_by_token_id` records which token
-    minted this one (provenance for a possible future cascading-revoke-by-lineage
-    feature; not implemented yet).
+    minted this one: the child is never broader or longer-lived than that token, and
+    revoking the parent revokes the child.
     """
     store = request.app.state.auth_store
     settings = request.app.state.settings
@@ -55,7 +65,9 @@ async def mint_own_token(
 
     raw_token = generate_token()
     hashed = hash_token(raw_token, pepper)
-    expires_at = datetime.now(timezone.utc) + timedelta(days=settings.token_ttl_days)
+    scope = body.scope if body is not None else DEFAULT_SCOPE
+    parent = await store.get_token(acting_token_id) if acting_token_id else None
+    expires_at = default_expiry(datetime.now(timezone.utc), settings.token_ttl_days, parent)
     try:
         token = await store.create_token(
             user_id=user.user_id,
@@ -63,7 +75,10 @@ async def mint_own_token(
             expires_at=expires_at,
             created_by_token_id=acting_token_id,
             max_active=settings.max_tokens_per_user,
+            scope=scope,
         )
+    except TokenLineageViolation as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from None
     except TokenLimitReached:
         raise HTTPException(
             status_code=429,
@@ -77,6 +92,7 @@ async def mint_own_token(
         token=raw_token,
         created_at=token.created_at,
         expires_at=token.expires_at,
+        scope=token.scope,
     )
 
 
@@ -102,10 +118,11 @@ async def revoke_own_token(
     if token is None or token.user_id != user.user_id:
         raise HTTPException(status_code=404, detail="token not found")
 
-    revoked = await store.revoke_token(token_id)
+    # The token and everything minted from it (directly or transitively).
+    revoked = await store.revoke_token_lineage(token_id)
     if not revoked:
         raise HTTPException(status_code=404, detail="token not found")
 
-    log.info("self_token_revoked", user_id=user.user_id, token_id=token_id)
+    log.info("self_token_revoked", user_id=user.user_id, token_id=token_id, revoked=revoked)
 
     return Response(status_code=204)

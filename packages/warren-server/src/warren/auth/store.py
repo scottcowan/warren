@@ -8,6 +8,7 @@ from pathlib import Path
 
 import aiosqlite
 from warren.auth.models import Token, User, WorkspaceToken
+from warren.auth.scopes import DEFAULT_SCOPE, check_child_token
 from warren.registry.store import open_db
 
 
@@ -35,7 +36,7 @@ def _row_to_user(row: aiosqlite.Row | tuple) -> User:
 
 
 def _row_to_token(row: aiosqlite.Row | tuple) -> Token:
-    token_id, user_id, created_at, expires_at, revoked_at, created_by_token_id = row
+    token_id, user_id, created_at, expires_at, revoked_at, created_by_token_id, scope = row
     return Token(
         token_id=token_id,
         user_id=user_id,
@@ -43,6 +44,7 @@ def _row_to_token(row: aiosqlite.Row | tuple) -> Token:
         expires_at=datetime.fromisoformat(expires_at) if expires_at else None,
         revoked_at=datetime.fromisoformat(revoked_at) if revoked_at else None,
         created_by_token_id=created_by_token_id,
+        scope=scope,
     )
 
 
@@ -190,9 +192,15 @@ class AuthStore:
         expires_at: datetime | None = None,
         created_by_token_id: str | None = None,
         max_active: int | None = None,
+        scope: str = DEFAULT_SCOPE,
     ) -> Token:
         """Insert a token. With `max_active`, the live-token count and the insert are one
-        statement, so concurrent mints can't overshoot the cap (TokenLimitReached)."""
+        statement, so concurrent mints can't overshoot the cap (TokenLimitReached). A child
+        (`created_by_token_id` naming a known token) may not be broader or longer-lived than
+        its parent (TokenLineageViolation)."""
+        check_child_token(
+            await self.get_token(created_by_token_id) if created_by_token_id else None, scope, expires_at
+        )
         token_id = uuid.uuid4().hex
         now = _utcnow_iso()
         expires_at_iso = expires_at.isoformat() if expires_at else None
@@ -200,16 +208,16 @@ class AuthStore:
             """
             INSERT INTO tokens (
                 token_id, user_id, hashed_token, created_at, expires_at, revoked_at,
-                created_by_token_id
+                created_by_token_id, scope
             )
-            SELECT ?, ?, ?, ?, ?, NULL, ?
+            SELECT ?, ?, ?, ?, ?, NULL, ?, ?
             WHERE ? IS NULL OR (
                 SELECT COUNT(*) FROM tokens
                 WHERE user_id = ? AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > ?)
             ) < ?
             """,
             (
-                token_id, user_id, hashed_token, now, expires_at_iso, created_by_token_id,
+                token_id, user_id, hashed_token, now, expires_at_iso, created_by_token_id, scope,
                 max_active, user_id, now, max_active,
             ),
         )
@@ -222,11 +230,12 @@ class AuthStore:
             expires_at=expires_at,
             revoked_at=None,
             created_by_token_id=created_by_token_id,
+            scope=scope,  # type: ignore[arg-type]
         )
 
     async def list_tokens_for_user(self, user_id: str) -> list[Token]:
         async with self._db.execute(
-            "SELECT token_id, user_id, created_at, expires_at, revoked_at, created_by_token_id "
+            "SELECT token_id, user_id, created_at, expires_at, revoked_at, created_by_token_id, scope "
             "FROM tokens WHERE user_id = ? ORDER BY created_at",
             (user_id,),
         ) as cur:
@@ -296,9 +305,20 @@ class AuthStore:
         *user_fields, token_id = row
         return _row_to_user(tuple(user_fields)), token_id
 
+    async def get_active_user_and_token_by_hashed_token(
+        self, hashed_token: str
+    ) -> tuple[User, Token] | None:
+        """Like `get_active_user_and_token_id_by_hashed_token` but returns the whole Token
+        (scope, expiry) so AuthMiddleware can enforce the scope."""
+        resolved = await self.get_active_user_and_token_id_by_hashed_token(hashed_token)
+        if resolved is None:
+            return None
+        token = await self.get_token(resolved[1])
+        return (resolved[0], token) if token is not None else None
+
     async def get_token(self, token_id: str) -> Token | None:
         async with self._db.execute(
-            "SELECT token_id, user_id, created_at, expires_at, revoked_at, created_by_token_id "
+            "SELECT token_id, user_id, created_at, expires_at, revoked_at, created_by_token_id, scope "
             "FROM tokens WHERE token_id = ?",
             (token_id,),
         ) as cur:
@@ -313,6 +333,33 @@ class AuthStore:
             (_utcnow_iso(), token_id),
         )
         return cursor.rowcount == 1
+
+    async def revoke_token_lineage(self, token_id: str) -> int:
+        """Revoke `token_id` and every token descended from it (via created_by_token_id,
+        across users). Iterative, so chain depth is not bounded by the recursion limit.
+        Returns the number newly revoked."""
+        seen = {token_id}
+        frontier = [token_id]
+        while frontier:
+            marks = ",".join("?" * len(frontier))
+            async with self._db.execute(
+                f"SELECT token_id FROM tokens WHERE created_by_token_id IN ({marks})", frontier
+            ) as cur:
+                rows = await cur.fetchall()
+            frontier = [r[0] for r in rows if r[0] not in seen]
+            seen.update(frontier)
+        now = _utcnow_iso()
+        revoked = 0
+        ids = list(seen)
+        for i in range(0, len(ids), 500):
+            chunk = ids[i : i + 500]
+            cursor = await self._db.execute(
+                "UPDATE tokens SET revoked_at = ? WHERE revoked_at IS NULL AND token_id IN "
+                f"({','.join('?' * len(chunk))})",
+                [now, *chunk],
+            )
+            revoked += cursor.rowcount
+        return revoked
 
     async def create_workspace_token(
         self,
