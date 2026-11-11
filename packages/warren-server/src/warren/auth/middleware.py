@@ -22,7 +22,10 @@ import structlog
 from warren.auth.tokens import derive_token_pepper, resolve_active_token
 from warren.auth.workspace_tokens import (
     PROOF_HEADER,
+    body_sha256,
+    is_v2_proof,
     is_workspace_token,
+    read_body,
     resolve_workspace_token,
     scoped_request_allowed,
     verify_proof,
@@ -133,7 +136,7 @@ class AuthMiddleware:
 
         pepper = derive_token_pepper(settings.secret_key.get_secret_value())
         if is_workspace_token(token):
-            await self._handle_workspace_token(scope, receive, send, auth_store, token, pepper)
+            await self._handle_workspace_token(scope, receive, send, auth_store, token, pepper, settings)
             return
         resolved = await resolve_active_token(auth_store, token, pepper)
         if resolved is None:
@@ -144,7 +147,7 @@ class AuthMiddleware:
         scope["state"] = {**scope.get("state", {}), "user": user, "token_id": token_id}
         await self.app(scope, receive, send)
 
-    async def _handle_workspace_token(self, scope, receive, send, auth_store, token, pepper) -> None:
+    async def _handle_workspace_token(self, scope, receive, send, auth_store, token, pepper, settings) -> None:
         """AI9: resolve a workspace-scoped token, check its key binding, and only
         let it through to its own workspace's allow-listed routes."""
         resolved = await resolve_workspace_token(auth_store, token, pepper)
@@ -153,11 +156,21 @@ class AuthMiddleware:
             return
         user, ws_token = resolved
         method = scope.get("method", "GET")
-        if ws_token.public_key is not None and not verify_proof(
-            ws_token.public_key, _header(scope, PROOF_HEADER), method, scope["path"]
-        ):
-            await self._deny_or_throttle(scope, send, reason="workspace_token_proof_invalid")
-            return
+        if ws_token.public_key is not None:
+            proof = _header(scope, PROOF_HEADER)
+            digest = None
+            if is_v2_proof(proof):
+                # v2 proofs cover the body: buffer it (bounded by the outer body limit),
+                # hash it, and replay it to the app.
+                body, receive = await read_body(receive)
+                digest = body_sha256(body)
+            if not verify_proof(
+                ws_token.public_key, proof, method, scope["path"],
+                body_sha256_hex=digest,
+                legacy_until=settings.workspace_token_legacy_proof_until,
+            ):
+                await self._deny_or_throttle(scope, send, reason="workspace_token_proof_invalid")
+                return
         if not scoped_request_allowed(method, scope["path"], ws_token):
             log.warning(
                 "workspace_token_out_of_scope",

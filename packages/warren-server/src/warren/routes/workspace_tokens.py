@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from warren.audit import audit_event
 from warren.auth.deps import current_token_id, current_user, current_workspace_scope
+from warren.auth.store import WorkspaceTokenLimitReached
 from warren.auth.tokens import derive_token_pepper, hash_token
 from warren.auth.workspace_tokens import (
     DEFAULT_TTL_SECONDS,
@@ -27,6 +28,21 @@ from warren.auth.workspace_tokens import (
 log = structlog.get_logger(__name__)
 
 router = APIRouter()
+
+
+_CAP_DETAIL = "too many active workspace tokens"
+
+
+async def _create(request: Request, **fields):
+    """Insert a workspace token under the per-user active cap (429, fixed message)."""
+    user_id = fields["user_id"]
+    try:
+        return await request.app.state.auth_store.create_workspace_token(
+            max_active=request.app.state.settings.max_workspace_tokens_per_user, **fields
+        )
+    except WorkspaceTokenLimitReached:
+        audit_event("workspace_token.issue", request=request, outcome="denied", reason="cap", owner_id=user_id)
+        raise HTTPException(status_code=429, detail=_CAP_DETAIL) from None
 
 
 class WorkspaceTokenRequest(BaseModel):
@@ -69,7 +85,8 @@ async def mint_workspace_token(
     pepper = derive_token_pepper(settings.secret_key.get_secret_value())
     raw = generate_workspace_token()
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=body.ttl_seconds)
-    minted = await request.app.state.auth_store.create_workspace_token(
+    minted = await _create(
+        request,
         workspace_id=workspace_id,
         user_id=user.user_id,
         hashed_token=hash_token(raw, pepper),
@@ -114,7 +131,8 @@ async def reserve_workspace_token(body: WorkspaceTokenRequest, request: Request)
     pepper = derive_token_pepper(settings.secret_key.get_secret_value())
     raw = generate_workspace_token()
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=body.ttl_seconds)
-    minted = await request.app.state.auth_store.create_workspace_token(
+    minted = await _create(
+        request,
         workspace_id=workspace_id,
         user_id=user.user_id,
         hashed_token=hash_token(raw, pepper),

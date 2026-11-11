@@ -67,7 +67,7 @@ from typing import Any, get_args
 
 import structlog
 from warren.auth.models import Token, User, WorkspaceToken
-from warren.auth.store import LastAdminError, TokenLimitReached
+from warren.auth.store import LastAdminError, TokenLimitReached, WorkspaceTokenLimitReached
 from warren.registry.models import Workspace, WorkspaceStatus
 from warren.registry.store import (
     _NON_TERMINAL,
@@ -1006,6 +1006,7 @@ class DynamoAuthStore:
                 "expires_at": fields["expires_at"], "revoked_at": fields.get("revoked_at"),
                 "created_by_token_id": fields.get("created_by_token_id"),
                 "provision_grant": bool(fields.get("provision_grant")), "ttl": ttl,
+                "gsi1pk": f"USERWSTOKENS#{fields['user_id']}", "gsi1sk": f"{fields['created_at']}#{tid}",
             },
             {"pk": f"WSTOKENHASH#{fields['hashed_token']}", "sk": "META", "token_id": tid, "workspace_id": wid, "ttl": ttl},
             {"pk": f"WSTOKENID#{tid}", "sk": "META", "workspace_id": wid, "ttl": ttl},
@@ -1235,9 +1236,20 @@ class DynamoAuthStore:
         public_key: str | None = None,
         created_by_token_id: str | None = None,
         provision_grant: bool = False,
+        max_active: int | None = None,
     ) -> WorkspaceToken:
         token_id = uuid.uuid4().hex
         now = _utcnow_iso()
+        if max_active is not None:
+            # Counted through gsi1 (eventually consistent), so a burst of concurrent mints
+            # can overshoot by the writes still in flight; the cap bounds growth, it is not
+            # an exact quota.
+            live = [
+                it for it in await self._t.query(f"USERWSTOKENS#{user_id}", index=GSI1)
+                if _live(it, _parse(now))
+            ]
+            if len(live) >= max_active:
+                raise WorkspaceTokenLimitReached(user_id)
         items = self.workspace_token_items({
             "token_id": token_id, "workspace_id": workspace_id, "user_id": user_id,
             "hashed_token": hashed_token, "public_key": public_key, "created_at": now,
@@ -1299,6 +1311,11 @@ class DynamoAuthStore:
             condition="#pg = :yes AND attribute_not_exists(#rv)",
             names={"#pg": "provision_grant", "#rv": "revoked_at"}, values={":yes": True},
         )
+
+    async def purge_workspace_tokens(self, older_than: datetime) -> int:
+        """No-op: DynamoDB deletes expired and revoked token items itself (the `ttl`
+        attribute, set from WARREN_DYNAMODB_TOKEN_RETENTION_DAYS)."""
+        return 0
 
     async def revoke_workspace_tokens(self, workspace_id: str, *, keep_token_id: str | None = None) -> int:
         now = _utcnow_iso()

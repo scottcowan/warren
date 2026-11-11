@@ -15,6 +15,10 @@ class TokenLimitReached(Exception):
     """create_token refused: the user already has `max_active` live tokens."""
 
 
+class WorkspaceTokenLimitReached(Exception):
+    """create_workspace_token refused: the user already has `max_active` live workspace tokens."""
+
+
 class LastAdminError(Exception):
     """disable_user refused: the target is the only enabled admin."""
 
@@ -324,16 +328,23 @@ class AuthStore:
         public_key: str | None = None,
         created_by_token_id: str | None = None,
         provision_grant: bool = False,
+        max_active: int | None = None,
     ) -> WorkspaceToken:
+        """Insert a workspace token. With `max_active`, the live-row count and the insert
+        are one statement, so concurrent mints can't overshoot (WorkspaceTokenLimitReached)."""
         token_id = uuid.uuid4().hex
         now = _utcnow_iso()
-        await self._db.execute(
+        cursor = await self._db.execute(
             """
             INSERT INTO workspace_tokens (
                 token_id, workspace_id, user_id, hashed_token, public_key,
                 created_at, expires_at, revoked_at, created_by_token_id, provision_grant
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            SELECT ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?
+            WHERE ? IS NULL OR (
+                SELECT COUNT(*) FROM workspace_tokens
+                WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ?
+            ) < ?
             """,
             (
                 token_id,
@@ -345,8 +356,11 @@ class AuthStore:
                 expires_at.isoformat(),
                 created_by_token_id,
                 int(provision_grant),
+                max_active, user_id, now, max_active,
             ),
         )
+        if cursor.rowcount == 0:
+            raise WorkspaceTokenLimitReached(user_id)
         return WorkspaceToken(
             token_id=token_id,
             workspace_id=workspace_id,
@@ -406,6 +420,15 @@ class AuthStore:
             provision_grant=bool(grant),
             workspace_status=status,
         )
+
+    async def purge_workspace_tokens(self, older_than: datetime) -> int:
+        """Delete rows that expired or were revoked before `older_than`. Returns the count."""
+        cutoff = older_than.isoformat()
+        cursor = await self._db.execute(
+            "DELETE FROM workspace_tokens WHERE expires_at < ? OR revoked_at < ?",
+            (cutoff, cutoff),
+        )
+        return cursor.rowcount
 
     async def consume_provision_grant(self, token_id: str) -> bool:
         """AI8/AJ2: atomically spend a reservation token's one provision."""
