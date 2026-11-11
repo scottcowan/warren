@@ -19,6 +19,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 from warren.audit import audit_event
+from warren.http_errors import fixed_detail
 from warren.auth.deps import (
     current_user,
     current_workspace_scope,
@@ -96,7 +97,7 @@ def _provision_http_error(exc: ProvisionError) -> HTTPException:
     retry_after = getattr(exc, "retry_after_seconds", None)
     return HTTPException(
         status_code=_PROVISION_ERROR_STATUS.get(exc.reason, 500),
-        detail={"error": exc.reason, "detail": str(exc)},
+        detail={"error": exc.reason, "detail": fixed_detail(exc.reason, exc, "workspace provisioning failed")},
         headers={"Retry-After": str(retry_after)} if retry_after is not None else None,
     )
 
@@ -347,7 +348,7 @@ async def _provision_workspace(
             check_key_not_delivered(secret_names, template_cfg.git_crypt_key_secret)
         except GitCryptError as exc:
             raise HTTPException(
-                status_code=422, detail={"error": "template_denied", "detail": str(exc)}
+                status_code=422, detail={"error": "template_denied", "detail": fixed_detail("template_denied", exc)}
             ) from exc
     folders = template_cfg.effective_folders() if template_cfg is not None else []
     if settings is not None:
@@ -363,7 +364,7 @@ async def _provision_workspace(
         agent_spec = template_launch_spec(template_cfg)
     except HarnessSelectionError as exc:
         raise HTTPException(
-            status_code=422, detail={"error": "invalid_template", "detail": str(exc)}
+            status_code=422, detail={"error": "invalid_template", "detail": fixed_detail("invalid_template", exc)}
         ) from exc
     if agent_spec is not None:
         harnesses = sorted({*harnesses, agent_spec["harness"]})
@@ -439,7 +440,7 @@ async def _provision_workspace(
         check_aws_mode(aws_cfg, f"server ({getattr(settings, 'runtime_type', 'podman')})")
     except ValueError as exc:
         raise HTTPException(
-            status_code=422, detail={"error": "invalid_template", "detail": str(exc)}
+            status_code=422, detail={"error": "invalid_template", "detail": fixed_detail("invalid_template", exc)}
         ) from exc
     scope_cfg = template_cfg.scope if template_cfg is not None else None
 
@@ -576,7 +577,7 @@ async def _provision_workspace(
         status_code = _PROVISION_ERROR_STATUS.get(exc.reason, 500)
         raise HTTPException(
             status_code=status_code,
-            detail={"error": exc.reason, "detail": str(exc)},
+            detail={"error": exc.reason, "detail": fixed_detail(exc.reason, exc, "workspace provisioning failed")},
         )
 
     audit_event(
@@ -714,7 +715,7 @@ def _headless_app(app_cmd: str, prompt: str, settings) -> str:
         return headless_command(app_cmd, prompt)
     except ValueError as exc:
         raise HTTPException(
-            status_code=422, detail={"error": "invalid_template", "detail": str(exc)}
+            status_code=422, detail={"error": "invalid_template", "detail": fixed_detail("invalid_template", exc)}
         ) from exc
 
 
@@ -850,7 +851,7 @@ async def _resolve_image(body: ProvisionRequest, request: Request) -> str:
             )
         except HarnessSelectionError as exc:
             raise HTTPException(
-                status_code=422, detail={"error": "invalid_template", "detail": str(exc)}
+                status_code=422, detail={"error": "invalid_template", "detail": fixed_detail("invalid_template", exc)}
             ) from exc
 
         containerfile_rel = getattr(template_cfg, "containerfile", None) or getattr(
@@ -893,7 +894,7 @@ async def _resolve_image(body: ProvisionRequest, request: Request) -> str:
                     status_code = _PROVISION_ERROR_STATUS.get(exc.reason, 422)
                     raise HTTPException(
                         status_code=status_code,
-                        detail={"error": exc.reason, "detail": str(exc)},
+                        detail={"error": exc.reason, "detail": fixed_detail(exc.reason, exc, "workspace provisioning failed")},
                     ) from exc
             # Runtime has no build capability -- fall through to tag lookup
             # rather than raising; this is a capability gap, not a project
@@ -1199,7 +1200,7 @@ async def pull_workspace_git(workspace_id: str, request: Request) -> GitPullResu
         status_code = _PROVISION_ERROR_STATUS.get(exc.reason, 500)
         raise HTTPException(
             status_code=status_code,
-            detail={"error": exc.reason, "detail": str(exc)},
+            detail={"error": exc.reason, "detail": fixed_detail(exc.reason, exc, "workspace provisioning failed")},
         )
     if result is None:
         raise HTTPException(status_code=404, detail="workspace not found")
@@ -1260,10 +1261,10 @@ async def _owned_workspace_repo(request: Request, workspace_id: str, repo: str, 
 
 def _git_http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, TurnRefNotFound):
-        return HTTPException(status_code=404, detail={"error": "ref_not_found", "detail": str(exc)})
+        return HTTPException(status_code=404, detail={"error": "ref_not_found", "detail": fixed_detail("ref_not_found", exc)})
     if isinstance(exc, TurnRefError):
-        return HTTPException(status_code=422, detail={"error": "invalid_ref", "detail": str(exc)})
-    return HTTPException(status_code=502, detail={"error": "git_failed", "detail": str(exc)})
+        return HTTPException(status_code=422, detail={"error": "invalid_ref", "detail": fixed_detail("invalid_ref", exc)})
+    return HTTPException(status_code=502, detail={"error": "git_failed", "detail": fixed_detail("git_failed", exc)})
 
 
 @router.get("/workspaces/{workspace_id}/refs", response_model=list[RefView])
@@ -1416,7 +1417,7 @@ async def open_exec(
     try:
         exec_relay.validate_argv(argv)
     except ValueError as exc:
-        raise HTTPException(status_code=422, detail={"error": "invalid_argv", "detail": str(exc)}) from exc
+        raise HTTPException(status_code=422, detail={"error": "invalid_argv", "detail": fixed_detail("invalid_argv", exc)}) from exc
     registry = request.app.state.registry
     ws = await registry.store.get(workspace_id)
     if ws is None:

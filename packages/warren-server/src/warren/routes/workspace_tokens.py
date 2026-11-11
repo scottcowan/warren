@@ -15,6 +15,7 @@ import structlog
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 from warren.audit import audit_event
+from warren.http_errors import fixed_detail
 from warren.auth.deps import current_token_id, current_user, current_workspace_scope
 from warren.auth.tokens import derive_token_pepper, hash_token
 from warren.auth.workspace_tokens import (
@@ -63,7 +64,7 @@ async def mint_workspace_token(
         try:
             parse_public_key(body.public_key)
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise HTTPException(status_code=422, detail=fixed_detail("invalid_public_key", exc)) from exc
 
     settings = request.app.state.settings
     pepper = derive_token_pepper(settings.secret_key.get_secret_value())
@@ -107,7 +108,7 @@ async def reserve_workspace_token(body: WorkspaceTokenRequest, request: Request)
         try:
             parse_public_key(body.public_key)
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            raise HTTPException(status_code=422, detail=fixed_detail("invalid_public_key", exc)) from exc
 
     workspace_id = str(uuid.uuid4())
     settings = request.app.state.settings
