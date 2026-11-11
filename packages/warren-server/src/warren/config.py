@@ -419,6 +419,15 @@ class WarrenSettings(BaseSettings):
     # (non-expired, non-revoked) tokens for the user — a revoked/expired token frees up room.
     max_tokens_per_user: int = 10
 
+    # Per-token request budget for the hot authenticated routes (GET /workspaces,
+    # GET /workspaces/{id}/git-credential, POST /runs). A valid token within budget is
+    # never throttled; this only bounds a runaway/stolen-token loop.
+    request_budget_max: int = Field(default=300, ge=1)
+    request_budget_window_seconds: float = Field(default=60.0, gt=0)
+
+    # FastAPI /docs, /redoc and /openapi.json are off unless WARREN_ENABLE_DOCS=1.
+    enable_docs: bool = False
+
     # Idle-TTL reaper for Podman workspaces (LIFE-01, D-01/D-03): a background loop stops
     # any "running" workspace whose egress byte counter (network/egress.py) has not moved
     # in `idle_ttl_seconds`. KNOWN FALSE-POSITIVE MODE (04-RESEARCH.md Security Domain

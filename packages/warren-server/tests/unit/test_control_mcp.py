@@ -264,8 +264,8 @@ def test_new_workspace_applies_bedrock_model_access_like_rest(monkeypatch, tmp_p
         assert all(s.template_env["CLAUDE_CODE_USE_BEDROCK"] == "1" for s in specs)
 
         ok, text = _call(client, ADMIN_TOKEN, "new_workspace", project="demo", template="bedrock_oauth")
-        assert not ok and text.startswith("422") and "AWS identity" in text
+        assert not ok and text.startswith("422") and "invalid_template" in text
         rest = client.post(
             "/workspaces", json={"project": "demo", "template": "bedrock_oauth"}, headers=_headers(ADMIN_TOKEN)
         )
-        assert rest.status_code == 422 and "AWS identity" in rest.text
+        assert rest.status_code == 422 and "invalid_template" in rest.text
