@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import socket
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -53,6 +54,16 @@ class WarrenSettings(BaseSettings):
                 f"(got {len(raw)}) -- generate one with e.g. `openssl rand -base64 32`"
             )
         return v
+
+    @field_validator("workspace_token_legacy_proof_until", mode="before")
+    @classmethod
+    def _blank_legacy_proof_until_means_closed(cls, v: object) -> object:
+        return None if isinstance(v, str) and not v.strip() else v
+
+    @field_validator("workspace_token_legacy_proof_until")
+    @classmethod
+    def _legacy_proof_until_is_utc(cls, v: datetime | None) -> datetime | None:
+        return v.replace(tzinfo=timezone.utc) if v is not None and v.tzinfo is None else v
 
     @field_validator("bedrock_gateway_url")
     @classmethod
@@ -418,6 +429,19 @@ class WarrenSettings(BaseSettings):
     # Mirrors max_workspaces_per_user's per-user-cap convention/naming. Counts only live
     # (non-expired, non-revoked) tokens for the user — a revoked/expired token frees up room.
     max_tokens_per_user: int = 10
+
+    # Cap on a user's live (unexpired, unrevoked) workspace tokens, reservation tokens
+    # included. Mint beyond it returns 429. Expired and revoked rows do not count.
+    max_workspace_tokens_per_user: int = Field(default=50, ge=1)
+    # Expired/revoked workspace-token rows are deleted by a SQLite cleanup loop this many
+    # days after they died (DynamoDB expires them with its own TTL, see
+    # dynamodb_token_retention_days).
+    workspace_token_retention_days: float = Field(default=7.0, ge=0)
+    # Workspace-token proofs: v2 (`X-Warren-Proof: v2.<ts>.<sig>`) signs the request body's
+    # SHA-256; legacy v1 proofs (`<ts>.<sig>`, no body) are accepted, with a deprecation
+    # warning, only until this instant. Set it to an empty string to reject v1 now.
+    # Remove the setting and v1 support in the first release after the date.
+    workspace_token_legacy_proof_until: datetime | None = datetime(2027, 3, 1, tzinfo=timezone.utc)
 
     # Idle-TTL reaper for Podman workspaces (LIFE-01, D-01/D-03): a background loop stops
     # any "running" workspace whose egress byte counter (network/egress.py) has not moved

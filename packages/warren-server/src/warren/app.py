@@ -337,6 +337,18 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
     except Exception:
         log.exception("rate_limiter_pruner_spawn_failed")
 
+    app.state.workspace_token_purger_task = None
+    try:
+        from warren.auth.workspace_tokens import run_workspace_token_purger  # noqa: PLC0415
+
+        app.state.workspace_token_purger_task = asyncio.create_task(
+            run_workspace_token_purger(
+                app.state.auth_store, retention_days=settings.workspace_token_retention_days
+            )
+        )
+    except Exception:
+        log.exception("workspace_token_purger_spawn_failed")
+
     app.state.efs_reaper_task = None
     app.state.efs_reaper_tasks = []
     # One reaper per filesystem, each purging only through that filesystem's own mount:
@@ -479,6 +491,13 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
                 pass
             except Exception:
                 log.exception("git_write_refresh_shutdown_error")
+        purger_task = getattr(app.state, "workspace_token_purger_task", None)
+        if purger_task is not None:
+            purger_task.cancel()
+            try:
+                await purger_task
+            except (asyncio.CancelledError, Exception):
+                pass
         rate_limiter_pruner_task = getattr(app.state, "rate_limiter_pruner_task", None)
         if rate_limiter_pruner_task is not None:
             rate_limiter_pruner_task.cancel()

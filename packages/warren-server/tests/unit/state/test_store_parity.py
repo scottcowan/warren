@@ -328,3 +328,71 @@ async def test_list_for_owner_pages_newest_first_across_statuses(workspace_store
         after = (last.created_at.isoformat() if hasattr(last.created_at, "isoformat") else last.created_at, last.workspace_id)
     assert seen == [f"mine-{i}" for i in reversed(range(7))]
     assert await workspace_store.list_for_owner("nobody", limit=5) == []
+
+
+# -- workspace token cap and purge (auth hardening) ------------------------------
+
+
+async def test_workspace_token_active_cap_counts_live_rows_only(auth_store, workspace_store):
+    from warren.auth.store import WorkspaceTokenLimitReached
+
+    user = await _user(auth_store)
+    other = await _user(auth_store, "bob")
+    await workspace_store.insert(**_ws("ws-cap", owner=user.user_id))
+    soon = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    async def mint(h: str, uid=user.user_id, exp=soon, reservation=False):
+        return await auth_store.create_workspace_token(
+            workspace_id="ws-cap", user_id=uid, hashed_token=h, expires_at=exp,
+            provision_grant=reservation, max_active=2,
+        )
+
+    first = await mint("c1")
+    await mint("c2", reservation=True)
+    with pytest.raises(WorkspaceTokenLimitReached):
+        await mint("c3")
+    assert await auth_store.get_active_workspace_token("c3") is None
+    await mint("o1", uid=other.user_id)  # another user is unaffected
+    await auth_store.revoke_workspace_tokens("ws-cap", keep_token_id=None)  # frees room
+    await mint("c4")
+    assert first.token_id  # the first token was a real row
+
+
+async def test_workspace_token_cap_ignores_expired_rows(auth_store, workspace_store):
+    from warren.auth.store import WorkspaceTokenLimitReached
+
+    user = await _user(auth_store)
+    await workspace_store.insert(**_ws("ws-exp", owner=user.user_id))
+    past = datetime.now(timezone.utc) - timedelta(minutes=5)
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    await auth_store.create_workspace_token(
+        workspace_id="ws-exp", user_id=user.user_id, hashed_token="e1", expires_at=past, max_active=1
+    )
+    await auth_store.create_workspace_token(
+        workspace_id="ws-exp", user_id=user.user_id, hashed_token="e2", expires_at=future, max_active=1
+    )
+    with pytest.raises(WorkspaceTokenLimitReached):
+        await auth_store.create_workspace_token(
+            workspace_id="ws-exp", user_id=user.user_id, hashed_token="e3", expires_at=future, max_active=1
+        )
+
+
+async def test_purge_workspace_tokens_drops_only_dead_rows(auth_store, workspace_store):
+    user = await _user(auth_store)
+    await workspace_store.insert(**_ws("ws-purge", owner=user.user_id))
+    now = datetime.now(timezone.utc)
+    old = await auth_store.create_workspace_token(
+        workspace_id="ws-purge", user_id=user.user_id, hashed_token="p1", expires_at=now - timedelta(days=40)
+    )
+    live = await auth_store.create_workspace_token(
+        workspace_id="ws-purge", user_id=user.user_id, hashed_token="p2", expires_at=now + timedelta(hours=1)
+    )
+    removed = await auth_store.purge_workspace_tokens(now - timedelta(days=30))
+    # DynamoDB expires rows with its own TTL attribute and purges nothing here.
+    assert removed in (0, 1)
+    if hasattr(auth_store, "_db"):
+        assert removed == 1
+        async with auth_store._db.execute("SELECT token_id FROM workspace_tokens") as cur:
+            assert [r[0] for r in await cur.fetchall()] == [live.token_id]
+    assert old.token_id != live.token_id
+    assert await auth_store.get_active_workspace_token("p2") is not None

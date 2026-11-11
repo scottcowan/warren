@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -14,7 +15,7 @@ from fastapi.testclient import TestClient
 
 from tests.conftest import TEST_BOOTSTRAP_TOKEN
 from warren.app import app
-from warren.auth.workspace_tokens import proof_message, scoped_route_allowed
+from warren.auth.workspace_tokens import proof_message, proof_message_v2, scoped_route_allowed
 from warren.registry.store import WorkspaceStore
 
 _ADMIN = {"Authorization": f"Bearer {TEST_BOOTSTRAP_TOKEN}"}
@@ -264,3 +265,95 @@ async def test_provision_grant_column_is_added_to_an_existing_database(tmp_path)
             assert "provision_grant" in {row[1] for row in await cur.fetchall()}
     finally:
         await db.close()
+
+
+def _proof_v2(key, method, path, body: bytes = b"", ts: int | None = None) -> str:
+    import hashlib
+
+    ts = int(time.time()) if ts is None else ts
+    sig = key.sign(proof_message_v2(ts, method, path, hashlib.sha256(body).hexdigest()))
+    return f"v2.{ts}.{base64.urlsafe_b64encode(sig).decode().rstrip('=')}"
+
+
+def _pub(key) -> str:
+    return base64.b64encode(
+        key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    ).decode()
+
+
+def test_v2_proof_binds_the_request_body(env_defaults):
+    key = Ed25519PrivateKey.generate()
+    path = "/workspaces/ws-a/exec"
+    body = b'{"command": ["true"]}'
+    hdr = {"content-type": "application/json"}
+    with _client() as (client, _):
+        token = _mint(client, public_key=_pub(key))["token"]
+        good = _proof_v2(key, "POST", path, body)
+        resp = client.post(path, content=body, headers=_bearer(token, **hdr, **{"X-Warren-Proof": good}))
+        assert resp.status_code not in (401, 403)
+        # the same proof replayed with a different body is refused
+        swapped = client.post(
+            path, content=b'{"command": ["id"]}', headers=_bearer(token, **hdr, **{"X-Warren-Proof": good})
+        )
+        assert swapped.status_code == 401
+        status = "/workspaces/ws-a/status"
+        ok = client.get(status, headers=_bearer(token, **{"X-Warren-Proof": _proof_v2(key, "GET", status)}))
+        assert ok.status_code == 200
+
+
+@pytest.mark.parametrize("until", ["", "2020-01-01T00:00:00Z"])
+def test_v1_proof_rejected_once_window_closed(env_defaults, monkeypatch, until):
+    monkeypatch.setenv("WARREN_WORKSPACE_TOKEN_LEGACY_PROOF_UNTIL", until)
+    key = Ed25519PrivateKey.generate()
+    path = "/workspaces/ws-a/status"
+    with _client() as (client, _):
+        token = _mint(client, public_key=_pub(key))["token"]
+        v1 = _bearer(token, **{"X-Warren-Proof": _proof(key, "GET", path)})
+        assert client.get(path, headers=v1).status_code == 401
+        v2 = _bearer(token, **{"X-Warren-Proof": _proof_v2(key, "GET", path)})
+        assert client.get(path, headers=v2).status_code == 200
+
+
+def test_v1_proof_accepted_inside_default_window_with_deprecation_log(env_defaults):
+    from structlog.testing import capture_logs
+
+    key = Ed25519PrivateKey.generate()
+    path = "/workspaces/ws-a/status"
+    with _client() as (client, _):
+        token = _mint(client, public_key=_pub(key))["token"]
+        with capture_logs() as logs:
+            resp = client.get(path, headers=_bearer(token, **{"X-Warren-Proof": _proof(key, "GET", path)}))
+        assert resp.status_code == 200
+        assert any(entry["event"] == "workspace_token_proof_v1_deprecated" for entry in logs)
+
+
+def test_per_user_active_workspace_token_cap(env_defaults, monkeypatch):
+    monkeypatch.setenv("WARREN_MAX_WORKSPACE_TOKENS_PER_USER", "2")
+    with _client() as (client, _):
+        _mint(client)
+        assert client.post("/workspace-tokens", json={}, headers=_ADMIN).status_code == 201
+        for resp in (
+            client.post("/workspaces/ws-a/tokens", json={}, headers=_ADMIN),
+            client.post("/workspace-tokens", json={}, headers=_ADMIN),
+        ):
+            assert resp.status_code == 429
+            assert resp.json()["detail"] == "too many active workspace tokens"
+
+
+def test_default_cap_is_fifty(env_defaults):
+    from warren.config import WarrenSettings
+
+    assert WarrenSettings().max_workspace_tokens_per_user == 50
+
+
+async def test_purger_deletes_dead_rows_periodically():
+    import asyncio
+
+    from warren.auth.workspace_tokens import run_workspace_token_purger
+
+    store = MagicMock()
+    store.purge_workspace_tokens = AsyncMock(return_value=3)
+    task = asyncio.create_task(run_workspace_token_purger(store, interval_seconds=0.01, retention_days=1))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    assert store.purge_workspace_tokens.await_count >= 1
