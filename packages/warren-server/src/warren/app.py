@@ -327,12 +327,20 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
     # the one wired into a dedicated background task here, same run-until-cancelled
     # pattern as run_idle_reaper above.
     app.state.rate_limiter_pruner_task = None
+    from warren.ratelimit import SlidingWindowRateLimiter  # noqa: PLC0415
+
+    app.state.request_budget_limiter = SlidingWindowRateLimiter(
+        max_events=settings.request_budget_max,
+        window_seconds=settings.request_budget_window_seconds,
+    )
     try:
         from warren.ratelimit import run_rate_limiter_pruner  # noqa: PLC0415
         from warren.routes.workspaces import _create_workspace_limiter  # noqa: PLC0415
 
         app.state.rate_limiter_pruner_task = asyncio.create_task(
-            run_rate_limiter_pruner([_create_workspace_limiter])
+            run_rate_limiter_pruner(
+                [_create_workspace_limiter, app.state.request_budget_limiter]
+            )
         )
     except Exception:
         log.exception("rate_limiter_pruner_spawn_failed")
@@ -506,7 +514,13 @@ async def _lifespan(app: FastAPI, settings: WarrenSettings):
         await state.close()
 
 
-app = FastAPI(lifespan=lifespan)
+_DOCS_ENABLED = os.environ.get("WARREN_ENABLE_DOCS") == "1"
+app = FastAPI(
+    lifespan=lifespan,
+    docs_url="/docs" if _DOCS_ENABLED else None,
+    redoc_url="/redoc" if _DOCS_ENABLED else None,
+    openapi_url="/openapi.json" if _DOCS_ENABLED else None,
+)
 
 from warren.auth.middleware import AuthMiddleware  # noqa: E402
 app.add_middleware(AuthMiddleware)

@@ -15,6 +15,7 @@ import structlog
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 from warren.audit import audit_event
+from warren.http_errors import fixed_detail
 from warren.auth.deps import current_user
 from warren.notify import store as notify_store
 from warren.notify.events import EVENTS
@@ -51,11 +52,11 @@ async def put_webhook(body: WebhookWriteRequest, request: Request) -> Response:
     try:
         url = validate_webhook_url(body.url)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail={"error": "invalid_webhook_url", "detail": str(exc)}) from None
+        raise HTTPException(status_code=400, detail={"error": "invalid_webhook_url", "detail": fixed_detail("invalid_webhook_url", exc)}) from None
     try:
         events = parse_events(body.events)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail={"error": "invalid_events", "detail": str(exc)}) from None
+        raise HTTPException(status_code=400, detail={"error": "invalid_events", "detail": fixed_detail("invalid_events", exc)}) from None
     await notify_store.put(_secrets(request), user.user_id, url, body.format, events)
     log.info("notify_webhook_written", owner_id=user.user_id, format=body.format, events=sorted(events))
     audit_event("notify.webhook.write", request=request, owner_id=user.user_id)

@@ -1276,7 +1276,7 @@ def test_provision_rejects_aws_sso_mode(env_defaults, auth_headers):
                 app.state.registry = fake_registry
                 resp = client.post("/workspaces", json={"project": "demo", "template": "observe"})
     assert resp.status_code == 422
-    assert "only allowed for local runtimes" in resp.json()["detail"]["detail"]
+    assert resp.json()["detail"] == {"error": "invalid_template", "detail": "invalid template"}
     fake_registry._do_provision.assert_not_called()
 
 
