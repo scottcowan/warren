@@ -7,7 +7,7 @@ authors = [{ name = "Scott Cowan" }]
 requires-python = ">=3.11"
 dependencies = [
   "httpx>=0.28,<0.29",
-  "typer>=0.28.0",
+  "typer>=0.29.0",
   "click>=8.0",
   "pydantic>=2.14.2,<3",
   "rich>=13.8",  # already transitive via typer; declared directly since we now import it (spinner)
