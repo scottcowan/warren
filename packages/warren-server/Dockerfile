@@ -11,7 +11,7 @@
 # lock, then copy everything) no longer applies cleanly — a single `COPY .`
 # + `uv sync --package` trades some layer-cache granularity for correctness.
 
-FROM python:3.11-slim@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce AS builder
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928 AS builder
 # 3.11-slim as of 2026-10-17
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -29,7 +29,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # session-manager-plugin: ECSRuntime.exec_stream runs `aws ecs execute-command`-style
 # sessions through it. Pinned version, each arch's .deb verified against its sha256
 # before it reaches the final image.
-FROM python:3.11-slim@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce AS session-manager-plugin
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928 AS session-manager-plugin
 ARG TARGETARCH
 ARG SESSION_MANAGER_PLUGIN_VERSION=1.2.896.0
 ARG SESSION_MANAGER_PLUGIN_SHA256_AMD64=53f51fcc67314a4bf85888a38a3967cd41f8d0f28a60a9469a63acf935ba713e
@@ -44,7 +44,7 @@ RUN set -eu; \
       "https://s3.amazonaws.com/session-manager-downloads/plugin/${SESSION_MANAGER_PLUGIN_VERSION}/${dir}/session-manager-plugin.deb"; \
     echo "$sha  /session-manager-plugin.deb" | sha256sum -c -
 
-FROM python:3.11-slim@sha256:e88e9763f943ec1834f992a4b51e0f24500486803e8bc534e5767af9ea65f6ce
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
 # 3.11-slim as of 2026-10-17
 # No `podman` CLI: workspace networks are managed through the API socket
 # (podman-py), and the per-workspace egress read (`find_host_veth`/
