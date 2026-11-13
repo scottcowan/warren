@@ -2,6 +2,10 @@
 
 Image releases, newest first. Written by scripts/release.py.
 
+## warren-server 1.9.1 (2026-11-13)
+
+- fix(server): DynamoDB launch attempt keeps an empty generation so a first-provision retry round-trips (#106) (f48b99d)
+
 ## warren-server 1.9.0 (2026-11-10)
 
 - fix(cli): state migration atomicity, ssh key collisions, ECS id validation (#98) (2487b07)
