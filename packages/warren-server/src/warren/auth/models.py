@@ -6,6 +6,8 @@ from datetime import datetime
 
 from pydantic import BaseModel
 
+from warren.auth.scopes import TokenScope
+
 
 class User(BaseModel):
     user_id: str
@@ -30,6 +32,9 @@ class Token(BaseModel):
     # Issue #11: the token that minted this one (None for the bootstrap admin's first
     # token). Provenance only, for a possible future cascading-revoke-by-lineage feature.
     created_by_token_id: str | None = None
+    # `full` (every route) or a narrower ui scope; see auth/scopes.py. Children of a token
+    # can never be broader or longer-lived than it, and revoking it revokes them.
+    scope: TokenScope = "full"
 
 
 class WorkspaceToken(BaseModel):

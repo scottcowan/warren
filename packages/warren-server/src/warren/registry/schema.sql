@@ -129,7 +129,9 @@ CREATE TABLE IF NOT EXISTS tokens (
     -- Issue #11: which token minted this one (NULL for the bootstrap admin's first
     -- token). Provenance only -- cascading revocation of a token's lineage is not
     -- implemented yet, a reasonable follow-up, not blocking this fix.
-    created_by_token_id  TEXT
+    created_by_token_id  TEXT,
+    -- full | ui-read | ui-act (auth/scopes.py); rows that predate it are full.
+    scope                TEXT NOT NULL DEFAULT 'full'
 );
 
 CREATE INDEX IF NOT EXISTS idx_tokens_hashed_token ON tokens(hashed_token);

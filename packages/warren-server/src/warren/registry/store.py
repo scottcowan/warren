@@ -54,6 +54,8 @@ _EXPECTED_COLUMNS: dict[str, dict[str, str]] = {
         # could in principle be traced/revoked together later. Cascading revocation
         # itself is not implemented yet -- a reasonable follow-up, not blocking.
         "created_by_token_id": "TEXT",
+        # Token scope (auth/scopes.py); rows that predate it are full-scope.
+        "scope": "TEXT NOT NULL DEFAULT 'full'",
     },
     "ecs_launch_attempts": {
         "secrets_blobs": "TEXT",

@@ -15,7 +15,7 @@ import secrets
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from warren.auth.models import User
+    from warren.auth.models import Token, User
     from warren.auth.store import AuthStore
 
 
@@ -55,6 +55,15 @@ async def resolve_token(store: "AuthStore", token: str, pepper: str) -> "User | 
     """
     result = await resolve_active_token(store, token, pepper)
     return result[0] if result else None
+
+
+async def resolve_active_token_full(
+    store: "AuthStore", token: str, pepper: str
+) -> "tuple[User, Token] | None":
+    """Like `resolve_active_token`, but returns the whole Token (scope, expiry)."""
+    if not token:
+        return None
+    return await store.get_active_user_and_token_by_hashed_token(hash_token(token, pepper))
 
 
 async def resolve_active_token(

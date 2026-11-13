@@ -19,7 +19,8 @@ from __future__ import annotations
 import time
 
 import structlog
-from warren.auth.tokens import derive_token_pepper, resolve_active_token
+from warren.auth.scopes import scope_allows
+from warren.auth.tokens import derive_token_pepper, resolve_active_token_full
 from warren.auth.workspace_tokens import (
     PROOF_HEADER,
     is_workspace_token,
@@ -135,13 +136,27 @@ class AuthMiddleware:
         if is_workspace_token(token):
             await self._handle_workspace_token(scope, receive, send, auth_store, token, pepper)
             return
-        resolved = await resolve_active_token(auth_store, token, pepper)
+        resolved = await resolve_active_token_full(auth_store, token, pepper)
         if resolved is None:
             await self._deny_or_throttle(scope, send, reason="invalid_or_inactive_token")
             return
-        user, token_id = resolved
+        user, token_obj = resolved
+        token_id = token_obj.token_id
+        # ui-read / ui-act tokens reach only their named routes (auth/scopes.py); unknown
+        # scope values fail closed. Runs after resolution so an invalid token is still a 401.
+        if not scope_allows(
+            token_obj.scope, scope.get("method", "GET"), scope["path"], scope.get("query_string", b"")
+        ):
+            log.warning(
+                "token_scope_denied", path=scope.get("path"), method=scope.get("method"),
+                token_id=token_id, token_scope=token_obj.scope,
+            )
+            await self._forbid(scope, send)
+            return
 
-        scope["state"] = {**scope.get("state", {}), "user": user, "token_id": token_id}
+        scope["state"] = {
+            **scope.get("state", {}), "user": user, "token_id": token_id, "token_scope": token_obj.scope,
+        }
         await self.app(scope, receive, send)
 
     async def _handle_workspace_token(self, scope, receive, send, auth_store, token, pepper) -> None:
