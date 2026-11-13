@@ -71,32 +71,51 @@ Run `uv run warren --help` for the full command tree.
 
 `packages/warren-mcp` exposes the CLI as MCP tools (`list_workspaces`, `new_workspace`,
 `exec_command`, `destroy_workspace`, `workspace_status`, `list_projects`, `list_remotes`,
-`doctor`) so an MCP client — Claude Desktop, Claude Code, anything that speaks MCP — can drive
-warren directly. It's a thin subprocess wrapper around the real `warren` binary (same config
-resolution, same validation, same error messages — no second code path to drift), always
-passing every argument a tool needs so it never falls through to an interactive picker, since
-there's no TTY on the other end of a tool call.
+`server_health`, `run_status`, `run_result`, `run_list`, `doctor`) so an MCP client — Claude
+Desktop, Claude Code, anything that speaks MCP — can drive warren directly. It's a thin
+subprocess wrapper around the real `warren` binary (same config resolution, same validation,
+same error messages), never prompting (stdin is closed; it passes `--json`/`--daemon` and every
+argument a tool needs), validating names before they reach the CLI, and capping output and run
+time. Terminal-only flows (`warren connect`, `tunnel`, `secrets` prompts) are not exposed. For
+ECS workspaces `exec_command` is local-only: use the server's own `/mcp` endpoint to exec.
 
 ```bash
 uv run --package warren-mcp warren-mcp   # stdio transport — run by the MCP client, not by hand
 ```
 
-Point an MCP client at it (Claude Desktop's `claude_desktop_config.json`, or Claude Code's MCP
-settings):
+Point an MCP client at it (Claude Desktop's `claude_desktop_config.json`, or Claude Code's
+`claude mcp add` / `.mcp.json`). For an ECS-backed server, pass the AWS environment the CLI
+needs (GUI clients do not inherit your shell env) and a default remote:
 
 ```json
 {
   "mcpServers": {
     "warren": {
       "command": "uv",
-      "args": ["run", "--project", "/path/to/warren", "--package", "warren-mcp", "warren-mcp"]
+      "args": ["run", "--project", "/path/to/warren", "--package", "warren-mcp", "warren-mcp"],
+      "env": {
+        "AWS_PROFILE": "my-sso-profile",
+        "AWS_REGION": "eu-west-2",
+        "WARREN_MCP_SERVER": "my-ecs-remote",
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+      }
     }
   }
 }
 ```
 
-It talks to whatever `~/.warren/config.toml` already points at — local mode or a configured
-remote — exactly like running `warren` by hand would.
+| Variable | Meaning |
+| --- | --- |
+| `WARREN_MCP_SERVER` | default `[remotes.*]` name when a tool's `server` argument is omitted (required by tools that need a remote: there is no interactive picker) |
+| `WARREN_MCP_CONFIG` | config file passed as `--config` (default `~/.warren/config.toml`) |
+| `WARREN_MCP_BIN` | absolute path of the `warren` executable if it is not on the client's `PATH` |
+| `WARREN_MCP_TIMEOUT` / `WARREN_MCP_MAX_OUTPUT` | per-call timeout seconds (default 150) / kept chars per stream (default 262144) |
+| `AWS_PROFILE`, `AWS_REGION`, `AWS_*` | passed through to the CLI and its `aws` calls |
+
+ECS remotes need the `aws` CLI and the `session-manager-plugin` on the server process's
+`PATH`. AWS SSO login is interactive and cannot be done by the MCP server: when the SSO session
+has expired a failed tool result carries a `hint`; run `aws sso login --profile <profile>` in a
+terminal and retry. The `doctor` tool reports AWS/ECS/EFS status as structured JSON.
 
 ---
 

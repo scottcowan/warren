@@ -72,21 +72,19 @@ def test_new_workspace_with_server(mock_run):
 
 
 @patch("warren_mcp.server.run_warren")
-def test_new_workspace_flag_looking_project_is_not_parsed_as_an_option(mock_run):
-    """Regression guard for audit 2026-10-16 #29: a model-chosen project/
-    template value that looks like a CLI flag must reach warren as a
-    literal positional, not get parsed as an option."""
-    mock_run.return_value = _ok()
-    new_workspace("--config=/etc/evil", "--daemon")
-    args = mock_run.call_args[0][0]
-    assert args == ["new", "--daemon", "--", "--config=/etc/evil", "--daemon"]
+def test_new_workspace_flag_looking_project_is_refused(mock_run):
+    """Audit 2026-10-16 #29: a model-chosen project/template that looks like
+    a CLI flag never reaches warren (validated, and `--` guards the rest)."""
+    result = new_workspace("--config=/etc/evil", "--daemon")
+    assert result["ok"] is False
+    mock_run.assert_not_called()
 
 
 @patch("warren_mcp.server.run_warren")
 def test_workspace_status_requires_server_arg(mock_run):
     mock_run.return_value = _ok("{}")
     workspace_status("ws-1", "node2")
-    assert mock_run.call_args[0][0] == ["status", "--server", "node2", "--", "ws-1"]
+    assert mock_run.call_args[0][0] == ["status", "--json", "--server", "node2", "--", "ws-1"]
 
 
 @patch("warren_mcp.server.run_warren")
@@ -138,17 +136,17 @@ def test_destroy_workspace_has_destructive_hint():
 
 
 @patch("warren_mcp.server.run_warren")
-def test_list_projects_omits_server_when_not_given(mock_run):
-    mock_run.return_value = _ok("[]")
-    list_projects()
-    assert mock_run.call_args[0][0] == ["projects"]
+def test_list_projects_without_server_is_an_error_not_a_picker(mock_run):
+    """`warren projects` with no --server opens an interactive picker; no TTY here."""
+    assert list_projects()["ok"] is False
+    mock_run.assert_not_called()
 
 
 @patch("warren_mcp.server.run_warren")
 def test_list_remotes(mock_run):
-    mock_run.return_value = _ok("node2\n")
+    mock_run.return_value = _ok("[]")
     list_remotes()
-    assert mock_run.call_args[0][0] == ["remote", "list"]
+    assert mock_run.call_args[0][0] == ["remote", "list", "--json"]
 
 
 @patch("warren_mcp.server.run_warren")
