@@ -639,13 +639,23 @@ class DynamoLaunchAttemptStore:
         item = await self._t.get(f"WS#{workspace_id}", "LAUNCH")
         if item is None:
             return None
-        return {k: item[k] for k in self._FIELDS if item.get(k)}
+        # Same shape as the SQLite store: the identity fields are always present (an
+        # empty generation, as on a first provision, is stored as null and read back as
+        # ""); only the optional secrets_blobs is omitted when empty.
+        attempt = {k: item.get(k) or "" for k in self._FIELDS[:4]}
+        if item.get("secrets_blobs"):
+            attempt["secrets_blobs"] = item["secrets_blobs"]
+        return attempt
 
     def _item(self, workspace_id: str, attempt: dict[str, str]) -> dict[str, Any]:
         return {
             "pk": f"WS#{workspace_id}", "sk": "LAUNCH", "workspace_id": workspace_id,
             "created_at": _utcnow_iso(),
             **{k: attempt.get(k) or None for k in self._FIELDS},
+            # The claim condition compares these, and NULL <> "" would let a second claim
+            # of an empty-generation attempt overwrite the first; keep "" as "".
+            "generation": attempt.get("generation") or "",
+            "fingerprint": attempt.get("fingerprint") or "",
         }
 
     async def put(self, workspace_id: str, attempt: dict[str, str]) -> None:
