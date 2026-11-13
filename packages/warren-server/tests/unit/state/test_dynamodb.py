@@ -172,6 +172,18 @@ async def test_ecs_launch_adopts_a_concurrent_tasks_attempt(dynamo_table):
     assert (won["task_definition_arn"], won["client_token"]) == ("arn:first", "t1")
 
 
+async def test_launch_attempt_with_empty_generation_round_trips(dynamo_table):
+    """A first provision has no generation; reading the attempt back must not drop the key."""
+    store = dynamo_stores(dynamo_table, SETTINGS)["launch_attempts"]
+    attempt = {"generation": "", "fingerprint": "f", "task_definition_arn": "arn:td", "client_token": "t1"}
+    assert await store.claim("ws-1", attempt) == attempt
+    assert await store.get("ws-1") == attempt
+    again = await store.claim("ws-1", {**attempt, "client_token": "t2"})
+    assert again["client_token"] == "t1"
+    await store.put("ws-2", {**attempt, "secrets_blobs": "b"})
+    assert (await store.get("ws-2"))["generation"] == ""
+
+
 # -- TTL --------------------------------------------------------------------------
 
 
