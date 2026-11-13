@@ -27,9 +27,9 @@
 # codex and pi, the same as warren-ecs-dev-base's (docs/harnesses.md). The plain warren-docker-base remains
 # available and untouched for anyone who prefers to decline this layer's supply-chain
 # surface.
-FROM ghcr.io/scottcowan/warren-docker-base:latest@sha256:6102cea6f4a8a3668bd14c8aa87d14238b97e132b7efdb5960341107667e6990
-# warren-docker-base:latest (warren-docker-base-v1.0.1, with the S1 build fix
-# and UX-1's zsh banner/prompt) as of 2026-10-17
+FROM ghcr.io/scottcowan/warren-docker-base:1.2.0@sha256:644997a75d7bb7e18ec748f36b666de1316da87a0002abd842beb13a3b322863
+# warren-docker-base 1.2.0 as of 2026-11-10: the workload runs as warren (uid 1000) after a
+# root phase, plus the git credential helper, run-result and harness changes since 1.0.1.
 
 # git/curl/jq/tmux already present from warren-docker-base.
 # ripgrep: common dev tool. build-essential + pyenv's documented build deps: pyenv
