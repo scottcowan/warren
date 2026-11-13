@@ -12,7 +12,7 @@
 #   ENTRYPOINT/CMD wiring so the harness starts eagerly (WARREN_APP_CMD contract,
 #   see packages/warren-server/images/ecs-base/entrypoint.sh for the ECS-side half
 #   of this — the Docker-env equivalent entrypoint wiring is separate follow-up work).
-FROM ghcr.io/scottcowan/warren-docker-dev-base:latest@sha256:32296404a24f2dda002d7489e60548a517c0918ec8d1a3265ff710121f68761c
+FROM ghcr.io/scottcowan/warren-docker-dev-base:latest@sha256:33be0122920dc1956fa5d655ebcc5df4803e4b704a75d28b22db28ec953168ca
 # warren-docker-dev-base:latest as of 2026-10-17
 
 # TODO: install acp-harness once public.
