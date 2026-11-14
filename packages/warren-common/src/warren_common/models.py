@@ -373,6 +373,20 @@ class ProjectConfig(BaseModel):
     # (WARREN_ECS_WORKSPACE_STORAGE). Only a mode the deployment has configured is accepted.
     ecs_storage: Literal["efs", "ebs"] | None = None
     idle_ttl_seconds: float | None = None  # per-project/template idle-reaper TTL override; None falls back to the server's global WarrenSettings.idle_ttl_seconds
+    # Opt-in: podman restart_policy=on-failure instead of the default "no" (D-18,
+    # 2026-11-14 -- found node2's warren-server itself down for ~8 days after a host
+    # reboot, with no boot-persistence; this is the same fix for workspace containers).
+    # Independent of idle_ttl_seconds: idle-reap is the server CHOOSING to stop a
+    # workspace after inactivity; this is whether the container comes back on its own
+    # after a crash or host reboot. "on-failure", not "always" -- podman's own restart-
+    # policy engine does not restart a container the operator (or the idle reaper)
+    # explicitly `stop`ped, regardless of its exit code, verified empirically against a
+    # real container (podman stop on an on-failure-policy container left it exited, not
+    # restarted) -- "always" would instead immediately relaunch a workspace the idle
+    # reaper just stopped, defeating idle-reap entirely. Requires podman-restart.service
+    # enabled on the host for the reboot case specifically; on-failure alone covers an
+    # ordinary crash regardless.
+    persistent: bool = False
     # AK2: git-crypt policy for this template's checkouts (warren_common.git_crypt).
     # `none` never delivers the key; `unlock_and_drop` decrypts at materialization
     # with the key in secret `git_crypt_key_secret` (base64), then deletes it.

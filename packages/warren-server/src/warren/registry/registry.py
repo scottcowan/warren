@@ -92,6 +92,7 @@ _SPEC_EXTRA_FIELDS = (
     "efs_retention_days",
     "mode",
     "idle_destroy_seconds",
+    "persistent",
     "agent",
     "ports",
     "git_write",

@@ -67,6 +67,35 @@ async def test_labels_applied_on_provision():
 
 
 @pytest.mark.asyncio
+async def test_provision_defaults_to_no_restart():
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.create.return_value = MagicMock(id="ctr-abc")
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        await runtime.provision(_spec())
+        _, kwargs = client.containers.create.call_args
+        assert kwargs["restart_policy"] == {"Name": "no"}
+
+
+@pytest.mark.asyncio
+async def test_provision_persistent_spec_gets_on_failure_restart():
+    """D-18: opt-in only, and 'on-failure' specifically, never 'always' -- see
+    podman.py's own comment for why 'always' would fight the idle reaper."""
+    with patch("warren.runtime.podman.PodmanClient") as ClientCls:
+        client = ClientCls.return_value
+        client.containers.create.return_value = MagicMock(id="ctr-abc")
+        runtime = PodmanRuntime(socket_path="/tmp/sock", server_id="srv-1")
+        spec = WorkspaceSpec(
+            workspace_id="ws-1", project="proj", intent="dev",
+            image="localhost/warren-base:latest", root_path="/tmp/ws-1",
+            persistent=True,
+        )
+        await runtime.provision(spec)
+        _, kwargs = client.containers.create.call_args
+        assert kwargs["restart_policy"] == {"Name": "on-failure"}
+
+
+@pytest.mark.asyncio
 async def test_provision_passes_init_true():
     with patch("warren.runtime.podman.PodmanClient") as ClientCls:
         client = ClientCls.return_value
