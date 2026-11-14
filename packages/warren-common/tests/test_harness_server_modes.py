@@ -222,6 +222,61 @@ def test_opencode_config_task_role_bedrock_and_unsafe_values():
     assert "apiKey" not in no_skip["provider"]["amazon-bedrock"]["options"]
 
 
+OPENAI_COMPAT_ENV = {
+    "OPENAI_BASE_URL": "https://api.daystrom.co",
+    "OPENAI_MODEL": "daystrom-1",
+    "OPENAI_API_KEY": "sk-should-never-appear-in-generated-config",
+}
+
+
+def test_opencode_config_generic_openai_compatible_provider():
+    cfg = json.loads(opencode_config(OPENAI_COMPAT_ENV))
+    assert cfg["model"] == "openai-compatible/daystrom-1"
+    assert cfg["enabled_providers"] == ["openai-compatible"]
+    assert cfg["provider"]["openai-compatible"] == {
+        "npm": "@ai-sdk/openai-compatible",
+        "options": {
+            "baseURL": "https://api.daystrom.co",
+            # Resolved by opencode at load time; the real key never lands in a file.
+            "apiKey": "{env:OPENAI_API_KEY}",
+        },
+        "models": {"daystrom-1": {}},
+    }
+    assert "sk-should-never-appear-in-generated-config" not in json.dumps(cfg)
+
+
+def test_opencode_config_openai_compatible_needs_all_three_vars():
+    base = json.loads(opencode_config({}))
+    assert json.loads(opencode_config({"OPENAI_BASE_URL": "https://api.daystrom.co"})) == base
+    assert json.loads(opencode_config({
+        "OPENAI_BASE_URL": "https://api.daystrom.co", "OPENAI_MODEL": "daystrom-1",
+    })) == base
+    assert json.loads(opencode_config({
+        "OPENAI_MODEL": "daystrom-1", "OPENAI_API_KEY": "sk-x",
+    })) == base
+
+
+def test_opencode_config_openai_compatible_unsafe_values_dropped():
+    bad = json.loads(opencode_config({
+        "OPENAI_BASE_URL": 'https://x"}, "evil": {"',
+        "OPENAI_MODEL": "m\" ,",
+        "OPENAI_API_KEY": "sk-x",
+    }))
+    assert bad == {"$schema": "https://opencode.ai/config.json", "autoupdate": False}
+
+
+def test_opencode_config_openai_compatible_coexists_with_bedrock():
+    """Independent of bedrock mode -- both blocks can be present at once; bedrock
+    keeps the active model/enabled_providers when both happen to be configured,
+    since opencode_config has no signal for which one the caller actually wants
+    as primary."""
+    cfg = json.loads(opencode_config({**GATEWAY_ENV, **OPENAI_COMPAT_ENV}))
+    assert cfg["model"] == "amazon-bedrock/eu.anthropic.claude-haiku-4-5-20251001-v1:0"
+    assert cfg["enabled_providers"] == ["amazon-bedrock"]
+    assert "amazon-bedrock" in cfg["provider"]
+    assert "openai-compatible" in cfg["provider"]
+
+
 def test_codex_config_bedrock_provider_only_without_a_gateway():
     plain = codex_config("/w/codex/hooks.json", {})
     assert plain.startswith('approval_policy = "never"\nsandbox_mode = "danger-full-access"\n\n[features]\nhooks = true\n')
