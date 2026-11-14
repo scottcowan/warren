@@ -2,6 +2,16 @@
 
 Image releases, newest first. Written by scripts/release.py.
 
+## warren-server 1.10.0 (2026-11-13)
+
+- feat(server): token scopes (full/ui-read/ui-act), child limits, lineage revoke (#100) (9bbc88a)
+- build(deps): bump typer from 0.28.0 to 0.29.0 in the python group (#104) (b6adea0)
+- build(deps): update moto[dynamodb,secretsmanager] requirement (#105) (39f8b34)
+
+## warren-docker-dev-base 1.2.0 (2026-11-13)
+
+- feat(docker-dev-base): build on warren-docker-base 1.2.0 (#88) (92ae174)
+
 ## warren-server 1.9.1 (2026-11-13)
 
 - fix(server): DynamoDB launch attempt keeps an empty generation so a first-provision retry round-trips (#106) (f48b99d)
