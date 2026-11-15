@@ -159,7 +159,12 @@ def init(
 
     typer.echo("warren init\n")
 
-    mode = typer.prompt(
+    # click.prompt, not typer.prompt: typer 0.29.0's typer.prompt added internal
+    # type-coercion (typer/_coercion.py) that asserts `type` is a plain Python
+    # type, breaking a click.ParamType instance like click.Choice(...) passed
+    # through as before -- AssertionError, not a prompt. click.prompt itself has
+    # no such restriction and takes the identical kwargs here.
+    mode = click.prompt(
         "Mode",
         type=click.Choice(["local", "server"]),
         default="local",
