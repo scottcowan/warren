@@ -161,32 +161,57 @@ def _safe(env: Mapping[str, str], key: str, pattern: re.Pattern) -> str:
 
 
 def opencode_config(env: Mapping[str, str]) -> str:
-    """opencode.json: Amazon Bedrock as the only provider in bedrock mode, through
-    the gateway when ANTHROPIC_BEDROCK_BASE_URL is set (opencode's amazon-bedrock
-    `endpoint`; the bearer token from ANTHROPIC_AUTH_TOKEN via `{env:}` when
+    """opencode.json: Amazon Bedrock in bedrock mode, through the gateway when
+    ANTHROPIC_BEDROCK_BASE_URL is set (opencode's amazon-bedrock `endpoint`; the
+    bearer token from ANTHROPIC_AUTH_TOKEN via `{env:}` when
     CLAUDE_CODE_SKIP_BEDROCK_AUTH is set, else SigV4 with the workspace's AWS
-    identity). Checked against opencode 1.19.5."""
+    identity); and/or a generic OpenAI-compatible provider, independent of
+    bedrock mode, when OPENAI_BASE_URL and OPENAI_MODEL are both set
+    (opencode's `@ai-sdk/openai-compatible`, the standard escape hatch for any
+    OpenAI-protocol endpoint that isn't one of opencode's named providers --
+    OPENAI_API_KEY is never embedded in the generated config, only an
+    `{env:OPENAI_API_KEY}` reference opencode itself resolves at runtime, same
+    as ANTHROPIC_AUTH_TOKEN above). Checked against opencode 1.19.5."""
     cfg: dict = dict(OPENCODE_BASE_CONFIG)
     gateway = _safe(env, "ANTHROPIC_BEDROCK_BASE_URL", _SAFE_URL)
-    if not (_truthy(env.get("CLAUDE_CODE_USE_BEDROCK")) or gateway):
-        return json.dumps(cfg)
-    cfg["enabled_providers"] = ["amazon-bedrock"]
-    model = _safe(env, "ANTHROPIC_MODEL", _SAFE_MODEL)
-    if model:
-        cfg["model"] = f"amazon-bedrock/{model}"
-    small = _safe(env, "ANTHROPIC_DEFAULT_HAIKU_MODEL", _SAFE_MODEL)
-    if small:
-        cfg["small_model"] = f"amazon-bedrock/{small}"
-    options: dict = {}
-    region = _safe(env, "AWS_REGION", _SAFE_REGION)
-    if region:
-        options["region"] = region
-    if gateway:
-        options["endpoint"] = gateway
-        if _truthy(env.get("CLAUDE_CODE_SKIP_BEDROCK_AUTH")):
-            options["apiKey"] = "{env:ANTHROPIC_AUTH_TOKEN}"
-    if options:
-        cfg["provider"] = {"amazon-bedrock": {"options": options}}
+    bedrock = _truthy(env.get("CLAUDE_CODE_USE_BEDROCK")) or bool(gateway)
+    if bedrock:
+        cfg["enabled_providers"] = ["amazon-bedrock"]
+        model = _safe(env, "ANTHROPIC_MODEL", _SAFE_MODEL)
+        if model:
+            cfg["model"] = f"amazon-bedrock/{model}"
+        small = _safe(env, "ANTHROPIC_DEFAULT_HAIKU_MODEL", _SAFE_MODEL)
+        if small:
+            cfg["small_model"] = f"amazon-bedrock/{small}"
+        options: dict = {}
+        region = _safe(env, "AWS_REGION", _SAFE_REGION)
+        if region:
+            options["region"] = region
+        if gateway:
+            options["endpoint"] = gateway
+            if _truthy(env.get("CLAUDE_CODE_SKIP_BEDROCK_AUTH")):
+                options["apiKey"] = "{env:ANTHROPIC_AUTH_TOKEN}"
+        if options:
+            cfg["provider"] = {"amazon-bedrock": {"options": options}}
+
+    openai_base = _safe(env, "OPENAI_BASE_URL", _SAFE_URL)
+    openai_model = _safe(env, "OPENAI_MODEL", _SAFE_MODEL)
+    if openai_base and openai_model and env.get("OPENAI_API_KEY"):
+        providers = dict(cfg.get("provider") or {})
+        providers["openai-compatible"] = {
+            "npm": "@ai-sdk/openai-compatible",
+            "options": {"baseURL": openai_base, "apiKey": "{env:OPENAI_API_KEY}"},
+            "models": {openai_model: {}},
+        }
+        cfg["provider"] = providers
+        if not bedrock:
+            # Bedrock, when also active, keeps its own model/enabled_providers --
+            # this only becomes the active provider when bedrock isn't, since
+            # opencode_config has no signal for which one the caller actually wants
+            # as primary when both happen to be configured at once.
+            cfg["model"] = f"openai-compatible/{openai_model}"
+            cfg["enabled_providers"] = [*cfg.get("enabled_providers", []), "openai-compatible"]
+
     return json.dumps(cfg)
 
 
