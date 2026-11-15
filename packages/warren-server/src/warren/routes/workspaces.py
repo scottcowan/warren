@@ -410,6 +410,7 @@ async def _provision_workspace(
             template_env.setdefault("CLAUDE_CODE_SKIP_BEDROCK_AUTH", "1")
     idle_ttl_seconds = template_cfg.idle_ttl_seconds if template_cfg is not None else None
     idle_destroy_seconds = template_cfg.idle_destroy_seconds if template_cfg is not None else None
+    persistent = template_cfg.persistent if template_cfg is not None else False
     # Issue #23: these were silently dropped on the floor -- every workspace got
     # whatever default ecs_cpu/ecs_memory is on `settings` (runtime/ecs.py's own
     # fallback) and no docker_networks attachment, regardless of what the
@@ -479,6 +480,7 @@ async def _provision_workspace(
         model_access=model_access,
         idle_ttl_seconds=idle_ttl_seconds,
         idle_destroy_seconds=idle_destroy_seconds,
+        persistent=persistent,
         ecs_cpu=ecs_cpu,
         ecs_memory=ecs_memory,
         docker_networks=docker_networks,

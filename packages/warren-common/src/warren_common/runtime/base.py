@@ -40,6 +40,7 @@ class WorkspaceSpec:
     efs_retention_days: int | None = None                                   # per-intent EFS TTL override (D-03); None falls back to WarrenSettings default
     idle_ttl_seconds: float | None = None                                   # per-project/template idle-reaper TTL override; None falls back to WarrenSettings.idle_ttl_seconds
     idle_destroy_seconds: float | None = None                               # AH10: destroy this long after an idle stop; None falls back to WarrenSettings.idle_destroy_seconds (off by default)
+    persistent: bool = False                                                # D-18: podman restart_policy=on-failure (survives a host reboot via podman-restart.service); never fights an intentional stop, see models.py's ProjectConfig.persistent for the full reasoning
     # Audit R11: the resolved template's `aws`/`scope` blocks (warren_common.models) were
     # silently dropped on the floor on the server-provision path -- never threaded onto
     # WorkspaceSpec at all, unlike docker_networks/ecs_cpu/ecs_memory above. Carried as

@@ -283,7 +283,13 @@ class PodmanRuntime:
             init=True,
             detach=True,
             remove=False,
-            restart_policy={"Name": "no"},
+            # D-18: "on-failure", never "always" -- podman's restart-policy engine
+            # does not restart a container the operator (or the idle reaper)
+            # explicitly `stop`ped regardless of exit code, verified empirically;
+            # "always" would immediately relaunch a workspace the idle reaper just
+            # stopped, defeating idle-reap entirely. Requires podman-restart.service
+            # enabled on the host to also cover a reboot, not just an ordinary crash.
+            restart_policy={"Name": "on-failure"} if spec.persistent else {"Name": "no"},
         )
         if self._userns is not None:
             create_kwargs["userns_mode"] = {**self._userns}
