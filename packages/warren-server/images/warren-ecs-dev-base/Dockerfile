@@ -146,7 +146,7 @@ RUN curl -fsSL "https://raw.githubusercontent.com/pyenv/pyenv-installer/bdd89156
 # before this) gave the workspace user "command not found". The verified binary is
 # installed as a root-owned file in /usr/local/bin instead, and the installer's copy
 # and state under /root are removed.
-ARG CLAUDE_CODE_VERSION=2.1.309
+ARG CLAUDE_CODE_VERSION=2.1.311
 RUN curl -fsSL https://claude.ai/install.sh | bash -s ${CLAUDE_CODE_VERSION} \
     && case "${TARGETARCH}" in \
          amd64) _CC_PLATFORM=linux-x64 ;; \
@@ -183,9 +183,9 @@ RUN curl -fsSL https://claude.ai/install.sh | bash -s ${CLAUDE_CODE_VERSION} \
 # this version (docs/harnesses.md), so a bump needs that check redone.
 # /etc/codex/config.toml is codex's system config layer, read under the CODEX_HOME one
 # warren generates: it turns off the update check at startup (codex has no env var for it).
-ARG CODEX_VERSION=0.166.0
-ARG CODEX_SHA256_AMD64=a0bf572d2f93f056c6712a6da348e96078dc84f3885fd7be67807ef389cb3978
-ARG CODEX_SHA256_ARM64=94eb707605ec2646b2e05b7edf7c4e7b3ccf02b16237c34ae9beb8cfb7f810a9
+ARG CODEX_VERSION=0.169.0
+ARG CODEX_SHA256_AMD64=9af4d751fce183faedea629437d5252dbf458eeb04130cf4f97be844621ea985
+ARG CODEX_SHA256_ARM64=97b97d87eea075c5cb7709c7f6156a451622a7667953ecda40e0276637196f3f
 RUN case "${TARGETARCH}" in \
          amd64) _CX_TRIPLE=x86_64-unknown-linux-musl; _CX_SHA256="${CODEX_SHA256_AMD64}" ;; \
          arm64) _CX_TRIPLE=aarch64-unknown-linux-musl; _CX_SHA256="${CODEX_SHA256_ARM64}" ;; \
