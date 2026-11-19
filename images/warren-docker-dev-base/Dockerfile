@@ -27,7 +27,7 @@
 # codex and pi, the same as warren-ecs-dev-base's (docs/harnesses.md). The plain warren-docker-base remains
 # available and untouched for anyone who prefers to decline this layer's supply-chain
 # surface.
-FROM ghcr.io/scottcowan/warren-docker-base:1.2.0@sha256:644997a75d7bb7e18ec748f36b666de1316da87a0002abd842beb13a3b322863
+FROM ghcr.io/scottcowan/warren-docker-base:1.2.1@sha256:d01547f3f1588fd0bf996c59dced7578bddc81e7e7e0875928bdf9400a2a017a
 # warren-docker-base 1.2.0 as of 2026-11-10: the workload runs as warren (uid 1000) after a
 # root phase, plus the git credential helper, run-result and harness changes since 1.0.1.
 
