@@ -87,7 +87,7 @@ RUN curl -fsSL "https://raw.githubusercontent.com/pyenv/pyenv-installer/bdd89156
 # It installs under $HOME, /root at build time. The binary is copied to a root-owned
 # /usr/local/bin/claude and the installer's copy and state removed, so a non-root
 # container user can run it too (a symlink into the 0700 /root can't be followed).
-RUN curl -fsSL https://claude.ai/install.sh | bash -s 2.1.309 \
+RUN curl -fsSL https://claude.ai/install.sh | bash -s 2.1.323 \
     && install -m 0755 "$(readlink -f /root/.local/bin/claude)" /usr/local/bin/claude \
     && claude --version \
     && rm -rf /root/.local/bin/claude /root/.local/share/claude /root/.claude /root/.claude.json
@@ -106,9 +106,9 @@ ARG TARGETARCH
 # /etc/codex/config.toml is codex's system config layer, read under the CODEX_HOME one
 # warren generates: it turns off the update check at startup (codex has no env var for it).
 # Same step as packages/warren-server/images/warren-ecs-dev-base/Dockerfile.
-ARG CODEX_VERSION=0.166.0
-ARG CODEX_SHA256_AMD64=a0bf572d2f93f056c6712a6da348e96078dc84f3885fd7be67807ef389cb3978
-ARG CODEX_SHA256_ARM64=94eb707605ec2646b2e05b7edf7c4e7b3ccf02b16237c34ae9beb8cfb7f810a9
+ARG CODEX_VERSION=0.171.0
+ARG CODEX_SHA256_AMD64=01baa2e47809f8597be5b2f8abd4e4dfe3fb5bcb6e504c2fbaaad97056c15e8d
+ARG CODEX_SHA256_ARM64=bcf50b836385e51bd2976ab2bbe92b1b08a1cbe37712eb8dbe378aa78d24871c
 RUN case "${TARGETARCH}" in \
          amd64) _CX_TRIPLE=x86_64-unknown-linux-musl; _CX_SHA256="${CODEX_SHA256_AMD64}" ;; \
          arm64) _CX_TRIPLE=aarch64-unknown-linux-musl; _CX_SHA256="${CODEX_SHA256_ARM64}" ;; \
