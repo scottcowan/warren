@@ -7,6 +7,7 @@
 # Needs only docker. Every SSH client and key used here lives inside throwaway
 # containers; nothing touches this machine's ~/.ssh. Checks:
 #   - sshd's effective config (`sshd -T`) is the hardened one;
+#   - herdr is installed root-owned 0755 and runs as uid 1000;
 #   - sshd runs as uid 1000 and listens on 127.0.0.1:2222 and nowhere else;
 #   - a key delivered in SSH_AUTHORIZED_KEYS (plain env, and as an EFS-mode secret
 #     file) logs in as warren, from a key generated inside the container;
@@ -40,6 +41,12 @@ test -z "$(docker run --rm --entrypoint sh "$IMG" -c 'ls /etc/ssh/ssh_host_* /va
 test "$(docker run --rm --entrypoint stat "$IMG" -c '%u:%g:%a' /usr/local/bin/entrypoint.sh /usr/local/bin/warren-sshd \
     /usr/local/lib/warren/ecs-entrypoint.sh /etc/ssh/sshd_config | sort -u | tr '\n' ' ')" = "0:0:644 0:0:755 " \
     || fail "helper modes"
+# herdr: pinned binary, root-owned 0755, runs as the workspace user, update checks off.
+test "$(docker run --rm --entrypoint stat "$IMG" -c '%u:%g:%a' /usr/local/bin/herdr)" = "0:0:755" || fail "herdr owner/mode"
+test "$(docker run --rm --entrypoint su-exec "$IMG" warren id -u)" = 1000 || fail "su-exec warren is not uid 1000"
+docker run --rm --entrypoint su-exec "$IMG" warren herdr --version | grep -qE '(^|[^0-9])0\.9\.5' || fail "herdr --version as uid 1000"
+test "$(docker run --rm --entrypoint cat "$IMG" /etc/herdr/config.toml)" = "$(printf '[update]\nversion_check = false\nmanifest_check = false')" \
+    || fail "herdr update checks not disabled"
 test -z "$(docker run --rm --entrypoint ls "$IMG" -A /etc/ssh/sshd_config.d)" || fail "unexpected sshd drop-ins"
 docker run --rm --entrypoint sh "$IMG" -c 'for f in /usr/local/bin/entrypoint.sh /usr/local/bin/warren-sshd /usr/local/lib/warren/ecs-entrypoint.sh; do sh -n "$f" || exit 1; done' \
     || fail "script syntax"

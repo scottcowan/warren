@@ -117,6 +117,9 @@ class RemoteProfile(BaseModel):
     ecs_service: str | None = None
     ssh_host: str | None = None       # e.g. "node2" (an ssh config Host alias) or "user@1.2.3.4"
     ssh_key_path: str | None = None   # e.g. "~/.ssh/id_homelab" -- passed to ssh -i verbatim
+    # Login user `warren ssh-config` writes for this remote's workspaces (default "warren",
+    # what warren-ecs-ssh-base uses). Same pattern as ssh_access._NAME_RE (a test pins them).
+    ssh_user: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
     ssh_remote_port: int = 8420       # the control plane's port on the far side of the tunnel
     # For an ECS AWS-identity server reached behind a tunnel: the server's own
     # `settings.server_id` (shown by `warren healthz` as `warren_id`). The signed

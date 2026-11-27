@@ -35,7 +35,9 @@ def ssh_config(
         "podman/docker: ignored, the server mints the key",
     ),
     user: Optional[str] = typer.Option(
-        None, "--user", help="podman/docker: login user (default: the server's shell user, break_glass_user)"
+        None, "--user",
+        help="Login user (default: the remote's ssh_user; else ECS: warren, podman/docker: the server's "
+        "shell user, break_glass_user)",
     ),
     jump: Optional[str] = typer.Option(
         None, "--jump",
@@ -68,6 +70,9 @@ def ssh_config(
             remote = cfg.get_remote(server)
         except KeyError as exc:
             raise ssh_access.SshAccessError(str(exc.args[0]) if exc.args else str(exc)) from exc
+        user = user or remote.ssh_user
+        if user:
+            ssh_access.check_name("user", user)
         if remote.runtime_type == "ecs":
             core.remote_for(cfg, server)
             workspace_id = (
@@ -79,6 +84,7 @@ def ssh_config(
                 host=host,
                 identity_file=identity_file,
                 config=str(config.expanduser().resolve()) if config else None,
+                user=user,
             )
         else:
             if identity_file:

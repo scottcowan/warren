@@ -140,7 +140,7 @@ container images
 ├── warren-base / warren-ecs-base           minimal — git, ssh-client/jq/curl, uv; no sshd
 ├── warren-dev-base / warren-ecs-dev-base   + harnesses (Claude Code, codex, pi), Node/Python, dev tools
 ├── warren-agent-base / warren-ecs-agent-base   stubs for purpose-built agent tooling (deferred)
-└── warren-docker-ssh-base / warren-ecs-ssh-base   opt-in: + hardened sshd for editors (docs/workspace-ssh.md)
+└── warren-docker-ssh-base / warren-ecs-ssh-base   opt-in: + hardened sshd for editors and herdr (docs/workspace-ssh.md)
 
 warren-sidecar (in-workspace)
 └── agent-state recorder: tails the tmux pane for OSC 7501 state and writes

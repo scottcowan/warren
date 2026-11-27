@@ -27,6 +27,12 @@ test -z "$(docker run --rm --entrypoint sh "$IMG" -c 'ls /etc/ssh/ssh_host_* /et
     || fail "host keys baked into the image"
 test "$(docker run --rm --entrypoint stat "$IMG" -c '%u:%g:%a' /etc/ssh/sshd_config /usr/local/bin/warren-sshd-start /etc/warren | tr '\n' ' ')" \
     = "0:0:644 0:0:755 0:0:755 " || fail "modes"
+# herdr: pinned binary, root-owned 0755, runs as the workspace user (uid 1000), update checks off.
+test "$(docker run --rm --entrypoint stat "$IMG" -c '%u:%g:%a' /usr/local/bin/herdr)" = "0:0:755" || fail "herdr owner/mode"
+test "$(docker run --rm --user 1000 --entrypoint id "$IMG" -u)" = 1000 || fail "uid 1000 run"
+docker run --rm --user 1000 --entrypoint herdr "$IMG" --version | grep -qE '(^|[^0-9])0\.9\.5' || fail "herdr --version as uid 1000"
+test "$(docker run --rm --entrypoint cat "$IMG" /etc/herdr/config.toml)" = "$(printf '[update]\nversion_check = false\nmanifest_check = false')" \
+    || fail "herdr update checks not disabled"
 test -z "$(docker run --rm --entrypoint ls "$IMG" -A /etc/ssh/sshd_config.d)" || fail "unexpected sshd drop-ins"
 test "$(docker run --rm --entrypoint sh "$IMG" -c 'getent passwd warren warren-shell | cut -d: -f1,3' | tr '\n' ' ')" \
     = "warren:1000 warren-shell:1001 " || fail "login users"

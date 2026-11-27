@@ -51,6 +51,37 @@ COPY --chown=0:0 --chmod=0755 warren-sshd-start.sh /usr/local/bin/warren-sshd-st
 RUN printf 'PATH="%s"\nexport PATH\n' "${PATH}" > /etc/profile.d/warren-path.sh \
     && chmod 0644 /etc/profile.d/warren-path.sh
 
+# herdr (https://herdr.dev), a terminal workspace manager for AI agents. `herdr machine
+# add <ssh-alias>` over this sshd runs its own server in the workspace and shows its
+# panes next to the local ones. Pinned release, per-arch sha256 checked at build time
+# (the digests GitHub lists for the v0.9.5 release assets), root-owned 0755. Never run
+# `herdr update` inside the image: it would replace a verified binary with an unpinned
+# one; bump HERDR_VERSION and both checksums here instead.
+# Update checks: herdr reads HERDR_CONFIG_PATH, so a root-owned /etc/herdr/config.toml
+# turns off the background version and manifest checks for login shells (profile.d).
+# Non-login ssh commands don't read profile.d; the same two keys in
+# ~/.config/herdr/config.toml (on the volume) cover those.
+ARG TARGETARCH
+ARG HERDR_VERSION=0.9.5
+ARG HERDR_SHA256_AMD64=14d9e8bc8b4a9e0118d77c32266f76d461f09b40342eb23752960bd89f59929d
+ARG HERDR_SHA256_ARM64=17d7536f2da50859523680ef279dffcac8e4a235f4e46fe8da6c2ec44141897c
+RUN set -eu; \
+    case "${TARGETARCH:-$(dpkg --print-architecture)}" in \
+        amd64) asset=herdr-linux-x86_64; sum="${HERDR_SHA256_AMD64}" ;; \
+        arm64) asset=herdr-linux-aarch64; sum="${HERDR_SHA256_ARM64}" ;; \
+        *) echo "herdr: unsupported architecture ${TARGETARCH:-?}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --retry 3 -o /tmp/herdr "https://github.com/herdrdev/herdr/releases/download/v${HERDR_VERSION}/${asset}"; \
+    echo "${sum}  /tmp/herdr" | sha256sum -c -; \
+    install -o root -g root -m 0755 /tmp/herdr /usr/local/bin/herdr; \
+    rm -f /tmp/herdr; \
+    mkdir -p /etc/herdr; \
+    printf '[update]\nversion_check = false\nmanifest_check = false\n' > /etc/herdr/config.toml; \
+    chmod 0644 /etc/herdr/config.toml; \
+    printf 'HERDR_CONFIG_PATH=/etc/herdr/config.toml\nexport HERDR_CONFIG_PATH\n' > /etc/profile.d/warren-herdr.sh; \
+    chmod 0644 /etc/profile.d/warren-herdr.sh; \
+    herdr --version
+
 # The config parses, with a throwaway host key.
 RUN mkdir -p /run/sshd && ssh-keygen -q -t ed25519 -N '' -f /tmp/k \
     && /usr/sbin/sshd -t -f /etc/ssh/sshd_config -h /tmp/k \
