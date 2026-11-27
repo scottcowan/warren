@@ -273,6 +273,60 @@ against the `warren-sshd: host key` log line before accepting.
 Editors forward their own ports over the SSH session (local forwarding is allowed).
 For a plain port without SSH, `warren proxy add`/`warren tunnel` still work (ECS).
 
+## herdr
+
+[herdr](https://herdr.dev) is a terminal workspace manager for AI agents. It reaches a
+remote machine over plain OpenSSH, so a workspace on either ssh image works once its
+`warren ssh-config` block is in `~/.ssh/config`. Both images ship herdr v0.9.5 at
+`/usr/local/bin/herdr` (root-owned 0755, checksum-pinned per architecture), so
+`herdr machine add` finds it and does not need to install anything.
+
+Prerequisites:
+
+- a running workspace on `warren-ecs-ssh-base` or `warren-docker-ssh-base` (above);
+- `warren ssh-config` working for it (for ECS also the `aws` CLI, the SSM
+  `session-manager-plugin` and `ssm:StartSession` on the task, see Client setup);
+- herdr on your machine (`herdr --version`).
+
+Steps:
+
+```bash
+warren ssh-config <workspace> --host my-ws >> ~/.ssh/config
+herdr machine add my-ws --label my-ws
+```
+
+herdr takes any `Host` alias from `~/.ssh/config`, uses an OpenSSH ControlMaster, and so
+works with the block's `ProxyCommand` (ECS) or `ProxyJump` (podman/docker). The
+workspace's panes then appear next to Local in herdr.
+
+- **Login user.** The ECS image logs in as `warren`; for podman/docker `warren ssh-config`
+  takes the user from the server. For another image pass `--user <name>`, or set it once
+  on the remote with `ssh_user = "<name>"` under `[remotes.<name>]`. Either value must
+  match `[A-Za-z0-9][A-Za-z0-9._-]{0,127}`; anything else is refused, so it cannot add a
+  line or option to the generated config.
+- **What runs where.** herdr starts its own server inside the workspace, over the ssh
+  session, and its panes are processes of that server. They run outside warren's agent
+  supervisor, so warren's harness configuration and state hooks (status, notifications)
+  do not apply to them.
+- **No agent forwarding.** The generated block sets `ForwardAgent no`; leave it off. For
+  pushes use the workspace's scoped write token for the repository, not your ssh agent.
+- **No `herdr update` in the image.** The binary is pinned and checksum-verified at build;
+  `herdr update` would replace it with an unverified one. Bump the version and both
+  checksums in the Dockerfiles instead. Background update checks are off for login shells
+  through `HERDR_CONFIG_PATH=/etc/herdr/config.toml`; ssh commands that are not login
+  shells don't read `profile.d`, so if you see update notices put `[update]` with
+  `version_check = false` and `manifest_check = false` in `~/.config/herdr/config.toml`.
+- **Stop and start.** herdr's session state lives in the workspace home, on the volume,
+  and survives a stop. The processes do not: stopping the workspace (or the ECS task)
+  ends herdr's server and every pane. After a start, reconnect from herdr and it restores
+  the layout from the saved state.
+- **Reconnecting (ECS).** Each connection is an SSM port-forward session. If your network
+  drops or the SSM session times out, herdr's ssh connection ends; reconnect from herdr
+  and the server and panes still running in the task are reattached. A replacement task
+  keeps the same `HostKeyAlias` and host key (on the volume).
+
+A real `herdr machine add` against a running workspace is not covered by the smoke tests.
+
 ## Verifying locally
 
 Both smoke tests need only docker.
