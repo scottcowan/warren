@@ -140,6 +140,7 @@ def render_ssh_config(
     warren: str | None = None,
     config: str | None = None,
     port: int = SSH_PORT,
+    user: str | None = None,
 ) -> str:
     """The ``~/.ssh/config`` Host block for an ECS workspace (warren-ecs-ssh-base)."""
     pc = proxy_command(server=server, workspace_id=workspace_id, port=port, warren=warren, config=config)
@@ -152,7 +153,7 @@ def render_ssh_config(
         host=host or f"warren-{workspace_id[:8]}",
         hostname="127.0.0.1",
         port=port,
-        user=SSH_USER,
+        user=user or SSH_USER,
         route=[f"ProxyCommand {pc}"],
         server=server,
         workspace_id=workspace_id,

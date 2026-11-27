@@ -498,3 +498,66 @@ def test_save_ignores_a_stale_fixed_temp_name(tmp_path):
     (path.parent / "k.tmp").write_text("attacker")
     ssh_access.save_private_key(path, "x")
     assert path.read_text() == "x\n"
+
+
+# ---------------------------------------------------------------------------
+# ssh user: --user flag and the remote's ssh_user
+# ---------------------------------------------------------------------------
+
+_BAD_USERS = ["a\nProxyCommand evil", "a b", "-oProxyCommand=x", "", "a\rb", "u;rm", "x" * 200, "$(id)"]
+
+
+def _ecs_ssh_config(tmp_path, *extra):
+    return runner.invoke(
+        app, ["ssh-config", _WS, "--server", "prodecs", "--no-resolve", "--config", str(_config(tmp_path)), *extra]
+    )
+
+
+def test_ssh_config_default_user_is_unchanged(tmp_path):
+    result = _ecs_ssh_config(tmp_path)
+    assert result.exit_code == 0, result.output
+    assert "    User warren\n" in result.stdout
+
+
+def test_ssh_config_user_flag_sets_the_user(tmp_path):
+    result = _ecs_ssh_config(tmp_path, "--user", "dev")
+    assert result.exit_code == 0, result.output
+    assert "    User dev\n" in result.stdout
+
+
+def test_ssh_config_uses_the_remotes_ssh_user_and_flag_wins(tmp_path):
+    path = _config(tmp_path)
+    path.write_text(path.read_text().replace("[remotes.prodecs]", '[remotes.prodecs]\nssh_user = "node"', 1))
+    args = ["ssh-config", _WS, "--server", "prodecs", "--no-resolve", "--config", str(path)]
+    assert "    User node\n" in runner.invoke(app, args).stdout
+    assert "    User dev\n" in runner.invoke(app, [*args, "--user", "dev"]).stdout
+
+
+@pytest.mark.parametrize("bad", [b for b in _BAD_USERS if b])
+def test_ssh_config_rejects_injected_user_flag(tmp_path, bad):
+    result = _ecs_ssh_config(tmp_path, "--user", bad)
+    assert result.exit_code != 0
+    assert "ProxyCommand evil" not in result.stdout and "Host " not in result.stdout
+
+
+@pytest.mark.parametrize("bad", [b for b in _BAD_USERS if b])
+def test_render_rejects_injected_user(bad):
+    with pytest.raises(ssh_access.SshAccessError):
+        ssh_access.render_ssh_config(server="prodecs", workspace_id=_WS, user=bad)
+
+
+@pytest.mark.parametrize("bad", [b for b in _BAD_USERS if b])
+def test_remote_ssh_user_is_validated_at_load(bad):
+    from pydantic import ValidationError
+
+    from warren_cli.config import RemoteProfile
+
+    with pytest.raises(ValidationError):
+        RemoteProfile(url="http://x", ssh_user=bad)
+
+
+def test_config_ssh_user_pattern_matches_the_render_guard():
+    from warren_cli.config import RemoteProfile
+
+    meta = RemoteProfile.model_fields["ssh_user"].metadata
+    assert any(getattr(m, "pattern", None) == ssh_access._NAME_RE.pattern for m in meta)
